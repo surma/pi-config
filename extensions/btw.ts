@@ -242,7 +242,10 @@ class BtwOverlay extends Container implements Focusable {
 	}
 
 	handleInput(data: string): void {
-		if (this.keybindings.matches(data, "selectCancel")) {
+		if (
+			this.keybindings.matches(data, "app.interrupt") ||
+			this.keybindings.matches(data, "tui.select.cancel")
+		) {
 			this.onDismissCallback();
 			return;
 		}
@@ -294,7 +297,7 @@ class BtwOverlay extends Container implements Focusable {
 		const lines = [
 			this.borderLine(innerWidth, "top"),
 			this.frameLine(this.theme.fg("accent", this.theme.bold(" BTW side chat ")), innerWidth),
-			this.frameLine(this.theme.fg("dim", "Separate side conversation. Esc closes."), innerWidth),
+			this.frameLine(this.theme.fg("dim", "Separate side conversation. Esc closes. /btw-send injects a summary."), innerWidth),
 			this.theme.fg("borderMuted", `├${"─".repeat(innerWidth)}┤`),
 		];
 
@@ -801,20 +804,8 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	async function closeOverlayFlow(ctx: ExtensionContext | ExtensionCommandContext): Promise<void> {
+	async function closeOverlayFlow(_ctx: ExtensionContext | ExtensionCommandContext): Promise<void> {
 		dismissOverlay();
-		if (!ctx.hasUI) {
-			return;
-		}
-
-		if (thread.length === 0) {
-			return;
-		}
-
-		const choice = await ctx.ui.select("Close BTW:", ["Keep side thread", "Inject summary into main chat"]);
-		if (choice === "Inject summary into main chat") {
-			await injectSummaryIntoMain(ctx);
-		}
 	}
 
 	async function runBtwPrompt(ctx: ExtensionCommandContext, question: string): Promise<void> {
@@ -942,6 +933,13 @@ export default function (pi: ExtensionAPI) {
 
 			await ensureOverlay(ctx);
 			await runBtwPrompt(ctx, question);
+		},
+	});
+
+	pi.registerCommand("btw-send", {
+		description: "Summarize the current BTW side thread into the main chat and clear it.",
+		handler: async (_args, ctx) => {
+			await injectSummaryIntoMain(ctx);
 		},
 	});
 
