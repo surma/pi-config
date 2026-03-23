@@ -47,15 +47,25 @@ After all subagents finish, act as the Top-Level Agent (TLA):
 
 Do not merely concatenate the subagent reports. Synthesize them.
 
-Format the final answer as a grouped list. For each grouped finding, include:
-- **Issue:** concise description of the problem
-- **Seen by:** checkbox list showing which subagents reported it
-  - [ ] Claude Opus 4.6
-  - [ ] GPT 5.4
-  - [ ] Gemini 3 Pro
-  Mark only the subagents that spotted the issue.
-- **TLA validation:** `Validated` or `Not validated`
-- **Evidence:** affected files, lines, and short rationale
-- **Best fix:** the strongest proposed fix, chosen by the TLA
+Format the final answer as a grouped list. For each validated finding, use exactly this structure:
+
+### <short issue description>
+**Seen by**: Claude Opus 4.6, GPT 5.4, Gemini 3 Pro
+**Evidence**: concise prose that cites affected files and line numbers and explains why the code is a real problem.
+
+```js
+// path/to/file:line-line
+// minimal snippet(s), only what is needed to support the claim
+```
+
+**Best fix**: strongest fix chosen by the TLA.
+
+Formatting rules:
+- Do not include a `TLA validation` line. Anything unvalidated should not appear in the main list.
+- Under `Seen by`, list only the subagents that actually reported the issue, as a comma-separated list. If only one saw it, list one. Do not use checkboxes.
+- Under `Evidence`, cite precise files and line numbers and keep the rationale tight and specific.
+- Include at least one minimal code snippet per finding when a code snippet will help substantiate the issue.
+- Keep snippets short and focused; do not dump large unrelated blocks.
+- Use docs/README snippets only for validated contract mismatches.
 
 If no findings survive validation, say so plainly. Then optionally include a short `Unvalidated leads` section with the most notable discarded findings and why they were discarded.
