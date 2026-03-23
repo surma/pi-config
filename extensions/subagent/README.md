@@ -34,8 +34,6 @@ A pi extension for isolated subagents and easy swarms.
 This extension ships with:
 
 - `scout`
-- `planner`
-- `worker`
 - `reviewer`
 
 ## Custom agents

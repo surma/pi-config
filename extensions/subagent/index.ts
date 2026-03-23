@@ -540,7 +540,7 @@ const ModelsSchema = Type.Object({
 
 const WaitSchema = Type.Object({
 	id: Type.Optional(Type.String({ description: "Specific subagent id to wait for" })),
-	all: Type.Optional(Type.Boolean({ default: true, description: "Wait for all active subagents when id is omitted" })),
+	all: Type.Optional(Type.Boolean({ default: true, description: "When id is omitted, this must be true to wait for all active subagents" })),
 	timeoutMs: Type.Optional(Type.Number({ minimum: 1, description: "Optional timeout in milliseconds" })),
 });
 
@@ -806,6 +806,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 
 			if (message.type === "message_end" && message.message?.role === "assistant") {
 				const assistantText = extractText(message.message.content);
+				const assistantStopReason = message.message.stopReason;
+				const assistantError = message.message.errorMessage;
 				const usage = message.message.usage || {};
 				handle.usage.input += usage.input || 0;
 				handle.usage.output += usage.output || 0;
@@ -813,10 +815,16 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				handle.usage.cacheWrite += usage.cacheWrite || 0;
 				handle.usage.cost += usage.cost?.total || 0;
 				handle.usage.turns += 1;
+				const assistantFailed = assistantStopReason === "error" || !!assistantError;
 				updateHandle(handle, {
+					state: assistantFailed && handle.state !== "killed" ? "error" : handle.state,
 					resultText: assistantText || handle.resultText,
-					stopReason: message.message.stopReason || handle.stopReason,
-					error: message.message.errorMessage || handle.error,
+					stopReason: assistantStopReason || handle.stopReason,
+					error: assistantError || handle.error,
+					statusText:
+						assistantFailed && handle.state !== "killed"
+							? truncate(assistantError || assistantText || "Subagent failed", 96)
+							: handle.statusText,
 					model: handle.model || message.message.model,
 				});
 				return;
@@ -1138,7 +1146,7 @@ Available predefined subagents:\n${formatAgentList(discovery.agents, 20)}`;
 						details: { handles: results.map(serializeHandle) },
 					};
 				}
-				const task = step.task.replace(/\{previous\}/g, previous);
+				const task = step.task.replace(/\{previous\}/g, () => previous);
 				const handle = spawnSubagent(agent, task, step.cwd || ctx.cwd, parentModel);
 				bindAbort(signal, handle, "Caller aborted subagent chain");
 				const result = await waitForHandle(handle);
@@ -1213,6 +1221,12 @@ Available predefined subagents:\n${formatAgentList(discovery.agents, 20)}`;
 				}
 				targets = [handle];
 			} else {
+				if (params.all === false) {
+					return {
+						content: [{ type: "text", text: "Invalid subagent_wait call. Provide {id} to wait for one subagent, or omit id / set {all:true} to wait for all active subagents." }],
+						details: { handles: sortHandles([...handles.values()]).map(serializeHandle) },
+					};
+				}
 				targets = [...handles.values()].filter(isHandleActive);
 				if (targets.length === 0) {
 					return {
@@ -1246,6 +1260,20 @@ Available predefined subagents:\n${formatAgentList(discovery.agents, 20)}`;
 			const handle = handles.get(params.id);
 			if (!handle) {
 				return { content: [{ type: "text", text: `Unknown subagent id: ${params.id}` }], details: {} };
+			}
+			if (!isHandleActive(handle)) {
+				const stateText =
+					handle.state === "done"
+						? "already completed"
+						: handle.state === "error"
+							? "already failed"
+							: handle.state === "killed"
+								? "already killed"
+								: `already ${handle.state}`;
+				return {
+					content: [{ type: "text", text: `Subagent #${handle.id} (${handle.agent.name}) is ${stateText}.` }],
+					details: { handle: serializeHandle(handle) },
+				};
 			}
 			const result = await killHandle(handle, "Killed via subagent_kill");
 			return {

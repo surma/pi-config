@@ -52,19 +52,26 @@ function readAgentDirectory(dir: string, source: AgentSource): AgentConfig[] {
 			continue;
 		}
 
-		const { frontmatter, body } = parseFrontmatter<Record<string, string>>(content);
-		if (!frontmatter.name || !frontmatter.description) continue;
+		const { frontmatter, body } = parseFrontmatter<Record<string, unknown>>(content);
+		const name = typeof frontmatter.name === "string" ? frontmatter.name.trim() : "";
+		const description = typeof frontmatter.description === "string" ? frontmatter.description.trim() : "";
+		if (!name || !description) continue;
 
-		const tools = frontmatter.tools
-			?.split(",")
-			.map((value) => value.trim())
-			.filter(Boolean);
+		const tools = Array.isArray(frontmatter.tools)
+			? frontmatter.tools.map((value) => (typeof value === "string" ? value.trim() : "")).filter(Boolean)
+			: typeof frontmatter.tools === "string"
+				? frontmatter.tools
+					.split(",")
+					.map((value) => value.trim())
+					.filter(Boolean)
+				: undefined;
+		const model = typeof frontmatter.model === "string" ? frontmatter.model.trim() || undefined : undefined;
 
 		agents.push({
-			name: frontmatter.name.trim(),
-			description: frontmatter.description.trim(),
+			name,
+			description,
 			tools: tools && tools.length > 0 ? tools : undefined,
-			model: frontmatter.model?.trim() || undefined,
+			model,
 			systemPrompt: body.trim(),
 			source,
 			filePath,
