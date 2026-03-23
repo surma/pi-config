@@ -97,7 +97,7 @@ Model overrides should use exact ids returned by `subagent_models` rather than f
 
 ## Commands
 
-- `/subagents` shows tracked subagent status in a notification
+- `/subagents` opens a scrollable overlay with tracked subagent status (or prints a summary without UI)
 - `/subagents-toggle` enables/disables the persistent subagent widget for active subagents
 - `/subagents-kill-all` aborts all running subagents
 
@@ -107,5 +107,5 @@ Model overrides should use exact ids returned by `subagent_models` rather than f
 - aborting the parent agent also aborts all active subagents
 - this is intentionally **subagents + easy swarms**, not a full agent-team system
 - the widget is shown by default for active subagents, but can be disabled with `/subagents-toggle`
-- widget/list ordering is stable by creation time so live updates stay in place
+- widget/list ordering is stable by reverse creation time so the newest subagents stay visible at the top
 - `subagent_run` allows up to 64 parallel tasks, while execution concurrency remains capped separately

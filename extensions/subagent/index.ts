@@ -3,6 +3,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { Key, matchesKey, truncateToWidth, visibleWidth, type Focusable, type KeybindingsManager, type TUI } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { discoverAgents, formatAgentList, type AgentConfig } from "./agents.js";
 
@@ -224,6 +225,232 @@ function formatUsage(usage: UsageStats, model?: string): string {
 	return parts.join(" ");
 }
 
+function formatHandleDetail(handle: SubagentHandle): string {
+	return (
+		handle.statusText ||
+		(handle.state === "done" ? truncate(handle.resultText, 140) : "") ||
+		(handle.lastTool ? `tool: ${handle.lastTool}` : "") ||
+		truncate(handle.error, 140)
+	);
+}
+
+function formatTimeOfDay(timestamp: number): string {
+	return new Date(timestamp).toISOString().slice(11, 19);
+}
+
+class SubagentOverlay implements Focusable {
+	focused = false;
+
+	private scrollOffset = 0;
+	private viewHeight = 0;
+	private totalLines = 0;
+
+	constructor(
+		private readonly tui: TUI,
+		private readonly theme: ExtensionContext["ui"]["theme"],
+		private readonly keybindings: KeybindingsManager,
+		private readonly getHandles: () => SubagentHandle[],
+		private readonly onClose: () => void,
+	) {}
+
+	handleInput(data: string): void {
+		if (
+			this.keybindings.matches(data, "app.interrupt") ||
+			this.keybindings.matches(data, "tui.select.cancel") ||
+			data === "q"
+		) {
+			this.onClose();
+			return;
+		}
+
+		const mouseScrollDelta = this.parseMouseScrollDelta(data);
+		if (mouseScrollDelta !== 0) {
+			this.scrollBy(mouseScrollDelta);
+			return;
+		}
+
+		if (this.keybindings.matches(data, "tui.select.up") || matchesKey(data, Key.up)) {
+			this.scrollBy(-1);
+			return;
+		}
+		if (this.keybindings.matches(data, "tui.select.down") || matchesKey(data, Key.down)) {
+			this.scrollBy(1);
+			return;
+		}
+		if (this.keybindings.matches(data, "tui.select.pageUp") || matchesKey(data, Key.pageUp)) {
+			this.scrollBy(-(this.viewHeight || 1));
+			return;
+		}
+		if (this.keybindings.matches(data, "tui.select.pageDown") || matchesKey(data, Key.pageDown)) {
+			this.scrollBy(this.viewHeight || 1);
+			return;
+		}
+		if (matchesKey(data, Key.home)) {
+			this.setScroll(0);
+			return;
+		}
+		if (matchesKey(data, Key.end)) {
+			this.setScroll(Math.max(0, this.totalLines - this.viewHeight));
+			return;
+		}
+	}
+
+	render(width: number): string[] {
+		const innerWidth = Math.max(28, width - 2);
+		const rows = this.tui.terminal.rows || 24;
+		const maxPanelHeight = Math.max(8, rows - 2);
+		const panelHeight = Math.min(maxPanelHeight, Math.max(12, Math.floor(rows * 0.85)));
+		const chromeLines = 7;
+		const contentHeight = Math.max(1, panelHeight - chromeLines);
+		const handles = this.getHandles();
+		const contentLines = this.buildContentLines(handles);
+		const running = handles.filter((handle) => handle.state === "running" || handle.state === "starting").length;
+		const done = handles.filter((handle) => handle.state === "done").length;
+		const failed = handles.filter((handle) => handle.state === "error").length;
+		const killed = handles.filter((handle) => handle.state === "killed").length;
+
+		this.totalLines = contentLines.length;
+		this.viewHeight = contentHeight;
+		const maxScroll = Math.max(0, this.totalLines - contentHeight);
+		this.scrollOffset = Math.max(0, Math.min(this.scrollOffset, maxScroll));
+
+		const visibleLines = contentLines.slice(this.scrollOffset, this.scrollOffset + contentHeight);
+		const padding = Math.max(0, contentHeight - visibleLines.length);
+		const start = this.totalLines === 0 ? 0 : Math.min(this.totalLines, this.scrollOffset + 1);
+		const end = Math.min(this.totalLines, this.scrollOffset + visibleLines.length);
+		const scrollInfo = this.totalLines > contentHeight ? `${start}-${end}/${this.totalLines}` : `${this.totalLines}/${this.totalLines}`;
+
+		const summaryParts = [
+			this.theme.fg("warning", `${running} running`),
+			this.theme.fg("success", `${done} done`),
+		];
+		if (failed) summaryParts.push(this.theme.fg("error", `${failed} failed`));
+		if (killed) summaryParts.push(this.theme.fg("muted", `${killed} killed`));
+
+		const lines = [
+			this.borderLine(innerWidth, "top"),
+			this.frameLine(this.theme.fg("accent", this.theme.bold(" Subagents ")) + this.theme.fg("dim", " newest first"), innerWidth),
+			this.frameLine(summaryParts.join(this.theme.fg("muted", " · ")), innerWidth),
+			this.theme.fg("borderMuted", `├${"─".repeat(innerWidth)}┤`),
+			...visibleLines.map((line) => this.frameLine(line, innerWidth)),
+		];
+		for (let i = 0; i < padding; i++) {
+			lines.push(this.frameLine("", innerWidth));
+		}
+		lines.push(this.theme.fg("borderMuted", `├${"─".repeat(innerWidth)}┤`));
+		lines.push(
+			this.frameLine(
+				this.theme.fg("dim", `Esc/q close · ↑/↓ scroll · PgUp/PgDn page · Home/End jump · ${scrollInfo}`),
+				innerWidth,
+			),
+		);
+		lines.push(this.borderLine(innerWidth, "bottom"));
+		return lines.map((line) => truncateToWidth(line, width, ""));
+	}
+
+	invalidate(): void {}
+
+	private buildContentLines(handles: SubagentHandle[]): string[] {
+		if (handles.length === 0) {
+			return [this.theme.fg("dim", "No subagents tracked yet.")];
+		}
+
+		const lines: string[] = [];
+		for (const handle of handles) {
+			const icon =
+				handle.state === "running" || handle.state === "starting"
+					? this.theme.fg("warning", "●")
+					: handle.state === "done"
+						? this.theme.fg("success", "✓")
+						: handle.state === "killed"
+							? this.theme.fg("muted", "■")
+							: this.theme.fg("error", "✗");
+			const stateColor: "warning" | "success" | "muted" | "error" =
+				handle.state === "running" || handle.state === "starting"
+					? "warning"
+					: handle.state === "done"
+						? "success"
+						: handle.state === "killed"
+							? "muted"
+							: "error";
+			const header = [
+				icon,
+				this.theme.fg("accent", `#${handle.id}`),
+				this.theme.bold(handle.agent.name),
+				this.theme.fg(stateColor, handle.state),
+				this.theme.fg("dim", formatTimeOfDay(handle.startedAt)),
+			].join(" ");
+			lines.push(header);
+			lines.push(`${this.theme.fg("dim", "  task:")} ${this.theme.fg("muted", truncate(handle.task, 180))}`);
+
+			const detail = formatHandleDetail(handle);
+			if (detail) {
+				const detailColor: "error" | "muted" = handle.state === "error" ? "error" : "muted";
+				lines.push(`${this.theme.fg("dim", "  info:")} ${this.theme.fg(detailColor, truncate(detail, 180))}`);
+			}
+
+			const metaParts: string[] = [];
+			if (handle.model) metaParts.push(`model ${truncate(handle.model, 48)}`);
+			const usage = formatUsage(handle.usage);
+			if (usage) metaParts.push(usage);
+			metaParts.push(`cwd ${truncate(handle.cwd, 56)}`);
+			lines.push(`${this.theme.fg("dim", "  ")}${this.theme.fg("dim", metaParts.join(" • "))}`);
+			lines.push("");
+		}
+		return lines;
+	}
+
+	private scrollBy(delta: number): void {
+		this.setScroll(this.scrollOffset + delta);
+	}
+
+	private setScroll(next: number): void {
+		const maxScroll = Math.max(0, this.totalLines - this.viewHeight);
+		const clamped = Math.max(0, Math.min(next, maxScroll));
+		if (clamped === this.scrollOffset) return;
+		this.scrollOffset = clamped;
+		this.tui.requestRender();
+	}
+
+	private frameLine(content: string, innerWidth: number): string {
+		const truncated = truncateToWidth(content, innerWidth, "");
+		const padding = Math.max(0, innerWidth - visibleWidth(truncated));
+		return `${this.theme.fg("borderMuted", "│")}${truncated}${" ".repeat(padding)}${this.theme.fg("borderMuted", "│")}`;
+	}
+
+	private borderLine(innerWidth: number, edge: "top" | "bottom"): string {
+		const left = edge === "top" ? "┌" : "└";
+		const right = edge === "top" ? "┐" : "┘";
+		return this.theme.fg("borderMuted", `${left}${"─".repeat(innerWidth)}${right}`);
+	}
+
+	private parseMouseScrollDelta(data: string): number {
+		const sgrMouseMatch = /^\x1b\[<(\d+);\d+;\d+([Mm])$/u.exec(data);
+		if (sgrMouseMatch) {
+			const code = Number(sgrMouseMatch[1]);
+			return this.getWheelDeltaFromMouseButtonCode(code);
+		}
+
+		if (data.startsWith("\x1b[M") && data.length >= 6) {
+			const code = data.charCodeAt(3) - 32;
+			return this.getWheelDeltaFromMouseButtonCode(code);
+		}
+
+		return 0;
+	}
+
+	private getWheelDeltaFromMouseButtonCode(code: number): number {
+		if (!Number.isFinite(code) || (code & 64) === 0) {
+			return 0;
+		}
+
+		const wheelDirection = code & 0b11;
+		if (wheelDirection === 0) return 3;
+		if (wheelDirection === 1) return -3;
+		return 0;
+	}
+}
+
 function serializeHandle(handle: SubagentHandle): SerializableHandle {
 	return {
 		id: handle.id,
@@ -335,7 +562,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	}
 
 	function sortHandles(values: SubagentHandle[]): SubagentHandle[] {
-		return [...values].sort((a, b) => a.startedAt - b.startedAt || a.id.localeCompare(b.id));
+		return [...values].sort((a, b) => b.startedAt - a.startedAt || b.id.localeCompare(a.id));
 	}
 
 	function trimRetainedHandles(): void {
@@ -1029,10 +1256,28 @@ Available predefined subagents:\n${formatAgentList(discovery.agents, 20)}`;
 	});
 
 	pi.registerCommand("subagents", {
-		description: "Show tracked subagent status",
+		description: "Open a scrollable subagent view",
 		handler: async (_args, ctx) => {
 			rememberContext(ctx);
-			ctx.ui.notify(getActiveOrRecentSummary(true), "info");
+			if (!ctx.hasUI) {
+				console.log(getActiveOrRecentSummary(true));
+				return;
+			}
+			await ctx.ui.custom<void>(
+				(tui, theme, keybindings, done) =>
+					new SubagentOverlay(tui, theme, keybindings, () => sortHandles([...handles.values()]), () => done(undefined)),
+				{
+					overlay: true,
+					overlayOptions: {
+						anchor: "right-center",
+						width: "55%",
+						minWidth: 64,
+						maxWidth: 110,
+						maxHeight: "85%",
+						margin: 1,
+					},
+				},
+			);
 		},
 	});
 
