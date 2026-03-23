@@ -6,7 +6,7 @@ A pi extension for isolated subagents and easy swarms.
 
 - runs delegated work in separate `pi --mode rpc` subprocesses
 - injects a child-only `update_status(message)` tool
-- shows active/recent subagents in a persistent widget
+- shows active subagents in a widget and keeps recent handles available via commands
 - supports:
   - one-off subagent runs
   - small parallel swarms
@@ -15,12 +15,16 @@ A pi extension for isolated subagents and easy swarms.
 
 ## Tools
 
+- `subagent_models`
+  - list the exact model ids accepted by subagent model overrides in the current session
 - `subagent_run`
+  - only for cases where the user explicitly asks for subagent delegation
   - single predefined: `{ agent, task }`
   - single ad hoc: `{ task, systemPrompt?, tools?, model? }`
   - parallel swarm: `{ tasks: [{ agent?, task, systemPrompt?, tools?, model? }, ...] }`
   - chain: `{ chain: [{ agent?, task, systemPrompt?, tools?, model? }, ...] }`
 - `subagent_start`
+  - only for cases where the user explicitly asks for a background subagent
 - `subagent_list`
 - `subagent_wait`
 - `subagent_kill`
@@ -87,16 +91,21 @@ Per-call `model` wins over the predefined agent’s `model`.
 
 If neither is provided, the child inherits the **current parent session model**.
 
+Use `subagent_models` to inspect the exact child model ids accepted by subagent model overrides before setting one.
+Unknown or unavailable override models are rejected before the subagent is spawned.
+Model overrides should use exact ids returned by `subagent_models` rather than fuzzy or fallback matches.
+
 ## Commands
 
 - `/subagents` shows tracked subagent status in a notification
-- `/subagents-toggle` shows/hides the persistent subagent widget
+- `/subagents-toggle` enables/disables the persistent subagent widget for active subagents
 - `/subagents-kill-all` aborts all running subagents
 
 ## Notes
 
 - children are ephemeral: they auto-exit after finishing their delegated task
+- aborting the parent agent also aborts all active subagents
 - this is intentionally **subagents + easy swarms**, not a full agent-team system
-- the widget is shown by default, but can be hidden with `/subagents-toggle`
+- the widget is shown by default for active subagents, but can be disabled with `/subagents-toggle`
 - widget/list ordering is stable by creation time so live updates stay in place
 - `subagent_run` allows up to 64 parallel tasks, while execution concurrency remains capped separately

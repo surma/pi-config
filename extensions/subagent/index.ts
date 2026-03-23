@@ -75,6 +75,18 @@ interface TaskSpec {
 	systemPrompt?: string;
 }
 
+interface SubagentModelInfo {
+	ref: string;
+	provider: string;
+	id: string;
+	name: string;
+	available: boolean;
+	reasoning: boolean;
+	input: string[];
+	contextWindow: number;
+	maxTokens: number;
+}
+
 function now(): number {
 	return Date.now();
 }
@@ -83,10 +95,81 @@ function createId(): string {
 	return randomBytes(3).toString("hex");
 }
 
+function formatModelRef(provider: string, modelId: string): string {
+	return `${provider}/${modelId}`;
+}
+
+function getKnownModels(ctx: ExtensionContext): SubagentModelInfo[] {
+	const available = new Set(ctx.modelRegistry.getAvailable().map((model) => formatModelRef(model.provider, model.id).toLowerCase()));
+	return [...ctx.modelRegistry.getAll()]
+		.sort((a, b) => a.provider.localeCompare(b.provider) || a.id.localeCompare(b.id))
+		.map((model) => ({
+			ref: formatModelRef(model.provider, model.id),
+			provider: model.provider,
+			id: model.id,
+			name: model.name,
+			available: available.has(formatModelRef(model.provider, model.id).toLowerCase()),
+			reasoning: !!model.reasoning,
+			input: [...model.input],
+			contextWindow: model.contextWindow,
+			maxTokens: model.maxTokens,
+		}));
+}
+
+function resolveKnownModel(ctx: ExtensionContext, rawModel: string): { ref?: string; error?: string } {
+	const model = rawModel.trim();
+	const known = getKnownModels(ctx);
+	if (known.length === 0) {
+		return { error: "No models are configured. Use pi model configuration or --list-models first." };
+	}
+
+	const lower = model.toLowerCase();
+	const exact = known.find((candidate) => candidate.ref.toLowerCase() === lower);
+	if (exact) {
+		if (!exact.available) {
+			return { error: `Model \"${exact.ref}\" is known but unavailable in this session. Choose an available model from subagent_models.` };
+		}
+		return { ref: exact.ref };
+	}
+
+	const slashIndex = model.indexOf("/");
+	if (slashIndex !== -1) {
+		const provider = model.slice(0, slashIndex);
+		const knownProvider = known.find((candidate) => candidate.provider.toLowerCase() === provider.toLowerCase());
+		if (!knownProvider) {
+			return { error: `Unknown provider \"${provider}\". Use subagent_models to inspect valid models.` };
+		}
+		return { error: `Unknown model \"${model}\". Use subagent_models to inspect valid models.` };
+	}
+
+	const byId = known.filter((candidate) => candidate.id.toLowerCase() === lower);
+	if (byId.length === 1) {
+		if (!byId[0]!.available) {
+			return { error: `Model \"${byId[0]!.ref}\" is known but unavailable in this session. Choose an available model from subagent_models.` };
+		}
+		return { ref: byId[0]!.ref };
+	}
+	if (byId.length > 1) {
+		return { error: `Model \"${model}\" is ambiguous. Use a full provider/model id from subagent_models.` };
+	}
+
+	return { error: `Unknown model \"${model}\". Use subagent_models to inspect valid models.` };
+}
+
 function truncate(text: string | undefined, max = 80): string {
 	const value = (text || "").replace(/\s+/g, " ").trim();
 	if (!value) return "";
 	return value.length > max ? `${value.slice(0, max - 1)}…` : value;
+}
+
+function isAbortedAssistantMessage(message: unknown): boolean {
+	if (!message || typeof message !== "object") return false;
+	const value = message as { role?: unknown; stopReason?: unknown };
+	return value.role === "assistant" && value.stopReason === "aborted";
+}
+
+function isHandleActive(handle: SubagentHandle): boolean {
+	return handle.state === "starting" || handle.state === "running" || (handle.state === "killed" && !handle.completionSettled);
 }
 
 function extractText(content: unknown): string {
@@ -213,10 +296,19 @@ const ChainSchema = Type.Object({
 
 const RunSchema = Type.Object({
 	agent: Type.Optional(Type.String({ description: "Single subagent to run" })),
+	name: Type.Optional(Type.String({ description: "Optional display name for an ad hoc single subagent" })),
 	task: Type.Optional(Type.String({ description: "Single delegated task" })),
+	cwd: Type.Optional(Type.String({ description: "Working directory for single-agent mode" })),
+	model: Type.Optional(Type.String({ description: "Optional child model override for single-agent mode" })),
+	tools: Type.Optional(Type.Array(Type.String(), { description: "Optional built-in tool override for single-agent mode" })),
+	systemPrompt: Type.Optional(Type.String({ description: "Optional ad hoc system prompt override for single-agent mode" })),
 	tasks: Type.Optional(ParallelSchema.properties.tasks),
 	chain: Type.Optional(ChainSchema.properties.chain),
-	cwd: Type.Optional(Type.String({ description: "Working directory for single-agent mode" })),
+});
+
+const ModelsSchema = Type.Object({
+	includeUnavailable: Type.Optional(Type.Boolean({ default: true, description: "Include known but unavailable models in the listing" })),
+	search: Type.Optional(Type.String({ description: "Optional case-insensitive substring filter over provider/model and name" })),
 });
 
 const WaitSchema = Type.Object({
@@ -249,7 +341,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	function trimRetainedHandles(): void {
 		const all = [...handles.values()].sort((a, b) => b.updatedAt - a.updatedAt || b.startedAt - a.startedAt || a.id.localeCompare(b.id));
 		for (const handle of all.slice(MAX_RETAINED_HANDLES)) {
-			if (handle.state === "running" || handle.state === "starting") continue;
+			if (isHandleActive(handle)) continue;
 			handles.delete(handle.id);
 		}
 	}
@@ -260,11 +352,12 @@ export default function subagentExtension(pi: ExtensionAPI) {
 
 		const all = sortHandles([...handles.values()]);
 		const running = all.filter((handle) => handle.state === "running" || handle.state === "starting").length;
+		const active = all.filter(isHandleActive).length;
 		const done = all.filter((handle) => handle.state === "done").length;
 		const failed = all.filter((handle) => handle.state === "error").length;
 		const killed = all.filter((handle) => handle.state === "killed").length;
 
-		if (all.length === 0) {
+		if (all.length === 0 || active === 0) {
 			ctx.ui.setWidget("subagent", undefined);
 			ctx.ui.setStatus("subagent", undefined);
 			return;
@@ -334,7 +427,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	}
 
 	function waitForHandle(handle: SubagentHandle, timeoutMs?: number): Promise<SubagentHandle> {
-		if (!["starting", "running"].includes(handle.state)) return Promise.resolve(handle);
+		if (handle.completionSettled) return Promise.resolve(handle);
 		return new Promise((resolve) => {
 			const waiter: { resolve: (handle: SubagentHandle) => void; timer?: NodeJS.Timeout } = { resolve };
 			if (timeoutMs && timeoutMs > 0) {
@@ -355,34 +448,46 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		}
 	}
 
+	function bindAbort(signal: AbortSignal | undefined, handle: SubagentHandle, reason: string): void {
+		if (!signal) return;
+		const abort = () => void killHandle(handle, reason);
+		if (signal.aborted) {
+			abort();
+			return;
+		}
+		signal.addEventListener("abort", abort, { once: true });
+	}
+
 	function killHandle(handle: SubagentHandle, reason = "Killed by parent"): Promise<SubagentHandle> {
-		if (handle.state === "done" || handle.state === "error" || handle.state === "killed") {
+		if (handle.completionSettled || handle.state === "done" || handle.state === "error") {
 			return Promise.resolve(handle);
 		}
 
-		updateHandle(handle, { state: "killed", error: reason, statusText: reason });
-		if (handle.process) {
-			sendRpc(handle.process, { type: "abort" });
-			setTimeout(() => {
-				try {
-					handle.process?.kill("SIGTERM");
-				} catch {
-					// ignore
-				}
-			}, 1500);
-			setTimeout(() => {
-				try {
-					handle.process?.kill("SIGKILL");
-				} catch {
-					// ignore
-				}
-			}, 4000);
+		if (handle.state !== "killed") {
+			updateHandle(handle, { state: "killed", error: reason, statusText: reason });
+			if (handle.process) {
+				sendRpc(handle.process, { type: "abort" });
+				setTimeout(() => {
+					try {
+						handle.process?.kill("SIGTERM");
+					} catch {
+						// ignore
+					}
+				}, 1500);
+				setTimeout(() => {
+					try {
+						handle.process?.kill("SIGKILL");
+					} catch {
+						// ignore
+					}
+				}, 4000);
+			}
 		}
 		return waitForHandle(handle, 5000);
 	}
 
 	async function killAll(reason: string): Promise<void> {
-		const active = [...handles.values()].filter((handle) => handle.state === "running" || handle.state === "starting");
+		const active = [...handles.values()].filter(isHandleActive);
 		await Promise.allSettled(active.map((handle) => killHandle(handle, reason)));
 	}
 
@@ -394,7 +499,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	}
 
 	function getActiveOrRecentSummary(includeCompleted = true): string {
-		const list = sortHandles([...handles.values()]).filter((handle) => includeCompleted || handle.state === "running" || handle.state === "starting");
+		const list = sortHandles([...handles.values()]).filter((handle) => includeCompleted || isHandleActive(handle));
 		if (list.length === 0) return "No subagents tracked yet.";
 		return list.map(formatHandleSummary).join("\n\n");
 	}
@@ -492,7 +597,13 @@ export default function subagentExtension(pi: ExtensionAPI) {
 
 			if (message.type === "agent_end") {
 				const finalState: SubagentState = handle.state === "error" ? "error" : handle.state === "killed" ? "killed" : "done";
-				updateHandle(handle, { state: finalState, statusText: handle.statusText || (finalState === "done" ? "Done" : handle.statusText || "Finished") });
+				const finalStatus =
+					finalState === "done"
+						? truncate(handle.resultText, 96) || "Done"
+						: finalState === "killed"
+							? handle.error || handle.statusText || "Killed"
+							: truncate(handle.error || handle.statusText, 96) || "Finished";
+				updateHandle(handle, { state: finalState, statusText: finalStatus });
 				settleHandle(handle);
 				setTimeout(() => {
 					try {
@@ -545,7 +656,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			if (!handle.completionSettled) {
 				if (handle.state !== "killed") {
 					if ((code ?? 0) === 0 && handle.state !== "error") {
-						updateHandle(handle, { state: "done", statusText: handle.statusText || "Done" });
+						updateHandle(handle, { state: "done", statusText: truncate(handle.resultText, 96) || "Done" });
 					} else {
 						const errorText = truncate(handle.error || handle.stderr || `Exited with code ${code ?? 0}`, 120);
 						updateHandle(handle, { state: "error", error: errorText, statusText: errorText });
@@ -599,6 +710,19 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		return { discovery, agent };
 	}
 
+	function materializeValidatedAgent(
+		ctx: ExtensionContext,
+		spec: TaskSpec,
+	): { discovery: ReturnType<typeof discoverAgents>; agent?: AgentConfig; error?: string } {
+		const result = materializeAgent(ctx, spec);
+		if (!result.agent?.model) return result;
+		const resolvedModel = resolveKnownModel(ctx, result.agent.model);
+		if (!resolvedModel.ref) {
+			return { discovery: result.discovery, error: resolvedModel.error || "Invalid model override" };
+		}
+		return { discovery: result.discovery, agent: { ...result.agent, model: resolvedModel.ref } };
+	}
+
 	async function waitForAll(handlesToWait: SubagentHandle[], timeoutMs?: number): Promise<SubagentHandle[]> {
 		return Promise.all(handlesToWait.map((handle) => waitForHandle(handle, timeoutMs)));
 	}
@@ -626,12 +750,20 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		await killAll("Parent session shutting down");
 	});
 
+	pi.on("agent_end", async (event, ctx) => {
+		rememberContext(ctx);
+		const lastAssistant = [...event.messages].reverse().find(isAbortedAssistantMessage);
+		if (!lastAssistant) return;
+		await killAll("Parent agent aborted");
+	});
+
 	pi.on("before_agent_start", async (event, ctx) => {
 		rememberContext(ctx);
 		const discovery = getAgents(ctx);
 		const guidance = `\n\nSubagent extension is available.
-Use subagent_run for focused delegated work or easy swarms.
-Use subagent_start, subagent_list, subagent_wait, and subagent_kill for background subagents.
+Do not use subagent_run or subagent_start unless the user explicitly asks you to delegate work to a subagent or spawn one.
+Use subagent_list, subagent_wait, and subagent_kill to inspect or control background subagents when relevant.
+Use subagent_models to inspect the exact model ids accepted by subagent model overrides in this session.
 A subagent call may either reference a predefined agent via {agent: "name", ...} or be ad hoc by omitting agent and providing task plus optional systemPrompt/tools/model overrides.
 Per-call model overrides are supported via model: "provider/model-id".
 Available predefined subagents:\n${formatAgentList(discovery.agents, 20)}`;
@@ -639,14 +771,65 @@ Available predefined subagents:\n${formatAgentList(discovery.agents, 20)}`;
 	});
 
 	pi.registerTool({
+		name: "subagent_models",
+		label: "Subagent Models",
+		description: "List the exact model ids accepted by subagent model overrides in this session, and whether they are available here.",
+		promptSnippet: "Inspect the exact model ids accepted by subagent model overrides before setting one.",
+		promptGuidelines: [
+			"Use subagent_models before setting a subagent model override when you are not sure which exact model ids are accepted.",
+			"Prefer available models from subagent_models; unavailable ones will be rejected for subagent launches.",
+		],
+		parameters: ModelsSchema,
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			rememberContext(ctx);
+			const includeUnavailable = params.includeUnavailable ?? true;
+			const search = params.search?.trim().toLowerCase();
+			let models = getKnownModels(ctx).filter((model) => includeUnavailable || model.available);
+			if (search) {
+				models = models.filter(
+					(model) =>
+						model.ref.toLowerCase().includes(search) ||
+						model.name.toLowerCase().includes(search) ||
+						model.provider.toLowerCase().includes(search) ||
+						model.id.toLowerCase().includes(search),
+				);
+			}
+			if (models.length === 0) {
+				const scope = includeUnavailable ? "known" : "available";
+				const suffix = search ? ` matching \"${params.search}\"` : "";
+				return {
+					content: [{ type: "text", text: `No ${scope} subagent models found${suffix}.` }],
+					details: { models: [] },
+				};
+			}
+
+			const availableCount = models.filter((model) => model.available).length;
+			const lines = [
+				`${models.length} model${models.length === 1 ? "" : "s"} (${availableCount} available)`,
+				...models.map((model) => {
+					const flags = [model.available ? "available" : "unavailable", model.reasoning ? "reasoning" : undefined, model.input.includes("image") ? "image" : undefined]
+						.filter(Boolean)
+						.join(", ");
+					return `${model.available ? "✓" : "·"} ${model.ref}${model.name && model.name !== model.id ? ` — ${model.name}` : ""}${flags ? ` (${flags})` : ""}`;
+				}),
+			];
+			return {
+				content: [{ type: "text", text: lines.join("\n") }],
+				details: { models },
+			};
+		},
+	});
+
+	pi.registerTool({
 		name: "subagent_run",
 		label: "Subagent Run",
 		description:
-			"Run one focused subagent task, a small parallel swarm, or a sequential chain. Use this when the task can be delegated to an isolated worker with a definitive answer.",
-		promptSnippet: "Delegate focused work to specialized subagents or a small swarm.",
+			"Run one focused subagent task, a small parallel swarm, or a sequential chain. Only use this when the user explicitly asks you to delegate work to a subagent or spawn one.",
+		promptSnippet: "Only when the user explicitly asks, delegate work to a specialized subagent or small swarm.",
 		promptGuidelines: [
-			"Prefer subagent_run for isolated reconnaissance, planning, implementation, or review tasks that can be summarized back.",
+			"Do not use subagent_run unless the user explicitly asks for delegation, a subagent, or a swarm.",
 			"Use tasks[] for small independent swarms, and chain[] for stepwise handoffs using {previous}.",
+			"Use subagent_models before setting a child model override when you are unsure which exact model ids are accepted.",
 			"You can override the child model per call with model: \"provider/model-id\".",
 			"For ad hoc subagents, omit agent and provide task plus optional systemPrompt, tools, and model.",
 		],
@@ -657,7 +840,7 @@ Available predefined subagents:\n${formatAgentList(discovery.agents, 20)}`;
 			const parentModel = getModelCliArg(ctx);
 
 			if (typeof params.task === "string" && !Array.isArray(params.tasks) && !Array.isArray(params.chain)) {
-				const { discovery, agent, error } = materializeAgent(ctx, params as TaskSpec);
+				const { discovery, agent, error } = materializeValidatedAgent(ctx, params as TaskSpec);
 				if (!agent) {
 					return {
 						content: [{ type: "text", text: `${error || "Invalid subagent spec"}\n\nAvailable subagents:\n${formatAgentList(discovery.agents)}` }],
@@ -666,7 +849,7 @@ Available predefined subagents:\n${formatAgentList(discovery.agents, 20)}`;
 				}
 
 				const handle = spawnSubagent(agent, params.task, params.cwd || ctx.cwd, parentModel);
-				if (signal) signal.addEventListener("abort", () => void killHandle(handle, "Caller aborted subagent_run"), { once: true });
+				bindAbort(signal, handle, "Caller aborted subagent_run");
 				const result = await waitForHandle(handle);
 				return {
 					content: [{ type: "text", text: result.resultText || result.error || "(no output)" }],
@@ -683,7 +866,7 @@ Available predefined subagents:\n${formatAgentList(discovery.agents, 20)}`;
 				}
 
 				const discovery = getAgents(ctx);
-				const materialized = (params.tasks as TaskSpec[]).map((task) => materializeAgent(ctx, task));
+				const materialized = (params.tasks as TaskSpec[]).map((task) => materializeValidatedAgent(ctx, task));
 				const failures = materialized.filter((value) => !value.agent);
 				if (failures.length > 0) {
 					return {
@@ -693,9 +876,10 @@ Available predefined subagents:\n${formatAgentList(discovery.agents, 20)}`;
 				}
 
 				const spawned = await mapWithConcurrencyLimit(params.tasks as TaskSpec[], MAX_CONCURRENCY, async (task, index) => {
+					if (signal?.aborted) throw new Error("Caller aborted subagent swarm");
 					const agent = materialized[index]!.agent!;
 					const handle = spawnSubagent(agent, task.task, task.cwd || ctx.cwd, parentModel);
-					if (signal) signal.addEventListener("abort", () => void killHandle(handle, "Caller aborted subagent swarm"), { once: true });
+					bindAbort(signal, handle, "Caller aborted subagent swarm");
 					return waitForHandle(handle);
 				});
 
@@ -720,7 +904,7 @@ Available predefined subagents:\n${formatAgentList(discovery.agents, 20)}`;
 			let previous = "";
 			for (let i = 0; i < chain.length; i++) {
 				const step = chain[i]!;
-				const { discovery: currentDiscovery, agent, error } = materializeAgent(ctx, step);
+				const { discovery: currentDiscovery, agent, error } = materializeValidatedAgent(ctx, step);
 				if (!agent) {
 					return {
 						content: [{ type: "text", text: `${error || `Invalid chain step ${i + 1}`}\n\nAvailable subagents:\n${formatAgentList(currentDiscovery.agents)}` }],
@@ -729,7 +913,7 @@ Available predefined subagents:\n${formatAgentList(discovery.agents, 20)}`;
 				}
 				const task = step.task.replace(/\{previous\}/g, previous);
 				const handle = spawnSubagent(agent, task, step.cwd || ctx.cwd, parentModel);
-				if (signal) signal.addEventListener("abort", () => void killHandle(handle, "Caller aborted subagent chain"), { once: true });
+				bindAbort(signal, handle, "Caller aborted subagent chain");
 				const result = await waitForHandle(handle);
 				results.push(result);
 				if (result.state !== "done") {
@@ -751,11 +935,13 @@ Available predefined subagents:\n${formatAgentList(discovery.agents, 20)}`;
 	pi.registerTool({
 		name: "subagent_start",
 		label: "Subagent Start",
-		description: "Start a background subagent and return immediately with its id.",
+		description: "Start a background subagent and return immediately with its id. Only use this when the user explicitly asks you to spawn a background subagent.",
+		promptSnippet: "Only when the user explicitly asks, start a background subagent and return its id.",
+		promptGuidelines: ["Do not use subagent_start unless the user explicitly asks for a background subagent."],
 		parameters: SingleSchema,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			rememberContext(ctx);
-			const { discovery, agent, error } = materializeAgent(ctx, params as TaskSpec);
+			const { discovery, agent, error } = materializeValidatedAgent(ctx, params as TaskSpec);
 			if (!agent) {
 				return {
 					content: [{ type: "text", text: `${error || "Invalid subagent spec"}\n\nAvailable subagents:\n${formatAgentList(discovery.agents)}` }],
@@ -800,7 +986,7 @@ Available predefined subagents:\n${formatAgentList(discovery.agents, 20)}`;
 				}
 				targets = [handle];
 			} else {
-				targets = [...handles.values()].filter((handle) => handle.state === "running" || handle.state === "starting");
+				targets = [...handles.values()].filter(isHandleActive);
 				if (targets.length === 0) {
 					return {
 						content: [{ type: "text", text: "No active subagents to wait for." }],
@@ -809,13 +995,11 @@ Available predefined subagents:\n${formatAgentList(discovery.agents, 20)}`;
 				}
 			}
 			if (signal) {
-				signal.addEventListener(
-					"abort",
-					() => {
-						for (const handle of targets) void killHandle(handle, "Caller aborted subagent_wait");
-					},
-					{ once: true },
-				);
+				const abort = () => {
+					for (const handle of targets) void killHandle(handle, "Caller aborted subagent_wait");
+				};
+				if (signal.aborted) abort();
+				else signal.addEventListener("abort", abort, { once: true });
 			}
 			const results = await waitForAll(targets, params.timeoutMs);
 			return {
@@ -858,7 +1042,7 @@ Available predefined subagents:\n${formatAgentList(discovery.agents, 20)}`;
 			rememberContext(ctx);
 			widgetVisible = !widgetVisible;
 			refreshUi();
-			ctx.ui.notify(`Subagent widget ${widgetVisible ? "shown" : "hidden"}.`, "info");
+			ctx.ui.notify(`Subagent widget ${widgetVisible ? "enabled for active subagents" : "disabled"}.`, "info");
 		},
 	});
 
