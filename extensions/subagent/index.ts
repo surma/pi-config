@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth, visibleWidth, type Focusable, type KeybindingsManager, type TUI } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { discoverAgents, formatAgentList, type AgentConfig } from "./agents.js";
+import { clearAgentDiscoveryCache, discoverAgents, formatAgentList, type AgentConfig } from "./agents.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const childExtensionPath = join(__dirname, "child.ts");
@@ -87,6 +87,8 @@ interface SubagentModelInfo {
 	contextWindow: number;
 	maxTokens: number;
 }
+
+type AgentDiscovery = Awaited<ReturnType<typeof discoverAgents>>;
 
 function now(): number {
 	return Date.now();
@@ -211,6 +213,14 @@ function createUsage(): UsageStats {
 function getModelCliArg(ctx: ExtensionContext): string | undefined {
 	if (!ctx.model) return undefined;
 	return `${ctx.model.provider}/${ctx.model.id}`;
+}
+
+function getSubagentDepth(): number {
+	return Math.max(0, Number.parseInt(process.env.PI_SUBAGENT_DEPTH || "0", 10) || 0);
+}
+
+function isNestedSubagent(): boolean {
+	return getSubagentDepth() > 0;
 }
 
 function formatUsage(usage: UsageStats, model?: string): string {
@@ -561,6 +571,19 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		latestCtx = ctx;
 	}
 
+	function getRequestedChildTools(agent: AgentConfig): string[] {
+		const parentActiveTools = new Set(pi.getActiveTools());
+		const requested = agent.tools && agent.tools.length > 0 ? agent.tools : Array.from(parentActiveTools);
+		return requested.filter((toolName) => parentActiveTools.has(toolName));
+	}
+
+	function nestedDelegationBlocked(toolName: "subagent_run" | "subagent_start") {
+		return {
+			content: [{ type: "text", text: `${toolName} is disabled inside delegated subagents. Report any need for further delegation back to the parent agent instead.` }],
+			details: { nestedDelegationBlocked: true },
+		};
+	}
+
 	function sortHandles(values: SubagentHandle[]): SubagentHandle[] {
 		return [...values].sort((a, b) => b.startedAt - a.startedAt || b.id.localeCompare(a.id));
 	}
@@ -667,6 +690,36 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		});
 	}
 
+	function waitForHandleOrAbort(handle: SubagentHandle, timeoutMs?: number, signal?: AbortSignal): Promise<SubagentHandle> {
+		if (!signal) return waitForHandle(handle, timeoutMs);
+		if (handle.completionSettled || signal.aborted) return Promise.resolve(handle);
+		return new Promise((resolve) => {
+			const waiter: { resolve: (handle: SubagentHandle) => void; timer?: NodeJS.Timeout } = {
+				resolve: (resolvedHandle) => {
+					cleanup();
+					resolve(resolvedHandle);
+				},
+			};
+			const cleanup = () => {
+				if (waiter.timer) clearTimeout(waiter.timer);
+				handle.waiters = handle.waiters.filter((value) => value !== waiter);
+				signal.removeEventListener("abort", onAbort);
+			};
+			const onAbort = () => {
+				cleanup();
+				resolve(handle);
+			};
+			if (timeoutMs && timeoutMs > 0) {
+				waiter.timer = setTimeout(() => {
+					cleanup();
+					resolve(handle);
+				}, timeoutMs);
+			}
+			signal.addEventListener("abort", onAbort, { once: true });
+			handle.waiters.push(waiter);
+		});
+	}
+
 	function sendRpc(proc: ChildProcessWithoutNullStreams, payload: Record<string, unknown>): void {
 		try {
 			proc.stdin.write(`${JSON.stringify(payload)}\n`);
@@ -752,9 +805,9 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		handles.set(handle.id, handle);
 		refreshUi();
 
-		const args = ["--mode", "rpc", "--no-session", "--no-extensions", "--extension", childExtensionPath];
+		const childActiveTools = getRequestedChildTools(agent);
+		const args = ["--mode", "rpc", "--no-session", "--extension", childExtensionPath];
 		if (selectedModel) args.push("--model", selectedModel);
-		if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
 
 		const invocation = getPiInvocation(args);
 		const proc = spawn(invocation.command, invocation.args, {
@@ -764,9 +817,13 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				...process.env,
 				PI_SUBAGENT_AGENT_NAME: agent.name,
 				PI_SUBAGENT_SYSTEM_PROMPT: agent.systemPrompt,
+				PI_SUBAGENT_ACTIVE_TOOLS: childActiveTools.join(","),
+				PI_SUBAGENT_DEPTH: String(getSubagentDepth() + 1),
 			},
 			shell: false,
 		});
+		proc.stdout.setEncoding("utf8");
+		proc.stderr.setEncoding("utf8");
 
 		handle.process = proc;
 		if (typeof proc.pid === "number") updateHandle(handle, { statusText: "Starting RPC session…" });
@@ -863,8 +920,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			}
 		};
 
-		proc.stdout.on("data", (chunk) => {
-			stdoutBuffer += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+		proc.stdout.on("data", (chunk: string) => {
+			stdoutBuffer += chunk;
 			while (true) {
 				const newlineIndex = stdoutBuffer.indexOf("\n");
 				if (newlineIndex === -1) break;
@@ -875,8 +932,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			}
 		});
 
-		proc.stderr.on("data", (chunk) => {
-			handle.stderr += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+		proc.stderr.on("data", (chunk: string) => {
+			handle.stderr += chunk;
 		});
 
 		proc.on("error", (error) => {
@@ -884,16 +941,17 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			settleHandle(handle);
 		});
 
-		proc.on("close", (code) => {
+		proc.on("close", (code, signal) => {
 			if (stdoutBuffer.trim()) processLine(stdoutBuffer.trim());
 			handle.process = undefined;
-			handle.exitCode = code ?? 0;
+			handle.exitCode = code ?? (signal ? 1 : 0);
 			if (!handle.completionSettled) {
 				if (handle.state !== "killed") {
-					if ((code ?? 0) === 0 && handle.state !== "error") {
+					if (code === 0 && handle.state !== "error") {
 						updateHandle(handle, { state: "done", statusText: truncate(handle.resultText, 96) || "Done" });
 					} else {
-						const errorText = truncate(handle.error || handle.stderr || `Exited with code ${code ?? 0}`, 120);
+						const exitDetail = signal ? `Exited via signal ${signal}` : `Exited with code ${code ?? 0}`;
+						const errorText = truncate(handle.error || handle.stderr || exitDetail, 120);
 						updateHandle(handle, { state: "error", error: errorText, statusText: errorText });
 					}
 				}
@@ -905,20 +963,12 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		return handle;
 	}
 
-	function getAgents(ctx: ExtensionContext): ReturnType<typeof discoverAgents> {
-		return discoverAgents(ctx.cwd, __dirname);
+	async function getAgents(ctx: ExtensionContext, cwd = ctx.cwd): Promise<AgentDiscovery> {
+		return discoverAgents(cwd, __dirname);
 	}
 
-	function findAgent(ctx: ExtensionContext, agentName: string): { discovery: ReturnType<typeof discoverAgents>; agent?: AgentConfig } {
-		const discovery = getAgents(ctx);
-		return { discovery, agent: discovery.agents.find((candidate) => candidate.name === agentName) };
-	}
-
-	function materializeAgent(
-		ctx: ExtensionContext,
-		spec: TaskSpec,
-	): { discovery: ReturnType<typeof discoverAgents>; agent?: AgentConfig; error?: string } {
-		const discovery = getAgents(ctx);
+	async function materializeAgent(ctx: ExtensionContext, spec: TaskSpec): Promise<{ discovery: AgentDiscovery; agent?: AgentConfig; error?: string }> {
+		const discovery = await getAgents(ctx, spec.cwd || ctx.cwd);
 		const base = spec.agent ? discovery.agents.find((candidate) => candidate.name === spec.agent) : undefined;
 		if (spec.agent && !base) {
 			return {
@@ -931,7 +981,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 - Stay tightly scoped to the assigned task.
 - Be concise and high-signal.
 - Use tools as needed, but avoid unnecessary work.
-- Return a definitive answer useful to the parent agent.`;
+- Return a definitive answer useful to the parent agent.
+- Never call subagent_run or subagent_start from within a subagent; report any need for further delegation back to the parent agent.`;
 		const mergedPrompt = [base?.systemPrompt || defaultPrompt, spec.systemPrompt || ""].filter(Boolean).join("\n\n");
 		const agent: AgentConfig = {
 			name: spec.name || base?.name || "adhoc",
@@ -945,11 +996,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		return { discovery, agent };
 	}
 
-	function materializeValidatedAgent(
-		ctx: ExtensionContext,
-		spec: TaskSpec,
-	): { discovery: ReturnType<typeof discoverAgents>; agent?: AgentConfig; error?: string } {
-		const result = materializeAgent(ctx, spec);
+	async function materializeValidatedAgent(ctx: ExtensionContext, spec: TaskSpec): Promise<{ discovery: AgentDiscovery; agent?: AgentConfig; error?: string }> {
+		const result = await materializeAgent(ctx, spec);
 		if (!result.agent?.model) return result;
 		const resolvedModel = resolveKnownModel(ctx, result.agent.model);
 		if (!resolvedModel.ref) {
@@ -962,13 +1010,19 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		return Promise.all(handlesToWait.map((handle) => waitForHandle(handle, timeoutMs)));
 	}
 
+	async function waitForAllOrAbort(handlesToWait: SubagentHandle[], timeoutMs: number | undefined, signal?: AbortSignal): Promise<SubagentHandle[]> {
+		return Promise.all(handlesToWait.map((handle) => waitForHandleOrAbort(handle, timeoutMs, signal)));
+	}
+
 	pi.on("session_start", async (_event, ctx) => {
 		rememberContext(ctx);
+		clearAgentDiscoveryCache();
 		refreshUi();
 	});
 
 	pi.on("session_switch", async (_event, ctx) => {
 		rememberContext(ctx);
+		clearAgentDiscoveryCache();
 		await killAll("Session switched");
 		handles.clear();
 		refreshUi();
@@ -976,6 +1030,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 
 	pi.on("session_fork", async (_event, ctx) => {
 		rememberContext(ctx);
+		clearAgentDiscoveryCache();
 		await killAll("Session forked");
 		handles.clear();
 		refreshUi();
@@ -994,8 +1049,12 @@ export default function subagentExtension(pi: ExtensionAPI) {
 
 	pi.on("before_agent_start", async (event, ctx) => {
 		rememberContext(ctx);
-		const discovery = getAgents(ctx);
-		const guidance = `\n\nSubagent extension is available.
+		const discovery = await getAgents(ctx);
+		const guidance = isNestedSubagent()
+			? `\n\nSubagent extension is loaded in this delegated child to preserve the parent environment.
+You are already inside a subagent. Never call subagent_run or subagent_start from within a subagent.
+If further delegation seems useful, report that back to the parent agent instead.`
+			: `\n\nSubagent extension is available.
 Do not use subagent_run or subagent_start unless the user explicitly asks you to delegate work to a subagent or spawn one.
 Use subagent_list, subagent_wait, and subagent_kill to inspect or control background subagents when relevant.
 Use subagent_models to inspect the exact model ids accepted by subagent model overrides in this session.
@@ -1063,6 +1122,7 @@ Available predefined subagents:\n${formatAgentList(discovery.agents, 20)}`;
 		promptSnippet: "Only when the user explicitly asks, delegate work to a specialized subagent or small swarm.",
 		promptGuidelines: [
 			"Do not use subagent_run unless the user explicitly asks for delegation, a subagent, or a swarm.",
+			"Never call subagent_run from within a delegated subagent; nested delegation is disabled.",
 			"Use tasks[] for small independent swarms, and chain[] for stepwise handoffs using {previous}.",
 			"Use subagent_models before setting a child model override when you are unsure which exact model ids are accepted.",
 			"You can override the child model per call with model: \"provider/model-id\".",
@@ -1071,11 +1131,12 @@ Available predefined subagents:\n${formatAgentList(discovery.agents, 20)}`;
 		parameters: RunSchema,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			rememberContext(ctx);
+			if (isNestedSubagent()) return nestedDelegationBlocked("subagent_run");
 
 			const parentModel = getModelCliArg(ctx);
 
 			if (typeof params.task === "string" && !Array.isArray(params.tasks) && !Array.isArray(params.chain)) {
-				const { discovery, agent, error } = materializeValidatedAgent(ctx, params as TaskSpec);
+				const { discovery, agent, error } = await materializeValidatedAgent(ctx, params as TaskSpec);
 				if (!agent) {
 					return {
 						content: [{ type: "text", text: `${error || "Invalid subagent spec"}\n\nAvailable subagents:\n${formatAgentList(discovery.agents)}` }],
@@ -1100,8 +1161,8 @@ Available predefined subagents:\n${formatAgentList(discovery.agents, 20)}`;
 					};
 				}
 
-				const discovery = getAgents(ctx);
-				const materialized = (params.tasks as TaskSpec[]).map((task) => materializeValidatedAgent(ctx, task));
+				const discovery = await getAgents(ctx);
+				const materialized = await Promise.all((params.tasks as TaskSpec[]).map((task) => materializeValidatedAgent(ctx, task)));
 				const failures = materialized.filter((value) => !value.agent);
 				if (failures.length > 0) {
 					return {
@@ -1127,7 +1188,7 @@ Available predefined subagents:\n${formatAgentList(discovery.agents, 20)}`;
 				};
 			}
 
-			const discovery = getAgents(ctx);
+			const discovery = await getAgents(ctx);
 			const chain = Array.isArray(params.chain) ? (params.chain as TaskSpec[]) : [];
 			if (chain.length === 0) {
 				return {
@@ -1139,7 +1200,7 @@ Available predefined subagents:\n${formatAgentList(discovery.agents, 20)}`;
 			let previous = "";
 			for (let i = 0; i < chain.length; i++) {
 				const step = chain[i]!;
-				const { discovery: currentDiscovery, agent, error } = materializeValidatedAgent(ctx, step);
+				const { discovery: currentDiscovery, agent, error } = await materializeValidatedAgent(ctx, step);
 				if (!agent) {
 					return {
 						content: [{ type: "text", text: `${error || `Invalid chain step ${i + 1}`}\n\nAvailable subagents:\n${formatAgentList(currentDiscovery.agents)}` }],
@@ -1172,11 +1233,15 @@ Available predefined subagents:\n${formatAgentList(discovery.agents, 20)}`;
 		label: "Subagent Start",
 		description: "Start a background subagent and return immediately with its id. Only use this when the user explicitly asks you to spawn a background subagent.",
 		promptSnippet: "Only when the user explicitly asks, start a background subagent and return its id.",
-		promptGuidelines: ["Do not use subagent_start unless the user explicitly asks for a background subagent."],
+		promptGuidelines: [
+			"Do not use subagent_start unless the user explicitly asks for a background subagent.",
+			"Never call subagent_start from within a delegated subagent; nested delegation is disabled.",
+		],
 		parameters: SingleSchema,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			rememberContext(ctx);
-			const { discovery, agent, error } = materializeValidatedAgent(ctx, params as TaskSpec);
+			if (isNestedSubagent()) return nestedDelegationBlocked("subagent_start");
+			const { discovery, agent, error } = await materializeValidatedAgent(ctx, params as TaskSpec);
 			if (!agent) {
 				return {
 					content: [{ type: "text", text: `${error || "Invalid subagent spec"}\n\nAvailable subagents:\n${formatAgentList(discovery.agents)}` }],
@@ -1235,14 +1300,7 @@ Available predefined subagents:\n${formatAgentList(discovery.agents, 20)}`;
 					};
 				}
 			}
-			if (signal) {
-				const abort = () => {
-					for (const handle of targets) void killHandle(handle, "Caller aborted subagent_wait");
-				};
-				if (signal.aborted) abort();
-				else signal.addEventListener("abort", abort, { once: true });
-			}
-			const results = await waitForAll(targets, params.timeoutMs);
+			const results = await waitForAllOrAbort(targets, params.timeoutMs, signal);
 			return {
 				content: [{ type: "text", text: results.map(formatHandleSummary).join("\n\n") }],
 				details: { handles: results.map(serializeHandle) },

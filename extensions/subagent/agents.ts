@@ -1,4 +1,5 @@
-import * as fs from "node:fs";
+import * as fs from "node:fs/promises";
+import type { Dirent } from "node:fs";
 import * as path from "node:path";
 import { getAgentDir, parseFrontmatter } from "@mariozechner/pi-coding-agent";
 
@@ -21,21 +22,24 @@ export interface AgentDiscoveryResult {
 	projectDir: string | null;
 }
 
-function isDirectory(dir: string): boolean {
+const DISCOVERY_CACHE_TTL_MS = 1000;
+const discoveryCache = new Map<string, { expiresAt: number; value?: AgentDiscoveryResult; promise?: Promise<AgentDiscoveryResult> }>();
+
+async function isDirectory(dir: string): Promise<boolean> {
 	try {
-		return fs.statSync(dir).isDirectory();
+		return (await fs.stat(dir)).isDirectory();
 	} catch {
 		return false;
 	}
 }
 
-function readAgentDirectory(dir: string, source: AgentSource): AgentConfig[] {
-	if (!isDirectory(dir)) return [];
+async function readAgentDirectory(dir: string, source: AgentSource): Promise<AgentConfig[]> {
+	if (!(await isDirectory(dir))) return [];
 
 	const agents: AgentConfig[] = [];
-	let entries: fs.Dirent[] = [];
+	let entries: Dirent[] = [];
 	try {
-		entries = fs.readdirSync(dir, { withFileTypes: true });
+		entries = await fs.readdir(dir, { withFileTypes: true });
 	} catch {
 		return [];
 	}
@@ -47,7 +51,7 @@ function readAgentDirectory(dir: string, source: AgentSource): AgentConfig[] {
 		const filePath = path.join(dir, entry.name);
 		let content = "";
 		try {
-			content = fs.readFileSync(filePath, "utf8");
+			content = await fs.readFile(filePath, "utf8");
 		} catch {
 			continue;
 		}
@@ -81,11 +85,11 @@ function readAgentDirectory(dir: string, source: AgentSource): AgentConfig[] {
 	return agents;
 }
 
-function findNearestProjectDir(cwd: string): string | null {
+async function findNearestProjectDir(cwd: string): Promise<string | null> {
 	let current = cwd;
 	while (true) {
 		const candidate = path.join(current, ".pi", "subagents");
-		if (isDirectory(candidate)) return candidate;
+		if (await isDirectory(candidate)) return candidate;
 
 		const parent = path.dirname(current);
 		if (parent === current) return null;
@@ -93,16 +97,16 @@ function findNearestProjectDir(cwd: string): string | null {
 	}
 }
 
-export function discoverAgents(cwd: string, extensionDir: string): AgentDiscoveryResult {
+async function discoverAgentsUncached(cwd: string, extensionDir: string): Promise<AgentDiscoveryResult> {
 	const builtinDir = path.join(extensionDir, "agents");
 	const userDir = path.join(getAgentDir(), "subagents");
-	const projectDir = findNearestProjectDir(cwd);
+	const projectDir = await findNearestProjectDir(cwd);
 
 	const map = new Map<string, AgentConfig>();
-	for (const agent of readAgentDirectory(builtinDir, "builtin")) map.set(agent.name, agent);
-	for (const agent of readAgentDirectory(userDir, "user")) map.set(agent.name, agent);
+	for (const agent of await readAgentDirectory(builtinDir, "builtin")) map.set(agent.name, agent);
+	for (const agent of await readAgentDirectory(userDir, "user")) map.set(agent.name, agent);
 	if (projectDir) {
-		for (const agent of readAgentDirectory(projectDir, "project")) map.set(agent.name, agent);
+		for (const agent of await readAgentDirectory(projectDir, "project")) map.set(agent.name, agent);
 	}
 
 	return {
@@ -111,6 +115,32 @@ export function discoverAgents(cwd: string, extensionDir: string): AgentDiscover
 		userDir,
 		projectDir,
 	};
+}
+
+export async function discoverAgents(cwd: string, extensionDir: string): Promise<AgentDiscoveryResult> {
+	const key = `${extensionDir}\u0000${cwd}`;
+	const cached = discoveryCache.get(key);
+	const currentTime = Date.now();
+	if (cached && cached.expiresAt > currentTime) {
+		if (cached.value) return cached.value;
+		if (cached.promise) return cached.promise;
+	}
+
+	const promise = discoverAgentsUncached(cwd, extensionDir);
+	discoveryCache.set(key, { expiresAt: currentTime + DISCOVERY_CACHE_TTL_MS, promise });
+	try {
+		const value = await promise;
+		discoveryCache.set(key, { expiresAt: Date.now() + DISCOVERY_CACHE_TTL_MS, value });
+		return value;
+	} catch (error) {
+		const current = discoveryCache.get(key);
+		if (current?.promise === promise) discoveryCache.delete(key);
+		throw error;
+	}
+}
+
+export function clearAgentDiscoveryCache(): void {
+	discoveryCache.clear();
 }
 
 export function formatAgentList(agents: AgentConfig[], maxItems = 12): string {
