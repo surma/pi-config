@@ -16,7 +16,9 @@ import { type AssistantMessage, type Message, type ThinkingLevel as AiThinkingLe
 import {
 	Container,
 	Input,
+	Key,
 	Markdown,
+	matchesKey,
 	truncateToWidth,
 	visibleWidth,
 	type Focusable,
@@ -193,6 +195,17 @@ function notify(ctx: ExtensionContext | ExtensionCommandContext, message: string
 	}
 }
 
+function setMouseReporting(enabled: boolean): void {
+	if (!process.stdout.isTTY) {
+		return;
+	}
+
+	try {
+		process.stdout.write(enabled ? "\x1b[?1000h\x1b[?1002h\x1b[?1006h" : "\x1b[?1006l\x1b[?1002l\x1b[?1000l");
+	} catch {
+		// Ignore terminal capability errors.
+	}
+}
 
 class BtwOverlay extends Container implements Focusable {
 	private readonly input: Input;
@@ -203,6 +216,9 @@ class BtwOverlay extends Container implements Focusable {
 	private readonly getStatus: () => string;
 	private readonly onSubmitCallback: (value: string) => void;
 	private readonly onDismissCallback: () => void;
+	private scrollOffset = 0;
+	private viewHeight = 0;
+	private totalLines = 0;
 	private _focused = false;
 
 	get focused(): boolean {
@@ -250,6 +266,32 @@ class BtwOverlay extends Container implements Focusable {
 			return;
 		}
 
+		const mouseScrollDelta = this.parseMouseScrollDelta(data);
+		if (mouseScrollDelta !== 0) {
+			this.scrollBy(mouseScrollDelta);
+			return;
+		}
+
+		if (matchesKey(data, Key.up)) {
+			this.scrollBy(1);
+			return;
+		}
+		if (matchesKey(data, Key.down)) {
+			this.scrollBy(-1);
+			return;
+		}
+		if (matchesKey(data, Key.pageUp)) {
+			this.scrollBy(this.viewHeight || 1);
+			return;
+		}
+		if (matchesKey(data, Key.pageDown)) {
+			this.scrollBy(-(this.viewHeight || 1));
+			return;
+		}
+		if (this.isMouseEvent(data)) {
+			return;
+		}
+
 		this.input.handleInput(data);
 	}
 
@@ -260,6 +302,50 @@ class BtwOverlay extends Container implements Focusable {
 
 	getDraft(): string {
 		return this.input.getValue();
+	}
+
+	private isMouseEvent(data: string): boolean {
+		return /^\x1b\[<\d+;\d+;\d+[Mm]$/u.test(data) || (data.startsWith("\x1b[M") && data.length >= 6);
+	}
+
+	private parseMouseScrollDelta(data: string): number {
+		const sgrMouseMatch = /^\x1b\[<(\d+);\d+;\d+([Mm])$/u.exec(data);
+		if (sgrMouseMatch) {
+			const code = Number(sgrMouseMatch[1]);
+			return this.getWheelDeltaFromMouseButtonCode(code);
+		}
+
+		if (data.startsWith("\x1b[M") && data.length >= 6) {
+			const code = data.charCodeAt(3) - 32;
+			return this.getWheelDeltaFromMouseButtonCode(code);
+		}
+
+		return 0;
+	}
+
+	private getWheelDeltaFromMouseButtonCode(code: number): number {
+		if (!Number.isFinite(code) || (code & 64) === 0) {
+			return 0;
+		}
+
+		const wheelDirection = code & 0b11;
+		if (wheelDirection === 0) {
+			return 3;
+		}
+		if (wheelDirection === 1) {
+			return -3;
+		}
+		return 0;
+	}
+
+	private scrollBy(delta: number): void {
+		const maxScroll = Math.max(0, this.totalLines - this.viewHeight);
+		const next = Math.max(0, Math.min(this.scrollOffset + delta, maxScroll));
+		if (next === this.scrollOffset) {
+			return;
+		}
+		this.scrollOffset = next;
+		this.tui.requestRender();
 	}
 
 	private frameLine(content: string, innerWidth: number): string {
@@ -284,10 +370,22 @@ class BtwOverlay extends Container implements Focusable {
 
 		// Markdown renders to innerWidth already — no manual wrapping needed
 		const transcript = this.getTranscript(innerWidth, this.theme);
-		const visibleTranscript = transcript.slice(-transcriptHeight);
+		const previousTotalLines = this.totalLines;
+		this.totalLines = transcript.length;
+		if (this.scrollOffset > 0 && this.totalLines > previousTotalLines) {
+			this.scrollOffset += this.totalLines - previousTotalLines;
+		}
+		this.viewHeight = transcriptHeight;
+		const maxScroll = Math.max(0, this.totalLines - transcriptHeight);
+		this.scrollOffset = Math.max(0, Math.min(this.scrollOffset, maxScroll));
+		const end = Math.max(0, this.totalLines - this.scrollOffset);
+		const start = Math.max(0, end - transcriptHeight);
+		const visibleTranscript = transcript.slice(start, end);
 		const transcriptPadding = Math.max(0, transcriptHeight - visibleTranscript.length);
 
 		const status = this.getStatus();
+		const scrollInfo =
+			this.totalLines > transcriptHeight ? ` ${start + 1}-${end}/${this.totalLines}` : "";
 
 		const previousFocused = this.input.focused;
 		this.input.focused = false;
@@ -313,7 +411,12 @@ class BtwOverlay extends Container implements Focusable {
 		lines.push(
 			`${this.theme.fg("borderMuted", "│")}${inputLine}${this.theme.fg("borderMuted", "│")}`,
 		);
-		lines.push(this.frameLine(this.theme.fg("dim", "Enter submit · Esc close"), innerWidth));
+		lines.push(
+			this.frameLine(
+				this.theme.fg("dim", `Enter submit · Esc close · ↑/↓ scroll · PgUp/PgDn page${scrollInfo}`),
+				innerWidth,
+			),
+		);
 		lines.push(this.borderLine(innerWidth, "bottom"));
 
 		return lines;
@@ -401,7 +504,7 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		const lines: string[] = [];
-		for (const item of thread.slice(-6)) {
+		for (const item of thread) {
 			// User message
 			const userText = item.question.trim().split("\n")[0];
 			lines.push(theme.fg("accent", theme.bold("You: ")) + truncateToWidth(userText, width - 5, "…"));
@@ -665,6 +768,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			runtime.closed = true;
+			setMouseReporting(false);
 			runtime.handle?.hide();
 			if (overlayRuntime === runtime) {
 				overlayRuntime = null;
@@ -677,6 +781,7 @@ export default function (pi: ExtensionAPI) {
 		void ctx.ui
 			.custom<void>(
 				async (tui, theme, keybindings, done) => {
+					setMouseReporting(true);
 					runtime.finish = () => done();
 
 					const overlay = new BtwOverlay(
@@ -730,6 +835,7 @@ export default function (pi: ExtensionAPI) {
 				},
 			)
 			.catch((error) => {
+				setMouseReporting(false);
 				if (overlayRuntime === runtime) {
 					overlayRuntime = null;
 				}
@@ -840,6 +946,7 @@ export default function (pi: ExtensionAPI) {
 		pendingAnswer = "";
 		pendingError = null;
 		pendingToolCalls = [];
+		setOverlayDraft("");
 		setOverlayStatus("Streaming side response...");
 		syncOverlay();
 
@@ -892,7 +999,6 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		setOverlayDraft("");
 		if (!("waitForIdle" in ctx)) {
 			setOverlayStatus("BTW submit requires command context. Re-open with /btw.");
 			return;
