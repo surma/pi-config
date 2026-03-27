@@ -98,6 +98,7 @@ class LspStatusOverlay implements Focusable {
 				this.theme.fg("dim", " · ") +
 				this.theme.fg("error", `✕ ${counts.broken} broken`),
 		);
+		lines.push(`${this.theme.fg("dim", "Logs    ")} ${this.theme.fg("muted", this.manager.getLogFilePath())}`);
 		lines.push("");
 
 		if (configErrors.length > 0) {

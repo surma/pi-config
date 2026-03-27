@@ -7,6 +7,7 @@ import { buildRegistry, selectEntryForFile } from "./registry.ts";
 import { loadOverlayConfig } from "./config.ts";
 import { LspClient, resolveExecutable } from "./client.ts";
 import { buildNixPackages, resolveCommandFromNixOutputs } from "./nix.ts";
+import { LspLogSink } from "./log.ts";
 import {
 	createDefaultLspDefaults,
 	createEmptySeverityCounts,
@@ -110,6 +111,7 @@ export class LspManager {
 	private latestCtx?: ExtensionContext;
 	private listeners = new Set<() => void>();
 	private configErrors: string[] = [];
+	private readonly logSink = new LspLogSink();
 
 	rememberContext(ctx: ExtensionContext): void {
 		this.latestCtx = ctx;
@@ -126,7 +128,11 @@ export class LspManager {
 	}
 
 	private log(message: string): void {
-		console.error(`[pi-lsp] ${message}`);
+		this.logSink.append(`[pi-lsp] ${message}`);
+	}
+
+	getLogFilePath(): string {
+		return this.logSink.filePath;
 	}
 
 	async reload(ctx: ExtensionContext): Promise<void> {
@@ -149,6 +155,7 @@ export class LspManager {
 		for (const state of active) {
 			await state.client.shutdown().catch(() => undefined);
 		}
+		await this.logSink.flush().catch(() => undefined);
 		this.notifyStateChange();
 	}
 
@@ -235,6 +242,8 @@ export class LspManager {
 
 	getStatusReport(cwd: string): string {
 		const lines: string[] = [];
+		lines.push(`Logs: ${this.getLogFilePath()}`);
+		lines.push("");
 		if (this.configErrors.length > 0) {
 			lines.push("Config errors:");
 			for (const error of this.configErrors) lines.push(`- ${error}`);
