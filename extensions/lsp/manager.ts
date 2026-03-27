@@ -5,7 +5,8 @@ import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { formatMutationDiagnosticsSection, countDiagnostics, mergeSeverityCounts } from "./diagnostics.ts";
 import { buildRegistry, selectEntryForFile } from "./registry.ts";
 import { loadOverlayConfig } from "./config.ts";
-import { LspClient } from "./client.ts";
+import { LspClient, resolveExecutable } from "./client.ts";
+import { buildNixPackages, resolveCommandFromNixOutputs } from "./nix.ts";
 import {
 	createDefaultLspDefaults,
 	createEmptySeverityCounts,
@@ -104,6 +105,8 @@ export class LspManager {
 	private spawning = new Map<string, SpawningState>();
 	private broken = new Map<string, BrokenState>();
 	private openDocs = new Map<string, OpenDocState>();
+	private installingPackages = new Map<string, Promise<string[]>>();
+	private builtPackageOutputs = new Map<string, string[]>();
 	private latestCtx?: ExtensionContext;
 	private listeners = new Set<() => void>();
 	private configErrors: string[] = [];
@@ -258,6 +261,9 @@ export class LspManager {
 
 	async resolveFileClient(filePath: string, ctx: ExtensionContext): Promise<{ client: LspClient; ref: ResolvedClientRef }> {
 		const ref = await this.resolveClientRef(filePath, ctx, true);
+		if (!ref) {
+			throw new Error(`No configured LSP entry can handle file: ${describeFile(filePath, ctx.cwd)}`);
+		}
 		const clientState = await this.ensureClient(ref, filePath, ctx);
 		return { client: clientState.client, ref };
 	}
@@ -437,6 +443,7 @@ export class LspManager {
 		const promise = (async () => {
 			try {
 				const spawnSpec = await ref.entry.spawn(ref.root, ctx);
+				await this.ensureCommandAvailable(ref.entry, ref.root, spawnSpec);
 				const client = new LspClient({
 					entry: ref.entry,
 					root: ref.root,
@@ -462,7 +469,7 @@ export class LspManager {
 				const reason = this.normalizeStartupError(error);
 				this.markBroken(ref, reason);
 				throw new Error(
-					`LSP unavailable for ${describeFile(filePath, ctx.cwd)}.\nSelected entry: ${ref.entry.id}\nWorkspace root: ${ref.root}\nReason: ${reason}\nThis extension is running in installed-only mode; auto-install is not enabled in v1.`,
+					`LSP unavailable for ${describeFile(filePath, ctx.cwd)}.\nSelected entry: ${ref.entry.id}\nWorkspace root: ${ref.root}\nReason: ${reason}`,
 				);
 			} finally {
 				this.spawning.delete(ref.key);
@@ -471,6 +478,54 @@ export class LspManager {
 		})();
 
 		this.spawning.set(ref.key, { entry: ref.entry, root: ref.root, promise });
+		this.notifyStateChange();
+		return promise;
+	}
+
+	private async ensureCommandAvailable(entry: ResolvedClientRef["entry"], root: string, spawnSpec: { command: string[]; cwd?: string; env?: Record<string, string> }): Promise<void> {
+		const command = spawnSpec.command[0];
+		if (!command) return;
+		const spawnCwd = path.resolve(spawnSpec.cwd ?? root);
+		const resolved = await resolveExecutable(command, spawnCwd, spawnSpec.env);
+		if (resolved) {
+			spawnSpec.command[0] = resolved;
+			return;
+		}
+		if (path.isAbsolute(command) || command.includes(path.sep)) {
+			throw new Error(`command '${command}' was not found`);
+		}
+		if (!entry.autoInstallViaNix || !entry.nixPackages || entry.nixPackages.length === 0) {
+			throw new Error(`command '${command}' was not found`);
+		}
+		let outputs: string[];
+		try {
+			outputs = await this.ensurePackagesBuilt(entry.nixFlake, entry.nixPackages, entry.installTimeoutMs);
+		} catch (error) {
+			throw new Error(`auto-build via nix failed for ${entry.id}: ${error instanceof Error ? error.message : String(error)}`);
+		}
+		const resolvedFromOutputs = await resolveCommandFromNixOutputs(command, outputs);
+		if (!resolvedFromOutputs) {
+			throw new Error(`command '${command}' was not found after building nix package(s): ${entry.nixPackages.join(", ")}`);
+		}
+		spawnSpec.command[0] = resolvedFromOutputs;
+	}
+
+	private async ensurePackagesBuilt(flake: string, packages: string[], timeoutMs: number): Promise<string[]> {
+		const key = `${flake}::${[...packages].sort().join(",")}`;
+		const cached = this.builtPackageOutputs.get(key);
+		if (cached) return cached;
+		const existing = this.installingPackages.get(key);
+		if (existing) return existing;
+		const promise = buildNixPackages(flake, packages, timeoutMs, (message) => this.log(message))
+			.then((outputs) => {
+				this.builtPackageOutputs.set(key, outputs);
+				return outputs;
+			})
+			.finally(() => {
+				this.installingPackages.delete(key);
+				this.notifyStateChange();
+			});
+		this.installingPackages.set(key, promise);
 		this.notifyStateChange();
 		return promise;
 	}
@@ -579,8 +634,9 @@ export class LspManager {
 		const capped = active.slice(0, 3).map((value) => value.text);
 		const overflow = active.length - capped.length;
 		const overflowText = overflow > 0 ? `${theme.fg("dim", " +")}${theme.fg("warning", String(overflow))}` : "";
+		const installingText = this.installingPackages.size > 0 ? `${theme.fg("dim", " · ")}${theme.fg("warning", `build ${this.installingPackages.size}`)}` : "";
 		const brokenText = this.broken.size > 0 ? `${theme.fg("dim", " · ")}${theme.fg("error", `${this.broken.size} broken`)}` : "";
-		ctx.ui.setStatus("lsp", `${badge} ${capped.join(theme.fg("dim", " · "))}${overflowText}${brokenText}`);
+		ctx.ui.setStatus("lsp", `${badge} ${capped.join(theme.fg("dim", " · "))}${overflowText}${installingText}${brokenText}`);
 	}
 
 	private normalizeLocation(value: any): LspLocationItem | undefined {

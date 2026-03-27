@@ -58,6 +58,9 @@ function normalizeDefaults(raw: Partial<LspDefaults> | undefined): Partial<LspDe
 	if (typeof raw.diagnosticsWaitTimeoutMs === "number") result.diagnosticsWaitTimeoutMs = raw.diagnosticsWaitTimeoutMs;
 	if (typeof raw.diagnosticsDebounceMs === "number") result.diagnosticsDebounceMs = raw.diagnosticsDebounceMs;
 	if (typeof raw.cooldownMs === "number") result.cooldownMs = raw.cooldownMs;
+	if (typeof raw.autoInstallViaNix === "boolean") result.autoInstallViaNix = raw.autoInstallViaNix;
+	if (typeof raw.installTimeoutMs === "number") result.installTimeoutMs = raw.installTimeoutMs;
+	if (typeof raw.nixFlake === "string" && raw.nixFlake.trim()) result.nixFlake = raw.nixFlake.trim();
 	return result;
 }
 

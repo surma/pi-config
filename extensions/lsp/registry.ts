@@ -35,6 +35,8 @@ type BaseEntrySpec = {
 	spawn?: (root: string, ctx: ExtensionContext, patch: OverlayEntryConfig) => Promise<{ command: string[]; env?: Record<string, string> }>;
 	initializationOptions?: unknown;
 	configuration?: unknown;
+	nixPackages?: string[];
+	nixFlake?: string;
 };
 
 const JS_TS_DENO_MARKERS = ["deno.json", "deno.jsonc"];
@@ -84,6 +86,10 @@ function applyDefaultValues(spec: BaseEntrySpec, patch: OverlayEntryConfig | und
 		diagnosticsWaitTimeoutMs: patch?.diagnosticsWaitTimeoutMs ?? defaults.diagnosticsWaitTimeoutMs,
 		diagnosticsDebounceMs: patch?.diagnosticsDebounceMs ?? defaults.diagnosticsDebounceMs,
 		cooldownMs: patch?.cooldownMs ?? defaults.cooldownMs,
+		autoInstallViaNix: patch?.autoInstallViaNix ?? defaults.autoInstallViaNix,
+		installTimeoutMs: patch?.installTimeoutMs ?? defaults.installTimeoutMs,
+		nixFlake: patch?.nixFlake ?? spec.nixFlake ?? defaults.nixFlake,
+		nixPackages: patch?.nixPackages ?? spec.nixPackages,
 		matchSpec: patch?.match ?? spec.matchSpec,
 		rootMarkers,
 		initializationOptions: mergedInitializationOptions,
@@ -126,6 +132,7 @@ function buildBuiltInSpecs(): BaseEntrySpec[] {
 	return [
 		{
 			id: "deno",
+			nixPackages: ["deno"],
 			serverName: "Deno Language Server",
 			languageName: "Deno",
 			priority: 10,
@@ -140,6 +147,7 @@ function buildBuiltInSpecs(): BaseEntrySpec[] {
 		},
 		{
 			id: "typescript",
+			nixPackages: ["typescript-language-server"],
 			serverName: "TypeScript Language Server",
 			languageName: "TypeScript / JavaScript",
 			priority: 20,
@@ -152,6 +160,7 @@ function buildBuiltInSpecs(): BaseEntrySpec[] {
 		},
 		{
 			id: "gopls",
+			nixPackages: ["gopls"],
 			serverName: "gopls",
 			languageName: "Go",
 			languageId: "go",
@@ -162,6 +171,7 @@ function buildBuiltInSpecs(): BaseEntrySpec[] {
 		},
 		{
 			id: "rust",
+			nixPackages: ["rust-analyzer"],
 			serverName: "rust-analyzer",
 			languageName: "Rust",
 			languageId: "rust",
@@ -172,6 +182,7 @@ function buildBuiltInSpecs(): BaseEntrySpec[] {
 		},
 		{
 			id: "rubocop",
+			nixPackages: ["rubyPackages.rubocop"],
 			serverName: "RuboCop LSP",
 			languageName: "Ruby",
 			languageId: "ruby",
@@ -194,6 +205,7 @@ function buildBuiltInSpecs(): BaseEntrySpec[] {
 		},
 		{
 			id: "nixd",
+			nixPackages: ["nixd"],
 			serverName: "nixd",
 			languageName: "Nix",
 			languageId: "nix",
@@ -204,6 +216,7 @@ function buildBuiltInSpecs(): BaseEntrySpec[] {
 		},
 		{
 			id: "bash",
+			nixPackages: ["bash-language-server"],
 			serverName: "Bash Language Server",
 			languageName: "Bash",
 			languageId: "shellscript",
@@ -213,6 +226,7 @@ function buildBuiltInSpecs(): BaseEntrySpec[] {
 		},
 		{
 			id: "zsh",
+			nixPackages: ["bash-language-server"],
 			serverName: "Bash Language Server",
 			languageName: "Zsh",
 			languageId: "shellscript",
@@ -222,6 +236,7 @@ function buildBuiltInSpecs(): BaseEntrySpec[] {
 		},
 		{
 			id: "nushell",
+			nixPackages: ["nushell"],
 			serverName: "Nushell LSP",
 			languageName: "Nushell",
 			languageId: "nushell",
@@ -231,6 +246,7 @@ function buildBuiltInSpecs(): BaseEntrySpec[] {
 		},
 		{
 			id: "zig",
+			nixPackages: ["zls"],
 			serverName: "ZLS",
 			languageName: "Zig",
 			languageId: "zig",
@@ -240,6 +256,7 @@ function buildBuiltInSpecs(): BaseEntrySpec[] {
 		},
 		{
 			id: "html",
+			nixPackages: ["vscode-langservers-extracted"],
 			serverName: "VSCode HTML Language Server",
 			languageName: "HTML",
 			languageId: "html",
@@ -249,6 +266,7 @@ function buildBuiltInSpecs(): BaseEntrySpec[] {
 		},
 		{
 			id: "css",
+			nixPackages: ["vscode-langservers-extracted"],
 			serverName: "VSCode CSS Language Server",
 			languageName: "CSS",
 			languageId: "css",
@@ -258,6 +276,7 @@ function buildBuiltInSpecs(): BaseEntrySpec[] {
 		},
 		{
 			id: "yaml",
+			nixPackages: ["yaml-language-server"],
 			serverName: "YAML Language Server",
 			languageName: "YAML",
 			languageId: "yaml",
@@ -267,6 +286,7 @@ function buildBuiltInSpecs(): BaseEntrySpec[] {
 		},
 		{
 			id: "python",
+			nixPackages: ["pyright"],
 			serverName: "Pyright Language Server",
 			languageName: "Python",
 			languageId: "python",
@@ -276,6 +296,7 @@ function buildBuiltInSpecs(): BaseEntrySpec[] {
 		},
 		{
 			id: "vue",
+			nixPackages: ["vue-language-server"],
 			serverName: "Vue Language Server",
 			languageName: "Vue",
 			languageId: "vue",
@@ -285,6 +306,7 @@ function buildBuiltInSpecs(): BaseEntrySpec[] {
 		},
 		{
 			id: "astro",
+			nixPackages: ["astro-language-server"],
 			serverName: "Astro Language Server",
 			languageName: "Astro",
 			languageId: "astro",
@@ -294,6 +316,7 @@ function buildBuiltInSpecs(): BaseEntrySpec[] {
 		},
 		{
 			id: "svelte",
+			nixPackages: ["svelte-language-server"],
 			serverName: "Svelte Language Server",
 			languageName: "Svelte",
 			languageId: "svelte",
@@ -303,6 +326,7 @@ function buildBuiltInSpecs(): BaseEntrySpec[] {
 		},
 		{
 			id: "clangd",
+			nixPackages: ["clang-tools"],
 			serverName: "clangd",
 			languageName: "C / C++",
 			priority: 115,
@@ -333,6 +357,10 @@ function buildCustomEntry(id: string, patch: OverlayEntryConfig, defaults: LspDe
 		diagnosticsWaitTimeoutMs: patch.diagnosticsWaitTimeoutMs ?? defaults.diagnosticsWaitTimeoutMs,
 		diagnosticsDebounceMs: patch.diagnosticsDebounceMs ?? defaults.diagnosticsDebounceMs,
 		cooldownMs: patch.cooldownMs ?? defaults.cooldownMs,
+		autoInstallViaNix: patch.autoInstallViaNix ?? defaults.autoInstallViaNix,
+		installTimeoutMs: patch.installTimeoutMs ?? defaults.installTimeoutMs,
+		nixFlake: patch.nixFlake ?? defaults.nixFlake,
+		nixPackages: patch.nixPackages,
 		matchSpec: patch.match,
 		rootMarkers: patch.rootMarkers,
 		configuration: patch.configuration,

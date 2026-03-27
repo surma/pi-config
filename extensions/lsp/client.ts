@@ -37,7 +37,7 @@ async function accessExecutable(filePath: string): Promise<boolean> {
 	}
 }
 
-async function resolveExecutable(command: string, cwd: string, env?: Record<string, string>): Promise<string | undefined> {
+export async function resolveExecutable(command: string, cwd: string, env?: Record<string, string>): Promise<string | undefined> {
 	if (path.isAbsolute(command)) {
 		return (await accessExecutable(command)) ? command : undefined;
 	}
@@ -310,14 +310,15 @@ export class LspClient {
 				case "workspace/configuration": {
 					const items = Array.isArray(params?.items) ? params.items : [];
 					result = items.map((item: any) => {
+						if (this.spawnSpec.configuration === undefined) return {};
 						const section = typeof item?.section === "string" ? item.section : undefined;
-						if (!section || this.spawnSpec.configuration === undefined) return this.spawnSpec.configuration ?? null;
+						if (!section) return this.spawnSpec.configuration;
 						const parts = section.split(".");
 						let current: any = this.spawnSpec.configuration;
 						for (const part of parts) {
 							current = current?.[part];
 						}
-						return current ?? null;
+						return current ?? {};
 					});
 					break;
 				}

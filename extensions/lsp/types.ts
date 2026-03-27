@@ -1,10 +1,12 @@
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 
+export const DEFAULT_NIX_FLAKE = "github:nixos/nixpkgs/nixos-25.11";
 export const DEFAULT_STARTUP_TIMEOUT_MS = 30_000;
 export const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 export const DEFAULT_DIAGNOSTICS_DEBOUNCE_MS = 150;
 export const DEFAULT_DIAGNOSTICS_WAIT_TIMEOUT_MS = 2_000;
 export const DEFAULT_BROKEN_COOLDOWN_MS = 30_000;
+export const DEFAULT_INSTALL_TIMEOUT_MS = 10 * 60_000;
 
 export type LspToolOperation =
 	| "servers"
@@ -33,6 +35,10 @@ export type LspEntry = {
 	diagnosticsWaitTimeoutMs: number;
 	diagnosticsDebounceMs: number;
 	cooldownMs: number;
+	autoInstallViaNix: boolean;
+	installTimeoutMs: number;
+	nixFlake: string;
+	nixPackages?: string[];
 	matchSpec?: LspMatchSpec;
 	rootMarkers?: string[];
 	configuration?: unknown;
@@ -57,6 +63,9 @@ export type LspDefaults = {
 	diagnosticsWaitTimeoutMs: number;
 	diagnosticsDebounceMs: number;
 	cooldownMs: number;
+	autoInstallViaNix: boolean;
+	installTimeoutMs: number;
+	nixFlake: string;
 };
 
 export type OverlayEntryConfig = {
@@ -75,6 +84,10 @@ export type OverlayEntryConfig = {
 	diagnosticsWaitTimeoutMs?: number;
 	diagnosticsDebounceMs?: number;
 	cooldownMs?: number;
+	autoInstallViaNix?: boolean;
+	installTimeoutMs?: number;
+	nixFlake?: string;
+	nixPackages?: string[];
 };
 
 export type OverlayFile = {
@@ -196,6 +209,9 @@ export function createDefaultLspDefaults(): LspDefaults {
 		diagnosticsWaitTimeoutMs: DEFAULT_DIAGNOSTICS_WAIT_TIMEOUT_MS,
 		diagnosticsDebounceMs: DEFAULT_DIAGNOSTICS_DEBOUNCE_MS,
 		cooldownMs: DEFAULT_BROKEN_COOLDOWN_MS,
+		autoInstallViaNix: true,
+		installTimeoutMs: DEFAULT_INSTALL_TIMEOUT_MS,
+		nixFlake: DEFAULT_NIX_FLAKE,
 	};
 }
 
