@@ -8,7 +8,7 @@ Use the subagent tool with the `tasks` parameter to run exactly one independent 
 Before spawning subagents, if model overrides require exact ids, use `subagent_models` to resolve the closest exact available ids for these requested models. Resolve the ids once up front and note any substitutions you had to make:
 - Anthropic: Claude Opus 4.6
 - OpenAI: GPT 5.4
-- Google: Gemini 3 Pro
+- OpenAI: GPT 5.3 Codex (NOT spark!)
 
 Launch review subagents with the same review brief but different models. Prefer the built-in `reviewer` agent with per-call `model` overrides if available; otherwise launch ad hoc read-only review subagents.
 
