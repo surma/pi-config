@@ -61,6 +61,9 @@ Use `fetch` to read the contents of a specific source page:
 
 ```bash
 web-search fetch https://example.com/article
+web-search fetch --mode static https://example.com/article
+web-search fetch --mode browser-dom https://example.com/article
+web-search fetch --mode browser-a11y https://example.com/article
 ```
 
 Use this when:
@@ -69,24 +72,43 @@ Use this when:
 - you want to inspect the original wording of documentation or an announcement
 - you need examples, tables, caveats, or exact API details omitted by search summaries
 
+### Fetch modes
+
+- `auto`: default; good first try
+- `static`: prefer for normal documentation pages, blogs, and simple HTML pages
+- `browser-dom`: prefer for JavaScript-rendered pages, interactive docs, and sites where `static` misses content
+- `browser-a11y`: useful fallback when DOM extraction is noisy and the rendered accessibility tree is cleaner
+
+If `fetch` is weak, retry with an explicit mode before giving up.
+
 ## Recommended workflow
 
 1. Start with `web-search search` using a natural-language query.
 2. Check whether the answer is about the correct technology and timeframe.
 3. Refine the query if the results are ambiguous, off-topic, or too shallow.
-4. Use `web-search fetch` on the most relevant cited sources.
+4. Use `web-search fetch` on the most relevant cited sources, and retry with an explicit `--mode` if the first extraction is weak.
 5. Prefer primary sources when possible: official docs, specs, repos, release notes, or vendor posts.
 6. Cross-check important claims when accuracy matters.
 
 ## Handling weak or lossy pages
 
-`web-search fetch` works from HTML converted to markdown. Some sites are dynamic or convert poorly.
+`web-search fetch` works from HTML converted to markdown. Some sites are dynamic, app-like, or PDF-based and may convert poorly.
 
-If a fetched page is incomplete, misleading, or missing key content, fall back to grabbing the raw content directly:
+If a fetched page is incomplete, misleading, missing key content, or comes back as obvious garbage, use this playbook:
+
+1. Retry with an explicit mode:
+   - `web-search fetch --mode static <url>`
+   - `web-search fetch --mode browser-dom <url>`
+   - `web-search fetch --mode browser-a11y <url>`
+2. If browser-based fetching fails because of environment issues, profile locks, or browser startup problems, retry with `--mode static`.
+3. If the source is a PDF and the extracted output is garbled or low-confidence, do not trust it blindly.
+4. Fall back to grabbing the raw content directly:
 
 ```bash
 curl -L <url>
 ```
+
+Prefer the least lossy source you can get, and be explicit when a fetch result looks unreliable.
 
 ## Reporting findings
 
