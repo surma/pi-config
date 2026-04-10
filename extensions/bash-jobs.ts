@@ -588,7 +588,11 @@ export default function (pi: ExtensionAPI) {
 		maxLogBytes = await loadMaxLogBytes(ctx.cwd);
 	});
 
-	pi.on("turn_end", async () => {
+	pi.on("turn_end", async (event, ctx) => {
+		if (event.message.stopReason !== "stop") return;
+		if (event.toolResults.length > 0) return;
+		if (ctx.hasPendingMessages()) return;
+
 		const runningJobs = getRunningJobs();
 		const signature = getRunningJobsSignature(runningJobs);
 		if (!signature) {
