@@ -1,5 +1,7 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { promises as fs } from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
@@ -14,6 +16,10 @@ const MAX_PARALLEL_TASKS = 64;
 const MAX_CONCURRENCY = 4;
 const MAX_WIDGET_ITEMS = 12;
 const MAX_RETAINED_HANDLES = 24;
+const INLINE_RESULT_MAX = 4_000;
+const RESULT_PREVIEW_MAX = 1_200;
+const SERIALIZED_RESULT_PREVIEW_MAX = 200;
+const RESULT_FILE_DIR = "pi-subagent-results";
 
 type SubagentState = "starting" | "running" | "done" | "error" | "killed";
 
@@ -35,6 +41,8 @@ interface SubagentHandle {
 	statusText: string;
 	lastTool?: string;
 	resultText: string;
+	resultPath?: string;
+	persistedResultHash?: string;
 	stderr: string;
 	error?: string;
 	stopReason?: string;
@@ -45,6 +53,7 @@ interface SubagentHandle {
 	usage: UsageStats;
 	process?: ChildProcessWithoutNullStreams;
 	completionSettled?: boolean;
+	completionPromise?: Promise<SubagentHandle>;
 	waiters: Array<{ resolve: (handle: SubagentHandle) => void; timer?: NodeJS.Timeout }>;
 }
 
@@ -57,6 +66,7 @@ interface SerializableHandle {
 	statusText: string;
 	lastTool?: string;
 	resultText: string;
+	resultPath?: string;
 	error?: string;
 	stopReason?: string;
 	model?: string;
@@ -163,6 +173,46 @@ function truncate(text: string | undefined, max = 80): string {
 	const value = (text || "").replace(/\s+/g, " ").trim();
 	if (!value) return "";
 	return value.length > max ? `${value.slice(0, max - 1)}…` : value;
+}
+
+function safeFileFragment(value: string | undefined): string {
+	const normalized = (value || "")
+		.toLowerCase()
+		.replace(/[^a-z0-9._-]+/g, "-")
+		.replace(/^-+|-+$/g, "");
+	return normalized || "subagent";
+}
+
+function hashText(text: string): string {
+	return createHash("sha1").update(text).digest("hex");
+}
+
+async function ensureResultPersisted(handle: SubagentHandle): Promise<string | undefined> {
+	if (!handle.resultText) return undefined;
+	const nextHash = hashText(handle.resultText);
+	if (handle.resultPath && handle.persistedResultHash === nextHash) return handle.resultPath;
+	try {
+		const directory = join(tmpdir(), RESULT_FILE_DIR);
+		await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+		await fs.chmod(directory, 0o700).catch(() => {});
+		const path = join(directory, `${safeFileFragment(handle.agent.name)}-${handle.id}.md`);
+		await fs.writeFile(path, handle.resultText, { encoding: "utf8", mode: 0o600 });
+		await fs.chmod(path, 0o600).catch(() => {});
+		handle.resultPath = path;
+		handle.persistedResultHash = nextHash;
+		return path;
+	} catch (error) {
+		handle.resultPath = undefined;
+		handle.persistedResultHash = undefined;
+		const message = error instanceof Error ? error.message : String(error);
+		handle.stderr += `Failed to persist subagent result: ${message}\n`;
+		return undefined;
+	}
+}
+
+function previewResult(text: string, max = RESULT_PREVIEW_MAX): string {
+	if (text.length <= max) return text;
+	return `${text.slice(0, max).trimEnd()}\n…`;
 }
 
 function isAbortedAssistantMessage(message: unknown): boolean {
@@ -470,7 +520,8 @@ function serializeHandle(handle: SubagentHandle): SerializableHandle {
 		task: handle.task,
 		statusText: handle.statusText,
 		lastTool: handle.lastTool,
-		resultText: handle.resultText,
+		resultText: previewResult(handle.resultText, SERIALIZED_RESULT_PREVIEW_MAX),
+		resultPath: handle.resultPath,
 		error: handle.error,
 		stopReason: handle.stopReason,
 		model: handle.model,
@@ -479,6 +530,15 @@ function serializeHandle(handle: SubagentHandle): SerializableHandle {
 		updatedAt: handle.updatedAt,
 		usage: { ...handle.usage },
 	};
+}
+
+async function serializeHandleForReturn(handle: SubagentHandle): Promise<SerializableHandle> {
+	if (handle.resultText) await ensureResultPersisted(handle);
+	return serializeHandle(handle);
+}
+
+async function serializeHandlesForReturn(values: SubagentHandle[]): Promise<SerializableHandle[]> {
+	return Promise.all(values.map((handle) => serializeHandleForReturn(handle)));
 }
 
 function mapWithConcurrencyLimit<TIn, TOut>(
@@ -668,16 +728,24 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		if (handle.completionSettled) return;
 		handle.completionSettled = true;
 		handle.updatedAt = now();
-		for (const waiter of handle.waiters.splice(0)) {
-			if (waiter.timer) clearTimeout(waiter.timer);
-			waiter.resolve(handle);
-		}
-		trimRetainedHandles();
-		refreshUi();
+		const waiters = handle.waiters.splice(0);
+		handle.completionPromise = (async () => {
+			try {
+				if (handle.resultText) await ensureResultPersisted(handle);
+			} finally {
+				for (const waiter of waiters) {
+					if (waiter.timer) clearTimeout(waiter.timer);
+					waiter.resolve(handle);
+				}
+				trimRetainedHandles();
+				refreshUi();
+			}
+			return handle;
+		})();
 	}
 
 	function waitForHandle(handle: SubagentHandle, timeoutMs?: number): Promise<SubagentHandle> {
-		if (handle.completionSettled) return Promise.resolve(handle);
+		if (handle.completionSettled) return handle.completionPromise || Promise.resolve(handle);
 		return new Promise((resolve) => {
 			const waiter: { resolve: (handle: SubagentHandle) => void; timer?: NodeJS.Timeout } = { resolve };
 			if (timeoutMs && timeoutMs > 0) {
@@ -692,7 +760,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 
 	function waitForHandleOrAbort(handle: SubagentHandle, timeoutMs?: number, signal?: AbortSignal): Promise<SubagentHandle> {
 		if (!signal) return waitForHandle(handle, timeoutMs);
-		if (handle.completionSettled || signal.aborted) return Promise.resolve(handle);
+		if (signal.aborted) return Promise.resolve(handle);
+		if (handle.completionSettled) return handle.completionPromise || Promise.resolve(handle);
 		return new Promise((resolve) => {
 			const waiter: { resolve: (handle: SubagentHandle) => void; timer?: NodeJS.Timeout } = {
 				resolve: (resolvedHandle) => {
@@ -771,17 +840,57 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		await Promise.allSettled(active.map((handle) => killHandle(handle, reason)));
 	}
 
-	function formatHandleSummary(handle: SubagentHandle): string {
+	async function formatSingleResult(handle: SubagentHandle): Promise<string> {
+		const resultPath = handle.resultText ? await ensureResultPersisted(handle) : undefined;
+		if (handle.state !== "done") {
+			const lines: string[] = [];
+			if (resultPath) {
+				lines.push(`Partial subagent result saved to ${resultPath}. Use read to inspect the exact output captured before completion.`);
+			}
+			if (!handle.resultText) {
+				lines.push(handle.error || handle.statusText || "(no output)");
+				return lines.join("\n\n");
+			}
+			if (handle.resultText.length <= INLINE_RESULT_MAX) {
+				lines.push(handle.resultText);
+				return lines.join("\n\n");
+			}
+			lines.push(`Captured output preview:\n${previewResult(handle.resultText)}`);
+			lines.push(resultPath ? `Preview truncated for transport safety. Use read on ${resultPath} for the full captured output.` : "Preview truncated for transport safety.");
+			return lines.join("\n\n");
+		}
+
+		const lines: string[] = [];
+		if (resultPath) {
+			lines.push(`Full subagent result saved to ${resultPath}. Use read to inspect the exact complete output.`);
+		}
+		if (!handle.resultText) {
+			lines.push("(no output)");
+			return lines.join("\n\n");
+		}
+		if (handle.resultText.length <= INLINE_RESULT_MAX) {
+			lines.push(handle.resultText);
+			return lines.join("\n\n");
+		}
+		lines.push(`Result preview:\n${previewResult(handle.resultText)}`);
+		lines.push(resultPath ? `Preview truncated for transport safety. Use read on ${resultPath} for the full result.` : "Preview truncated for transport safety.");
+		return lines.join("\n\n");
+	}
+
+	async function formatHandleSummary(handle: SubagentHandle): Promise<string> {
 		const base = `#${handle.id} ${handle.agent.name} ${handle.state} - ${truncate(handle.task, 70)}`;
 		const detail = handle.statusText || truncate(handle.resultText, 90) || truncate(handle.error, 90);
 		const usage = formatUsage(handle.usage, handle.model);
-		return [base, detail ? `  ${detail}` : "", usage ? `  ${usage}` : ""].filter(Boolean).join("\n");
+		const resultPath = handle.resultText ? await ensureResultPersisted(handle) : undefined;
+		return [base, detail ? `  ${detail}` : "", resultPath ? `  result ${resultPath}` : "", usage ? `  ${usage}` : ""]
+			.filter(Boolean)
+			.join("\n");
 	}
 
-	function getActiveOrRecentSummary(includeCompleted = true): string {
+	async function getActiveOrRecentSummary(includeCompleted = true): Promise<string> {
 		const list = sortHandles([...handles.values()]).filter((handle) => includeCompleted || isHandleActive(handle));
 		if (list.length === 0) return "No subagents tracked yet.";
-		return list.map(formatHandleSummary).join("\n\n");
+		return (await Promise.all(list.map((handle) => formatHandleSummary(handle)))).join("\n\n");
 	}
 
 	function spawnSubagent(agent: AgentConfig, task: string, cwd: string, modelOverride?: string): SubagentHandle {
@@ -1148,8 +1257,8 @@ Available predefined subagents:\n${formatAgentList(discovery.agents, 20)}`;
 				bindAbort(signal, handle, "Caller aborted subagent_run");
 				const result = await waitForHandle(handle);
 				return {
-					content: [{ type: "text", text: result.resultText || result.error || "(no output)" }],
-					details: { handles: [serializeHandle(result)] },
+					content: [{ type: "text", text: await formatSingleResult(result) }],
+					details: { handles: [await serializeHandleForReturn(result)] },
 				};
 			}
 
@@ -1179,12 +1288,10 @@ Available predefined subagents:\n${formatAgentList(discovery.agents, 20)}`;
 					return waitForHandle(handle);
 				});
 
-				const summary = spawned
-					.map((handle) => `[${handle.agent.name} #${handle.id}] ${handle.state}: ${truncate(handle.resultText || handle.error || handle.statusText, 120)}`)
-					.join("\n");
+				const summary = (await Promise.all(spawned.map((handle) => formatHandleSummary(handle)))).join("\n\n");
 				return {
 					content: [{ type: "text", text: summary || "Parallel swarm finished." }],
-					details: { handles: spawned.map(serializeHandle) },
+					details: { handles: await serializeHandlesForReturn(spawned) },
 				};
 			}
 
@@ -1204,7 +1311,7 @@ Available predefined subagents:\n${formatAgentList(discovery.agents, 20)}`;
 				if (!agent) {
 					return {
 						content: [{ type: "text", text: `${error || `Invalid chain step ${i + 1}`}\n\nAvailable subagents:\n${formatAgentList(currentDiscovery.agents)}` }],
-						details: { handles: results.map(serializeHandle) },
+						details: { handles: await serializeHandlesForReturn(results) },
 					};
 				}
 				const task = step.task.replace(/\{previous\}/g, () => previous);
@@ -1214,16 +1321,16 @@ Available predefined subagents:\n${formatAgentList(discovery.agents, 20)}`;
 				results.push(result);
 				if (result.state !== "done") {
 					return {
-						content: [{ type: "text", text: `Chain stopped at step ${i + 1} (${step.agent}): ${result.error || result.statusText}` }],
-						details: { handles: results.map(serializeHandle) },
+						content: [{ type: "text", text: `Chain stopped at step ${i + 1} (${step.agent || result.agent.name}):\n\n${await formatSingleResult(result)}` }],
+						details: { handles: await serializeHandlesForReturn(results) },
 					};
 				}
 				previous = result.resultText;
 			}
 
 			return {
-				content: [{ type: "text", text: results[results.length - 1]?.resultText || "Chain finished." }],
-				details: { handles: results.map(serializeHandle) },
+				content: [{ type: "text", text: results.length > 0 ? await formatSingleResult(results[results.length - 1]!) : "Chain finished." }],
+				details: { handles: await serializeHandlesForReturn(results) },
 			};
 		},
 	});
@@ -1251,7 +1358,7 @@ Available predefined subagents:\n${formatAgentList(discovery.agents, 20)}`;
 			const handle = spawnSubagent(agent, params.task, params.cwd || ctx.cwd, getModelCliArg(ctx));
 			return {
 				content: [{ type: "text", text: `Started subagent #${handle.id} (${agent.name}).` }],
-				details: { handle: serializeHandle(handle) },
+				details: { handle: await serializeHandleForReturn(handle) },
 			};
 		},
 	});
@@ -1263,10 +1370,10 @@ Available predefined subagents:\n${formatAgentList(discovery.agents, 20)}`;
 		parameters: ListSchema,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			rememberContext(ctx);
-			const summary = getActiveOrRecentSummary(params.includeCompleted ?? true);
+			const summary = await getActiveOrRecentSummary(params.includeCompleted ?? true);
 			return {
 				content: [{ type: "text", text: summary }],
-				details: { handles: sortHandles([...handles.values()]).map(serializeHandle) },
+				details: { handles: await serializeHandlesForReturn(sortHandles([...handles.values()])) },
 			};
 		},
 	});
@@ -1289,21 +1396,21 @@ Available predefined subagents:\n${formatAgentList(discovery.agents, 20)}`;
 				if (params.all === false) {
 					return {
 						content: [{ type: "text", text: "Invalid subagent_wait call. Provide {id} to wait for one subagent, or omit id / set {all:true} to wait for all active subagents." }],
-						details: { handles: sortHandles([...handles.values()]).map(serializeHandle) },
+						details: { handles: await serializeHandlesForReturn(sortHandles([...handles.values()])) },
 					};
 				}
 				targets = [...handles.values()].filter(isHandleActive);
 				if (targets.length === 0) {
 					return {
 						content: [{ type: "text", text: "No active subagents to wait for." }],
-						details: { handles: sortHandles([...handles.values()]).map(serializeHandle) },
+						details: { handles: await serializeHandlesForReturn(sortHandles([...handles.values()])) },
 					};
 				}
 			}
 			const results = await waitForAllOrAbort(targets, params.timeoutMs, signal);
 			return {
-				content: [{ type: "text", text: results.map(formatHandleSummary).join("\n\n") }],
-				details: { handles: results.map(serializeHandle) },
+				content: [{ type: "text", text: (await Promise.all(results.map((handle) => formatHandleSummary(handle)))).join("\n\n") }],
+				details: { handles: await serializeHandlesForReturn(results) },
 			};
 		},
 	});
@@ -1330,13 +1437,13 @@ Available predefined subagents:\n${formatAgentList(discovery.agents, 20)}`;
 								: `already ${handle.state}`;
 				return {
 					content: [{ type: "text", text: `Subagent #${handle.id} (${handle.agent.name}) is ${stateText}.` }],
-					details: { handle: serializeHandle(handle) },
+					details: { handle: await serializeHandleForReturn(handle) },
 				};
 			}
 			const result = await killHandle(handle, "Killed via subagent_kill");
 			return {
-				content: [{ type: "text", text: `Killed subagent #${result.id} (${result.agent.name}).` }],
-				details: { handle: serializeHandle(result) },
+				content: [{ type: "text", text: `Killed subagent #${result.id} (${result.agent.name}).\n\n${await formatSingleResult(result)}` }],
+				details: { handle: await serializeHandleForReturn(result) },
 			};
 		},
 	});
@@ -1346,7 +1453,7 @@ Available predefined subagents:\n${formatAgentList(discovery.agents, 20)}`;
 		handler: async (_args, ctx) => {
 			rememberContext(ctx);
 			if (!ctx.hasUI) {
-				console.log(getActiveOrRecentSummary(true));
+				console.log(await getActiveOrRecentSummary(true));
 				return;
 			}
 			await ctx.ui.custom<void>(

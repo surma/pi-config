@@ -107,6 +107,7 @@ Model overrides should use exact ids returned by `subagent_models` rather than f
 ## Notes
 
 - children are ephemeral: they auto-exit after finishing their delegated task
+- completed subagent results are persisted to temp files, and tool responses include the path so large outputs can be recovered with `read`
 - aborting the parent agent also aborts all active subagents
 - aborting `subagent_wait` stops waiting but does not kill the background subagent(s)
 - this is intentionally **subagents + easy swarms**, not a full agent-team system
