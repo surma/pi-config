@@ -63,6 +63,12 @@ type BashJob = {
 	finalized: boolean;
 };
 
+type TailState = {
+	text: string;
+	truncated: boolean;
+	truncation: ReturnType<typeof truncateTail>;
+};
+
 const bashSchema = Type.Object({
 	command: Type.String({ description: "Bash command to execute" }),
 	cwd: Type.Optional(Type.String({ description: "Working directory for this command (relative to the current working directory if not absolute)" })),
@@ -80,6 +86,7 @@ const waitSchema = Type.Object({
 
 const jobs = new Map<string, BashJob>();
 let maxLogBytes = DEFAULT_MAX_LOG_BYTES;
+let remindedRunningJobsSignature: string | undefined;
 
 function createDeferred<T>(): Deferred<T> {
 	let resolve!: (value: T) => void;
@@ -208,10 +215,7 @@ function appendChunk(job: BashJob, chunk: Buffer): void {
 	}
 }
 
-function getTailState(job: BashJob): {
-	text: string;
-	truncated: boolean;
-} {
+function getTailState(job: BashJob): TailState {
 	const text = Buffer.concat(job.chunks).toString("utf8");
 	const truncation = truncateTail(text, {
 		maxLines: DEFAULT_MAX_LINES,
@@ -220,11 +224,11 @@ function getTailState(job: BashJob): {
 	return {
 		text: truncation.content || "",
 		truncated: truncation.truncated || job.totalBytes > DEFAULT_MAX_BYTES,
+		truncation,
 	};
 }
 
-function formatRunningMessage(job: BashJob): string {
-	const tail = getTailState(job);
+function formatRunningMessage(job: BashJob, tail = getTailState(job)): string {
 	const lines = [
 		`Command is still running as managed bash job ${job.jobId}.`,
 		`Started: ${formatStartedAt(job.startedAt)} (${formatDuration(Date.now() - job.startedAt)} elapsed)`,
@@ -249,8 +253,7 @@ function formatRunningMessage(job: BashJob): string {
 	return lines.join("\n");
 }
 
-function formatCompletedMessage(job: BashJob, includeHeader = false): string {
-	const tail = getTailState(job);
+function formatCompletedMessage(job: BashJob, includeHeader = false, tail = getTailState(job)): string {
 	const lines: string[] = [];
 	if (includeHeader) {
 		const summary =
@@ -399,14 +402,13 @@ function getJob(jobId: string): BashJob {
 	return job;
 }
 
-function buildDetails(job: BashJob, forceFullOutputPath = false): { truncation?: unknown; fullOutputPath?: string } | undefined {
-	const tail = getTailState(job);
+function buildDetails(job: BashJob, forceFullOutputPath = false, tail = getTailState(job)): { truncation?: unknown; fullOutputPath?: string } | undefined {
 	if (!forceFullOutputPath && !tail.truncated) {
 		return undefined;
 	}
 	return {
 		fullOutputPath: job.outputPath,
-		...(tail.truncated ? { truncation: truncateTail(Buffer.concat(job.chunks).toString("utf8")) } : {}),
+		...(tail.truncated ? { truncation: tail.truncation } : {}),
 	};
 }
 
@@ -439,6 +441,7 @@ async function runManagedBash(
 				if (settled) return;
 				settled = true;
 				if (timeoutHandle) clearTimeout(timeoutHandle);
+				job.killRequested = true;
 				killProcessGroup(job.pid);
 				reject(new Error("Command aborted"));
 			};
@@ -510,7 +513,7 @@ async function waitForJob(
 	});
 }
 
-function formatStatus(job: BashJob): string {
+function formatStatus(job: BashJob, tail = getTailState(job)): string {
 	const lines = [
 		`Job: ${job.jobId}`,
 		`Status: ${job.status}`,
@@ -526,11 +529,36 @@ function formatStatus(job: BashJob): string {
 	if (job.exitCode !== undefined) lines.push(`Exit code: ${job.exitCode ?? "null"}`);
 	if (job.interactiveStall && job.stallSummary) lines.push(`Interactive stall: ${job.stallSummary}`);
 	if (job.killedForLogLimit) lines.push(`Killed for log limit: ${formatSize(maxLogBytes)}`);
-	lines.push("", "Recent output:", getTailState(job).text || "(no output yet)");
-	if (getTailState(job).truncated) {
+	lines.push("", "Recent output:", tail.text || "(no output yet)");
+	if (tail.truncated) {
 		lines.push("", `[Showing recent output tail. Full log: ${job.outputPath}]`);
 	}
 	return lines.join("\n");
+}
+
+function getRunningJobs(): BashJob[] {
+	return [...jobs.values()].filter((job) => job.status === "running");
+}
+
+function getRunningJobsSignature(runningJobs: BashJob[]): string | undefined {
+	if (runningJobs.length === 0) return undefined;
+	return runningJobs
+		.map((job) => `${job.jobId}:${job.command}`)
+		.sort()
+		.join("|");
+}
+
+function formatRunningJobsReminder(runningJobs: BashJob[]): string {
+	const lines = runningJobs
+		.sort((a, b) => a.startedAt - b.startedAt)
+		.map((job) => `- ${job.jobId} — ${job.command}`);
+	return [
+		"You still have managed bash jobs running:",
+		...lines,
+		"",
+		"Before you stop, either use bash_wait to wait for them, use bash_kill to stop them, or explicitly tell the user why they should remain running.",
+		"Do not use shell backgrounding operators like &, nohup, or disown for this. Prefer managed bash jobs via timeout plus bash_wait/bash_status/bash_kill/bash_jobs.",
+	].join("\n");
 }
 
 function formatJobsList(): string {
@@ -560,8 +588,29 @@ export default function (pi: ExtensionAPI) {
 		maxLogBytes = await loadMaxLogBytes(ctx.cwd);
 	});
 
+	pi.on("turn_end", async () => {
+		const runningJobs = getRunningJobs();
+		const signature = getRunningJobsSignature(runningJobs);
+		if (!signature) {
+			remindedRunningJobsSignature = undefined;
+			return;
+		}
+		if (signature === remindedRunningJobsSignature) {
+			return;
+		}
+		remindedRunningJobsSignature = signature;
+		pi.sendMessage(
+			{
+				customType: "bash-jobs-reminder",
+				content: formatRunningJobsReminder(runningJobs),
+				display: false,
+			},
+			{ deliverAs: "followUp", triggerTurn: true },
+		);
+	});
+
 	pi.on("session_shutdown", async () => {
-		const runningJobs = [...jobs.values()].filter((job) => job.status === "running");
+		const runningJobs = getRunningJobs();
 		await Promise.all(
 			runningJobs.map(async (job) => {
 				job.killRequested = true;
@@ -587,6 +636,7 @@ export default function (pi: ExtensionAPI) {
 			"Prefer the cwd parameter over prepending commands with cd when you want to run a command in another directory.",
 			"When a timed bash command is still running, use bash_wait, bash_status, bash_kill, or bash_jobs instead of rerunning it from scratch.",
 			"Use bash_jobs when you need to recover a job id or inspect all managed bash jobs.",
+			"Do not use shell backgrounding tricks like &, nohup, or disown to detach work. Instead, give bash a timeout so it becomes a managed job, then use bash_wait, bash_status, bash_kill, or bash_jobs.",
 		],
 		parameters: bashSchema,
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
@@ -625,9 +675,10 @@ export default function (pi: ExtensionAPI) {
 		parameters: jobIdSchema,
 		async execute(_toolCallId, params) {
 			const job = getJob(params.jobId);
+			const tail = getTailState(job);
 			return {
-				content: [{ type: "text", text: formatStatus(job) }],
-				details: buildDetails(job, true),
+				content: [{ type: "text", text: formatStatus(job, tail) }],
+				details: buildDetails(job, true, tail),
 			};
 		},
 	});
