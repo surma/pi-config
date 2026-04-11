@@ -12,6 +12,7 @@ import {
 	formatSize,
 	truncateTail,
 } from "@mariozechner/pi-coding-agent";
+import { Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 
 const LOG_DIR = join(tmpdir(), "pi-bash-jobs");
@@ -661,6 +662,10 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet: "Wait for an existing managed bash job to finish or produce more output.",
 		promptGuidelines: ["Use this after bash returns a running managed job and you want to wait longer without restarting the command."],
 		parameters: waitSchema,
+		renderCall(args, theme) {
+			const timeoutSuffix = args.timeout ? theme.fg("muted", ` (timeout ${args.timeout}s)`) : "";
+			return new Text(theme.fg("toolTitle", theme.bold(`bash_wait ${args.jobId}`)) + timeoutSuffix, 0, 0);
+		},
 		async execute(_toolCallId, params, signal) {
 			const job = getJob(params.jobId);
 			await waitForJob(job, params.timeout, signal);
