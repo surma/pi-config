@@ -43,10 +43,44 @@ The command returns a markdown answer plus source links.
 ### Search guidelines
 
 - Ask a real question or write short prose describing what you need.
+- Do not write queries as if you were using `grep`, package search, or SEO keywords.
 - Include disambiguating details such as language, framework, company, version, platform, or time period.
 - If the result is about the wrong technology, refine the query immediately.
 - If the result is relevant but missing detail, either refine the query or fetch the cited sources.
 - Prefer multiple targeted searches over one vague query.
+
+### Rewrite-before-run rule
+
+If your query looks like a bag of nouns, API names, file paths, flags, or endpoint fragments rather than something a person would actually ask, **stop and rewrite it before running the search**.
+
+Before running `web-search search`, quickly check:
+- Would a human say this sentence out loud?
+- Does it state the actual question I want answered?
+- If I removed the quotes, would it read like prose instead of search-engine sludge?
+
+If not, rewrite it.
+
+A good pattern is:
+1. Write one sentence describing the fact you want to verify.
+2. Turn that sentence into the search query with minimal compression.
+
+### Bad vs good queries
+
+Bad:
+
+```bash
+web-search search "Gitea API actions runs jobs logs endpoint repository"
+web-search search "tea CLI actions logs Gitea"
+web-search search "Axum nested routers state current docs rust"
+```
+
+Good:
+
+```bash
+web-search search "How do I list workflow runs and fetch job logs from the Gitea Actions API?"
+web-search search "Does the tea CLI support viewing Gitea Actions workflow runs or logs?"
+web-search search "For the Rust web framework Axum, how are nested routers and state handled in current docs?"
+```
 
 Examples of good refinements:
 
@@ -83,12 +117,13 @@ If `fetch` is weak, retry with an explicit mode before giving up.
 
 ## Recommended workflow
 
-1. Start with `web-search search` using a natural-language query.
-2. Check whether the answer is about the correct technology and timeframe.
-3. Refine the query if the results are ambiguous, off-topic, or too shallow.
-4. Use `web-search fetch` on the most relevant cited sources, and retry with an explicit `--mode` if the first extraction is weak.
-5. Prefer primary sources when possible: official docs, specs, repos, release notes, or vendor posts.
-6. Cross-check important claims when accuracy matters.
+1. State the question you are trying to answer in one sentence.
+2. Start with `web-search search` using that natural-language query.
+3. Check whether the answer is about the correct technology and timeframe.
+4. Refine the query if the results are ambiguous, off-topic, or too shallow.
+5. Use `web-search fetch` on the most relevant cited sources, and retry with an explicit `--mode` if the first extraction is weak.
+6. Prefer primary sources when possible: official docs, specs, repos, release notes, or vendor posts.
+7. Cross-check important claims when accuracy matters.
 
 ## Handling weak or lossy pages
 
