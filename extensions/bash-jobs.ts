@@ -1,14 +1,12 @@
 import { randomBytes } from "node:crypto";
 import { createWriteStream, mkdirSync } from "node:fs";
-import { readFile } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import {
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
-	createBashTool,
 	formatSize,
 	truncateTail,
 } from "@mariozechner/pi-coding-agent";
@@ -18,10 +16,9 @@ import { Type } from "@sinclair/typebox";
 const LOG_DIR = join(tmpdir(), "pi-bash-jobs");
 const MAX_TAIL_BUFFER_BYTES = DEFAULT_MAX_BYTES * 2;
 const DEFAULT_MAX_LOG_BYTES = 4 * 1024 * 1024 * 1024;
+const FALLBACK_BASH_TIMEOUT_SECONDS = 10;
 const STALL_CHECK_INTERVAL_MS = 5_000;
 const STALL_THRESHOLD_MS = 45_000;
-const GLOBAL_SETTINGS_PATH = join(homedir(), ".pi", "agent", "settings.json");
-const GLOBAL_CONFIG_PATH = join(homedir(), ".pi", "agent", "bash-jobs.json");
 
 const PROMPT_PATTERNS = [
 	/\(y\/n\)/i,
@@ -70,10 +67,29 @@ type TailState = {
 	truncation: ReturnType<typeof truncateTail>;
 };
 
+type BashToolDetails = {
+	truncation?: unknown;
+	fullOutputPath?: string;
+};
+
+type BashToolResult = {
+	content: Array<{ type: "text"; text: string }>;
+	details?: BashToolDetails;
+};
+
+type CompletedJobResult = {
+	text: string;
+	details?: BashToolDetails;
+	status: Exclude<JobStatus, "running">;
+	exitCode?: number | null;
+};
+
+const defaultBashTimeoutSeconds = loadDefaultBashTimeoutSeconds();
+
 const bashSchema = Type.Object({
 	command: Type.String({ description: "Bash command to execute" }),
 	cwd: Type.Optional(Type.String({ description: "Working directory for this command (relative to the current working directory if not absolute)" })),
-	timeout: Type.Optional(Type.Number({ minimum: 1, description: "Timeout in seconds (soft timeout: command keeps running if exceeded)" })),
+	timeout: Type.Optional(Type.Number({ minimum: 1, description: `Timeout in seconds (defaults to ${defaultBashTimeoutSeconds}; soft timeout: command keeps running if exceeded)` })),
 });
 
 const jobIdSchema = Type.Object({
@@ -101,6 +117,15 @@ function ensureLogDir(): void {
 	mkdirSync(LOG_DIR, { recursive: true });
 }
 
+function parsePositiveNumber(value: unknown): number | undefined {
+	if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+		return value;
+	}
+	if (typeof value !== "string") return undefined;
+	const parsed = Number(value.trim());
+	return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+}
+
 function parseByteSize(value: unknown): number | undefined {
 	if (typeof value === "number" && Number.isFinite(value) && value > 0) {
 		return Math.floor(value);
@@ -125,42 +150,12 @@ function parseByteSize(value: unknown): number | undefined {
 	return Number.isFinite(bytes) && bytes > 0 ? Math.floor(bytes) : undefined;
 }
 
-async function readJsonFile(path: string): Promise<unknown> {
-	try {
-		return JSON.parse(await readFile(path, "utf8"));
-	} catch {
-		return undefined;
-	}
+function loadMaxLogBytes(): number {
+	return parseByteSize(process.env.PI_BASH_JOBS_MAX_LOG_BYTES) ?? DEFAULT_MAX_LOG_BYTES;
 }
 
-async function loadMaxLogBytes(projectCwd: string): Promise<number> {
-	const projectPiDir = join(projectCwd, ".pi");
-	const projectSettingsPath = join(projectPiDir, "settings.json");
-	const projectConfigPath = join(projectPiDir, "bash-jobs.json");
-
-	const [globalSettings, projectSettings, globalConfig, projectConfig] = await Promise.all([
-		readJsonFile(GLOBAL_SETTINGS_PATH),
-		readJsonFile(projectSettingsPath),
-		readJsonFile(GLOBAL_CONFIG_PATH),
-		readJsonFile(projectConfigPath),
-	]);
-
-	const candidates = [
-		(globalSettings as { bashJobs?: { maxLogBytes?: unknown } } | undefined)?.bashJobs?.maxLogBytes,
-		(globalConfig as { maxLogBytes?: unknown } | undefined)?.maxLogBytes,
-		(projectSettings as { bashJobs?: { maxLogBytes?: unknown } } | undefined)?.bashJobs?.maxLogBytes,
-		(projectConfig as { maxLogBytes?: unknown } | undefined)?.maxLogBytes,
-		process.env.PI_BASH_JOBS_MAX_LOG_BYTES,
-	];
-
-	let resolved = DEFAULT_MAX_LOG_BYTES;
-	for (const candidate of candidates) {
-		const parsed = parseByteSize(candidate);
-		if (parsed !== undefined) {
-			resolved = parsed;
-		}
-	}
-	return resolved;
+function loadDefaultBashTimeoutSeconds(): number {
+	return parsePositiveNumber(process.env.PI_BASH_JOBS_DEFAULT_TIMEOUT_SECONDS) ?? FALLBACK_BASH_TIMEOUT_SECONDS;
 }
 
 function createJobId(): string {
@@ -303,7 +298,9 @@ function finalizeJob(job: BashJob, exitCode: number | null, _signal: NodeJS.Sign
 		clearInterval(job.stallTimer);
 		job.stallTimer = undefined;
 	}
-	job.logStream.end();
+	if (!job.logStream.destroyed) {
+		job.logStream.end();
+	}
 	job.endedAt = Date.now();
 	job.exitCode = exitCode;
 	job.status = job.killRequested ? "killed" : exitCode === 0 ? "completed" : "failed";
@@ -346,6 +343,7 @@ function registerJob(command: string, cwd: string, child: ChildProcess): BashJob
 	const jobId = createJobId();
 	const outputPath = createLogPath(jobId);
 	const logStream = createWriteStream(outputPath, { flags: "a" });
+	let canWriteLog = true;
 	const completion = createDeferred<void>();
 	const job: BashJob = {
 		jobId,
@@ -367,11 +365,16 @@ function registerJob(command: string, cwd: string, child: ChildProcess): BashJob
 		finalized: false,
 	};
 	jobs.set(jobId, job);
+	logStream.on("error", () => {
+		canWriteLog = false;
+	});
 
 	const onData = (data: Buffer | string) => {
 		const chunk = Buffer.isBuffer(data) ? data : Buffer.from(data);
 		appendChunk(job, chunk);
-		logStream.write(chunk);
+		if (canWriteLog) {
+			logStream.write(chunk);
+		}
 	};
 
 	child.stdout?.on("data", onData);
@@ -412,14 +415,19 @@ function consumeCompletedJob(
 	includeHeader = false,
 	forceFullOutputPath = false,
 	tail = getTailState(job),
-): { text: string; details?: { truncation?: unknown; fullOutputPath?: string } } {
+): CompletedJobResult {
+	if (job.status === "running") {
+		throw new Error(`Cannot consume running bash job: ${job.jobId}`);
+	}
 	const text = formatCompletedMessage(job, includeHeader, tail);
 	const details = buildDetails(job, forceFullOutputPath, tail);
+	const status = job.status;
+	const exitCode = job.exitCode;
 	forgetJob(job);
-	return { text, details };
+	return { text, details, status, exitCode };
 }
 
-function buildDetails(job: BashJob, forceFullOutputPath = false, tail = getTailState(job)): { truncation?: unknown; fullOutputPath?: string } | undefined {
+function buildDetails(job: BashJob, forceFullOutputPath = false, tail = getTailState(job)): BashToolDetails | undefined {
 	if (!forceFullOutputPath && !tail.truncated) {
 		return undefined;
 	}
@@ -429,12 +437,31 @@ function buildDetails(job: BashJob, forceFullOutputPath = false, tail = getTailS
 	};
 }
 
+function completedJobResponseOrThrow(
+	job: BashJob,
+	includeHeader = false,
+	forceFullOutputPath = false,
+	tail = getTailState(job),
+): BashToolResult {
+	const { text, details, status, exitCode } = consumeCompletedJob(job, includeHeader, forceFullOutputPath, tail);
+	if (status === "failed") {
+		throw new Error(`${text}\n\nCommand exited with code ${exitCode ?? 1}`);
+	}
+	if (status === "killed") {
+		throw new Error(`${text}\n\nCommand was killed`);
+	}
+	return {
+		content: [{ type: "text", text }],
+		details,
+	};
+}
+
 async function runManagedBash(
 	command: string,
 	cwd: string,
 	timeoutSeconds: number,
 	signal: AbortSignal | undefined,
-): Promise<{ content: Array<{ type: "text"; text: string }>; details?: { truncation?: unknown; fullOutputPath?: string } }> {
+): Promise<BashToolResult> {
 	const job = spawnManagedJob(command, cwd);
 
 	const result = await new Promise<"completed" | "timed_out">((resolve, reject) => {
@@ -475,17 +502,7 @@ async function runManagedBash(
 		};
 	}
 
-	const { text, details } = consumeCompletedJob(job);
-	if (job.status === "failed") {
-		throw new Error(`${text}\n\nCommand exited with code ${job.exitCode ?? 1}`);
-	}
-	if (job.status === "killed") {
-		throw new Error(`${text}\n\nCommand was killed`);
-	}
-	return {
-		content: [{ type: "text", text }],
-		details: details,
-	};
+	return completedJobResponseOrThrow(job);
 }
 
 async function waitForJob(
@@ -601,8 +618,8 @@ async function killJob(job: BashJob): Promise<void> {
 }
 
 export default function (pi: ExtensionAPI) {
-	pi.on("session_start", async (_event, ctx) => {
-		maxLogBytes = await loadMaxLogBytes(ctx.cwd);
+	pi.on("session_start", () => {
+		maxLogBytes = loadMaxLogBytes();
 	});
 
 	pi.on("turn_end", async (event, ctx) => {
@@ -651,23 +668,19 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "bash",
 		label: "bash",
-		description: `Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). Supports an optional cwd override for this command. If a timed command exceeds its timeout, it stays alive as a managed bash job instead of being killed. Use bash_wait, bash_status, bash_kill, or bash_jobs to manage it.`,
-		promptSnippet: "Execute bash commands (ls, grep, find, etc.). Supports an optional cwd override. Timed commands that exceed their timeout continue as managed bash jobs.",
+		description: `Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). Supports an optional cwd override for this command. Timeout defaults to ${defaultBashTimeoutSeconds} seconds; if the command exceeds it, it stays alive as a managed bash job instead of being killed. Use bash_wait, bash_status, bash_kill, or bash_jobs to manage it.`,
+		promptSnippet: `Execute bash commands (ls, grep, find, etc.). Supports an optional cwd override. Timeout defaults to ${defaultBashTimeoutSeconds}s; commands that exceed it continue as managed bash jobs.`,
 		promptGuidelines: [
 			"Prefer the cwd parameter over prepending commands with cd when you want to run a command in another directory.",
 			"When a timed bash command is still running, use bash_wait, bash_status, bash_kill, or bash_jobs instead of rerunning it from scratch.",
 			"Use bash_jobs when you need to recover a job id for a still-running managed bash job.",
-			"Do not use shell backgrounding tricks like &, nohup, or disown to detach work. Instead, give bash a timeout so it becomes a managed job, then use bash_wait, bash_status, bash_kill, or bash_jobs.",
+			`If you omit timeout, bash uses a default soft timeout of ${defaultBashTimeoutSeconds} seconds before the command becomes a managed job.`,
+			"Do not use shell backgrounding tricks like &, nohup, or disown to detach work. Instead, let bash create a managed job and then use bash_wait, bash_status, bash_kill, or bash_jobs.",
 		],
 		parameters: bashSchema,
-		async execute(toolCallId, params, signal, onUpdate, ctx) {
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const commandCwd = resolveCommandCwd(ctx.cwd, params.cwd);
-			if (params.timeout === undefined) {
-				const builtin = createBashTool(commandCwd);
-				return builtin.execute(toolCallId, { command: params.command, timeout: params.timeout }, signal, onUpdate);
-			}
-
-			return runManagedBash(params.command, commandCwd, params.timeout, signal);
+			return runManagedBash(params.command, commandCwd, params.timeout ?? defaultBashTimeoutSeconds, signal);
 		},
 	});
 
@@ -691,11 +704,7 @@ export default function (pi: ExtensionAPI) {
 					details: buildDetails(job, true),
 				};
 			}
-			const { text, details } = consumeCompletedJob(job, true);
-			return {
-				content: [{ type: "text", text }],
-				details,
-			};
+			return completedJobResponseOrThrow(job, true);
 		},
 	});
 
