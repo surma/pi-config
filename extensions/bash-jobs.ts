@@ -398,9 +398,25 @@ function spawnManagedJob(command: string, cwd: string): BashJob {
 function getJob(jobId: string): BashJob {
 	const job = jobs.get(jobId);
 	if (!job) {
-		throw new Error(`Unknown bash job: ${jobId}. Use bash_jobs to see known jobs.`);
+		throw new Error(`Unknown bash job: ${jobId}. It may have already finished and been cleaned up. Use bash_jobs to see running jobs.`);
 	}
 	return job;
+}
+
+function forgetJob(job: BashJob): void {
+	jobs.delete(job.jobId);
+}
+
+function consumeCompletedJob(
+	job: BashJob,
+	includeHeader = false,
+	forceFullOutputPath = false,
+	tail = getTailState(job),
+): { text: string; details?: { truncation?: unknown; fullOutputPath?: string } } {
+	const text = formatCompletedMessage(job, includeHeader, tail);
+	const details = buildDetails(job, forceFullOutputPath, tail);
+	forgetJob(job);
+	return { text, details };
 }
 
 function buildDetails(job: BashJob, forceFullOutputPath = false, tail = getTailState(job)): { truncation?: unknown; fullOutputPath?: string } | undefined {
@@ -459,7 +475,7 @@ async function runManagedBash(
 		};
 	}
 
-	const text = formatCompletedMessage(job);
+	const { text, details } = consumeCompletedJob(job);
 	if (job.status === "failed") {
 		throw new Error(`${text}\n\nCommand exited with code ${job.exitCode ?? 1}`);
 	}
@@ -468,7 +484,7 @@ async function runManagedBash(
 	}
 	return {
 		content: [{ type: "text", text }],
-		details: buildDetails(job),
+		details: details,
 	};
 }
 
@@ -563,18 +579,18 @@ function formatRunningJobsReminder(runningJobs: BashJob[]): string {
 }
 
 function formatJobsList(): string {
-	if (jobs.size === 0) {
-		return "No managed bash jobs.";
+	const runningJobs = getRunningJobs();
+	if (runningJobs.length === 0) {
+		return "No running managed bash jobs.";
 	}
 
-	const sorted = [...jobs.values()].sort((a, b) => b.startedAt - a.startedAt);
+	const sorted = runningJobs.sort((a, b) => b.startedAt - a.startedAt);
 	const lines = sorted.map((job) => {
-		const runtime = formatDuration((job.endedAt ?? Date.now()) - job.startedAt);
-		const marker = job.status === "running" ? "●" : job.status === "completed" ? "✓" : job.status === "killed" ? "■" : "✗";
+		const runtime = formatDuration(Date.now() - job.startedAt);
 		const extra = job.interactiveStall ? " · waiting for input?" : "";
-		return `${marker} ${job.jobId} · ${job.status} · ${runtime}${extra}\n    ${job.command}\n    ${job.outputPath}`;
+		return `● ${job.jobId} · running · ${runtime}${extra}\n    ${job.command}\n    ${job.outputPath}`;
 	});
-	return `Managed bash jobs (${jobs.size}):\n\n${lines.join("\n\n")}`;
+	return `Running managed bash jobs (${runningJobs.length}):\n\n${lines.join("\n\n")}`;
 }
 
 async function killJob(job: BashJob): Promise<void> {
@@ -640,7 +656,7 @@ export default function (pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Prefer the cwd parameter over prepending commands with cd when you want to run a command in another directory.",
 			"When a timed bash command is still running, use bash_wait, bash_status, bash_kill, or bash_jobs instead of rerunning it from scratch.",
-			"Use bash_jobs when you need to recover a job id or inspect all managed bash jobs.",
+			"Use bash_jobs when you need to recover a job id for a still-running managed bash job.",
 			"Do not use shell backgrounding tricks like &, nohup, or disown to detach work. Instead, give bash a timeout so it becomes a managed job, then use bash_wait, bash_status, bash_kill, or bash_jobs.",
 		],
 		parameters: bashSchema,
@@ -669,9 +685,16 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params, signal) {
 			const job = getJob(params.jobId);
 			await waitForJob(job, params.timeout, signal);
+			if (job.status === "running") {
+				return {
+					content: [{ type: "text", text: formatRunningMessage(job) }],
+					details: buildDetails(job, true),
+				};
+			}
+			const { text, details } = consumeCompletedJob(job, true);
 			return {
-				content: [{ type: "text", text: job.status === "running" ? formatRunningMessage(job) : formatCompletedMessage(job, true) }],
-				details: buildDetails(job, job.status === "running"),
+				content: [{ type: "text", text }],
+				details,
 			};
 		},
 	});
@@ -685,10 +708,14 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params) {
 			const job = getJob(params.jobId);
 			const tail = getTailState(job);
-			return {
+			const response = {
 				content: [{ type: "text", text: formatStatus(job, tail) }],
 				details: buildDetails(job, true, tail),
 			};
+			if (job.status !== "running") {
+				forgetJob(job);
+			}
+			return response;
 		},
 	});
 
@@ -701,9 +728,10 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params) {
 			const job = getJob(params.jobId);
 			await killJob(job);
+			const { text, details } = consumeCompletedJob(job, true, true);
 			return {
-				content: [{ type: "text", text: formatCompletedMessage(job, true) }],
-				details: buildDetails(job, true),
+				content: [{ type: "text", text }],
+				details,
 			};
 		},
 	});
@@ -711,8 +739,8 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "bash_jobs",
 		label: "bash_jobs",
-		description: "List all managed bash jobs known to this session, including running and completed jobs.",
-		promptSnippet: "List managed bash jobs so you can recover job ids and inspect active/completed backgrounded commands.",
+		description: "List currently running managed bash jobs.",
+		promptSnippet: "List running managed bash jobs so you can recover job ids for active backgrounded commands.",
 		parameters: Type.Object({}),
 		async execute() {
 			return {
@@ -722,7 +750,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("bash-jobs", {
-		description: "Show managed bash jobs",
+		description: "Show running managed bash jobs",
 		handler: async (_args, ctx) => {
 			if (ctx.hasUI) {
 				ctx.ui.notify(formatJobsList(), "info");
