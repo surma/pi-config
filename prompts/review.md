@@ -6,7 +6,7 @@ Review the following code, files, or context: $@
 Use the subagent tool with the `tasks` parameter to run exactly one independent review swarm in parallel.
 
 Before spawning subagents, if model overrides require exact ids, use `subagent_models` to resolve the closest exact available ids for these requested models. Resolve the ids once up front and note any substitutions you had to make:
-- Anthropic: Claude Opus 4.6
+- Anthropic: Claude Opus 4.7
 - OpenAI: GPT 5.4
 - OpenAI: GPT 5.3 Codex (NOT spark!)
 
