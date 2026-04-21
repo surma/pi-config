@@ -610,11 +610,61 @@ function formatJobsList(): string {
 	return `Running managed bash jobs (${runningJobs.length}):\n\n${lines.join("\n\n")}`;
 }
 
-async function killJob(job: BashJob): Promise<void> {
+// Hard deadline for the post-SIGKILL wait in killJob. If the child is
+// stuck in kernel D-state (uninterruptible sleep on a hung syscall —
+// e.g., ssh / 9p / NFS against a swamped or frozen peer), SIGKILL is
+// queued but may never be delivered, so the `close` event never fires
+// and job.completion.promise never resolves. We give up after this
+// many ms and force-finalize the job so the caller can't hang forever.
+const KILL_WAIT_DEADLINE_MS = 5_000;
+
+async function killJob(job: BashJob, signal?: AbortSignal): Promise<void> {
 	if (job.status !== "running") return;
 	job.killRequested = true;
 	killProcessGroup(job.pid);
-	await job.completion.promise;
+
+	await new Promise<void>((resolve, reject) => {
+		let settled = false;
+		let deadlineHandle: NodeJS.Timeout | undefined;
+		let abortHandler: (() => void) | undefined;
+
+		const cleanup = () => {
+			if (deadlineHandle) clearTimeout(deadlineHandle);
+			if (abortHandler && signal) signal.removeEventListener("abort", abortHandler);
+		};
+
+		const finish = () => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			resolve();
+		};
+
+		const fail = (err: Error) => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			reject(err);
+		};
+
+		job.completion.promise.then(finish);
+
+		deadlineHandle = setTimeout(() => {
+			// Child didn't close after SIGKILL. Force-finalize so the
+			// caller returns; if the kernel eventually reaps the child,
+			// finalizeJob is idempotent and the late 'close' event is a
+			// no-op.
+			finalizeJob(job, null, "SIGKILL");
+			finish();
+		}, KILL_WAIT_DEADLINE_MS);
+		if (deadlineHandle.unref) deadlineHandle.unref();
+
+		abortHandler = () => fail(new Error(`Stopped waiting for bash_kill of ${job.jobId}`));
+		if (signal) {
+			if (signal.aborted) abortHandler();
+			else signal.addEventListener("abort", abortHandler, { once: true });
+		}
+	});
 }
 
 export default function (pi: ExtensionAPI) {
@@ -734,9 +784,9 @@ export default function (pi: ExtensionAPI) {
 		description: "Kill a running managed bash job and return its final known output tail.",
 		promptSnippet: "Stop a running managed bash job.",
 		parameters: jobIdSchema,
-		async execute(_toolCallId, params) {
+		async execute(_toolCallId, params, signal) {
 			const job = getJob(params.jobId);
-			await killJob(job);
+			await killJob(job, signal);
 			const { text, details } = consumeCompletedJob(job, true, true);
 			return {
 				content: [{ type: "text", text }],
