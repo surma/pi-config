@@ -25,6 +25,7 @@ Each subagent should work independently and produce a thorough, high-signal code
 - maintainability problems
 - worthwhile optimizations
 - specific proposed fixes
+- claims that depend on surrounding reality — named components, wire paths, config knobs, endpoints, types, files, APIs, versions — and whether the surrounding context confirms them or they are unverified assumptions
 
 Require each subagent to:
 - cite concrete evidence with file paths and line numbers where possible
@@ -34,7 +35,21 @@ Require each subagent to:
 - return at most 6 main findings, sorted by importance
 - prefer fewer strong findings over many weak ones
 - include a brief coverage note: files inspected, highest-risk areas checked, and anything notable they could not verify
-- report docs/README/prompt contract mismatches only when those materials are in scope or the mismatch materially affects runtime or user expectations
+- for non-trivial claims that depend on context outside the artifact (referenced files, components, APIs, config, wire paths), attempt to verify the claim against the referenced material; if the material is unavailable or out of scope, flag the claim as an unverified assumption rather than implicitly accepting it. Flag unverified assumptions only when the assumption is load-bearing for the artifact's claim — do not list every type or symbol the reviewer didn't trace.
+- when the artifact distinguishes versions, phases, branches, or current-vs-future state, audit present-tense claims for tense-alignment — present-tense descriptions of behavior that is actually future / planned / phase-gated are findings
+- when the artifact under review IS a spec, design doc, README, or contract, treat consistency-with-the-surrounding-codebase as in-scope by default — those artifacts ARE claims about the world. When the artifact under review is code, suppress unrelated doc drift unless the mismatch materially affects runtime or user expectations.
+
+Look specifically for these patterns when relevant:
+- **Reuse**: new functions/inline logic that duplicates an existing utility in the codebase. Search adjacent files and shared/util directories before flagging code as fine.
+- **Redundant state**: state that duplicates other state, cached values that could be derived, observers/effects that could be direct calls.
+- **Parameter sprawl**: new parameters bolted onto a function instead of restructuring.
+- **Copy-paste with variation**: near-duplicate blocks that want a shared abstraction.
+- **Stringly-typed code**: raw strings where existing constants/enums/branded types apply.
+- **Nested conditionals 3+ deep**: flatten with early returns or lookup tables.
+- **No-op updates**: state/store writes in loops or handlers without change-detection; updater callbacks that don't honor same-reference returns.
+- **TOCTOU existence checks**: pre-checking file/resource existence instead of operating and handling the error.
+- **Hot-path bloat**: blocking work added to startup or per-request/per-render paths.
+- **What-comments**: comments restating what the code does. Keep only non-obvious why.
 
 After all subagents finish, act as the Top-Level Agent (TLA):
 1. Aggregate all findings.
