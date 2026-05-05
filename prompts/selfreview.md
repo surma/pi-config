@@ -13,6 +13,8 @@ Run `git diff` (or `git diff HEAD` if there are staged changes) to see what chan
 
 Use the subagent tool with the `tasks` parameter to launch all three agents concurrently in a single `subagent_run` call. Pass each agent the full diff (or the file list, if the diff is huge) so it has the complete context. Prefer the built-in `reviewer` agent; otherwise launch ad hoc read-only review subagents.
 
+Each agent must attach a suggested severity rating from 1-10 to every finding (1 = trivial nit, 10 = critical / data loss / security breach / production outage), with a one-clause justification. The TLA treats this as a suggestion, not a final verdict. Each agent should sort its findings by suggested severity, highest first.
+
 ### Agent 1: Code reuse review
 
 For each change:
@@ -45,4 +47,11 @@ Review the same changes for efficiency:
 
 ## Phase 3: Fix issues
 
-Wait for all three agents to complete. Aggregate their findings and fix each issue directly. If a finding is a false positive or not worth addressing, note it and move on — do not argue with the finding, just skip it. When done, briefly summarize what was fixed (or confirm the code was already clean).
+Wait for all three agents to complete. Aggregate their findings and act as the TLA:
+
+1. Assign a final severity rating /10 to each finding. Subagent suggestions are inputs — you make the call. When subagents disagree, pick the rating you can defend; do not just average. Override aggressively when a subagent over- or under-rates.
+2. Sort by final severity, highest first. Break ties by blast radius, then by confidence.
+3. Fix issues in severity order. High-severity findings must be addressed; low-severity findings (roughly ≤ 3/10) may be skipped if not worth the churn.
+4. If a finding is a false positive, note it and skip — do not argue with it.
+
+When done, briefly summarize what was fixed and what was skipped, with the final severity rating next to each item (or confirm the code was already clean).

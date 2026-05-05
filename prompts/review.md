@@ -32,8 +32,9 @@ Require each subagent to:
 - explain why the issue matters
 - avoid weak speculation
 - clearly label uncertainty
-- return at most 6 main findings, sorted by importance
+- return at most 6 main findings, sorted by suggested severity (highest first)
 - prefer fewer strong findings over many weak ones
+- attach a suggested severity rating from 1-10 to each finding (1 = trivial nit, 10 = critical / data loss / security breach / production outage). Treat this as a suggestion to the TLA, not a final verdict. Briefly justify the rating in one short clause.
 - include a brief coverage note: files inspected, highest-risk areas checked, and anything notable they could not verify
 - for non-trivial claims that depend on context outside the artifact (referenced files, components, APIs, config, wire paths), attempt to verify the claim against the referenced material; if the material is unavailable or out of scope, flag the claim as an unverified assumption rather than implicitly accepting it. Flag unverified assumptions only when the assumption is load-bearing for the artifact's claim — do not list every type or symbol the reviewer didn't trace.
 - when the artifact distinguishes versions, phases, branches, or current-vs-future state, audit present-tense claims for tense-alignment — present-tense descriptions of behavior that is actually future / planned / phase-gated are findings
@@ -58,7 +59,9 @@ After all subagents finish, act as the Top-Level Agent (TLA):
 4. Group duplicate or substantially similar findings into a single merged issue.
 5. Choose the best proposed fix across all subagents, or write a better one yourself if needed.
 6. If the subagent reports are uneven, verbose, or differently formatted, normalize them yourself rather than asking more subagents.
-7. Return only the grouped findings that survived validation.
+7. Assign a final severity rating /10 to each surviving finding. Subagent suggestions are inputs — you make the call. When subagents disagree, pick the rating you can defend; do not just average. Override aggressively when a subagent over- or under-rates.
+8. Sort the final list by severity, highest first. Break ties by blast radius, then by confidence.
+9. Return only the grouped findings that survived validation.
 
 Do not merely concatenate the subagent reports. Synthesize them.
 
@@ -66,8 +69,9 @@ Format the final answer as a grouped list. For each validated finding, use exact
 
 ---
 
-### <index>. <short issue description>
+### <index>. [<severity>/10] <short issue description>
 **Seen by**: Claude Opus 4.6, GPT 5.4, Gemini 3 Pro
+**Severity**: <final TLA rating>/10 (suggested: Claude <n>, GPT <n>, Gemini <n>) — one-line rationale.
 **Evidence**: concise prose that cites affected files and line numbers and explains why the code is a real problem.
 
 ```js
@@ -87,5 +91,8 @@ Formatting rules:
 - Keep snippets short and focused; do not dump large unrelated blocks.
 - Use docs/README snippets only for validated contract mismatches.
 - Every item must have a number in the header so that the user can refer to items easily by number.
+- The header severity (`[<severity>/10]`) is the TLA's final rating, not an average of subagent suggestions.
+- Under `Severity`, only list suggested ratings from subagents that actually reported the issue. If a subagent did not raise it, omit them from the suggested list.
+- The final list must be ordered by severity, highest first.
 
 If no findings survive validation, say so plainly. Then optionally include a short `Unvalidated leads` section with the most notable discarded findings and why they were discarded.
