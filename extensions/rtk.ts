@@ -31,7 +31,7 @@ function rewriteCommand(command: string): string {
 			if (rewritten.length === 0 || rewritten === command) return command;
 			// Force C locale: rtk's parsers expect ASCII output (numbers,
 			// dates, error messages) and break on locale-translated tooling.
-			return `LC_ALL=C ${rewritten}`;
+			return `RTK_SUPPRESS_HOOK_WARNING=1 LC_ALL=C ${rewritten}`;
 		}
 		return command;
 	} catch {
