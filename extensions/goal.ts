@@ -176,8 +176,18 @@ export default function goalExtension(pi: ExtensionAPI) {
 	// continuationSuppressed: latched true when an auto-continuation loop
 	//   ends with zero tool calls. Reset by any productive turn (>=1 tool
 	//   call) or by genuine user input.
+	// continuationTimer: pending idle-aware kick-off. Kept singular so a
+	//   /goal command during streaming and the subsequent agent_end can't
+	//   enqueue duplicate continuation turns.
 	let nextLoopIsAutoContinuation = false;
 	let continuationSuppressed = false;
+	let continuationTimer: ReturnType<typeof setTimeout> | undefined = undefined;
+
+	function cancelContinuationTimer(): void {
+		if (continuationTimer === undefined) return;
+		clearTimeout(continuationTimer);
+		continuationTimer = undefined;
+	}
 
 	function rebuildFromBranch(ctx: ExtensionContext): void {
 		let goal: Goal | null = null;
@@ -214,9 +224,11 @@ export default function goalExtension(pi: ExtensionAPI) {
 		// Transient runtime flags don't persist across reload / branch nav.
 		nextLoopIsAutoContinuation = false;
 		continuationSuppressed = false;
+		cancelContinuationTimer();
 	}
 
 	function setNewGoal(objective: string, tokenBudget: number | null): Goal {
+		cancelContinuationTimer();
 		const now = Date.now();
 		const id = newGoalId();
 		const entry: GoalSetEntry = { id, objective, tokenBudget, createdAt: now };
@@ -236,6 +248,7 @@ export default function goalExtension(pi: ExtensionAPI) {
 		if (status !== "active") {
 			nextLoopIsAutoContinuation = false;
 			continuationSuppressed = false;
+			cancelContinuationTimer();
 		}
 		return currentGoal;
 	}
@@ -244,17 +257,35 @@ export default function goalExtension(pi: ExtensionAPI) {
 	 * Schedule an auto-continuation kick-off if a goal is active. Used
 	 * after `/goal <obj>` and `/goal resume` to match Codex's behavior of
 	 * driving the loop without requiring a follow-up user nudge.
+	 *
+	 * pi-agent's `agent_end` event is the final event for a run, but it is
+	 * not the idle boundary. `pi.sendUserMessage()` without `deliverAs` is
+	 * only safe once the agent has fully settled, so poll ctx.isIdle() from
+	 * a macrotask instead of queueing a microtask from inside agent_end.
 	 */
-	function triggerContinuationIfActive(): void {
-		queueMicrotask(() => {
+	function triggerContinuationIfActive(ctx: ExtensionContext): void {
+		if (continuationTimer !== undefined) return;
+
+		const attempt = () => {
+			continuationTimer = undefined;
+
 			if (!currentGoal || currentGoal.status !== "active") return;
 			if (continuationSuppressed) return;
+
 			try {
+				if (!ctx.isIdle()) {
+					continuationTimer = setTimeout(attempt, 25);
+					return;
+				}
+
 				pi.sendUserMessage(CONTINUATION_SENTINEL);
 			} catch {
-				// If pi rejects the call (e.g. mid-stream), drop the kick-off.
+				// The runtime may have been reloaded or replaced while a timer was
+				// pending. In that case this stale continuation should be dropped.
 			}
-		});
+		};
+
+		continuationTimer = setTimeout(attempt, 0);
 	}
 
 	function clearGoal(): boolean {
@@ -264,6 +295,7 @@ export default function goalExtension(pi: ExtensionAPI) {
 		currentGoal = null;
 		nextLoopIsAutoContinuation = false;
 		continuationSuppressed = false;
+		cancelContinuationTimer();
 		return true;
 	}
 
@@ -315,7 +347,7 @@ export default function goalExtension(pi: ExtensionAPI) {
 				}
 				setStatus("active");
 				ctx.ui.notify("Goal resumed.", "info");
-				triggerContinuationIfActive();
+				triggerContinuationIfActive(ctx);
 				return;
 			}
 
@@ -346,7 +378,7 @@ export default function goalExtension(pi: ExtensionAPI) {
 
 			const goal = setNewGoal(objective, null);
 			ctx.ui.notify(`Goal set: ${goal.objective}`, "info");
-			triggerContinuationIfActive();
+			triggerContinuationIfActive(ctx);
 		},
 	});
 
@@ -493,7 +525,7 @@ You cannot use this tool to pause or resume a goal; those status changes are con
 	});
 
 	// Anti-spin classification + auto-continuation trigger.
-	pi.on("agent_end", async (event, _ctx) => {
+	pi.on("agent_end", async (event, ctx) => {
 		const wasAutoContinuation = nextLoopIsAutoContinuation;
 		nextLoopIsAutoContinuation = false;
 
@@ -513,21 +545,7 @@ You cannot use this tool to pause or resume a goal; those status changes are con
 
 		if (continuationSuppressed) return;
 
-		// Defer the trigger so the current handler unwinds before we kick
-		// off another loop. Re-check state inside the microtask because the
-		// user may have cleared/paused in the meantime (e.g. via a slash
-		// command queued during agent_end).
-		queueMicrotask(() => {
-			if (!currentGoal || currentGoal.status !== "active") return;
-			if (continuationSuppressed) return;
-			try {
-				pi.sendUserMessage(CONTINUATION_SENTINEL);
-			} catch {
-				// pi.sendUserMessage throws while streaming; in agent_end the
-				// agent is idle so this should not fire, but if pi's lifecycle
-				// surprises us we'd rather drop a continuation than crash.
-			}
-		});
+		triggerContinuationIfActive(ctx);
 	});
 
 	// Restore from session history on every load / branch nav. Same
@@ -540,5 +558,8 @@ You cannot use this tool to pause or resume a goal; those status changes are con
 	});
 	pi.on("session_tree", async (_event, ctx) => {
 		rebuildFromBranch(ctx);
+	});
+	pi.on("session_shutdown", async () => {
+		cancelContinuationTimer();
 	});
 }
