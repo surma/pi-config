@@ -3,20 +3,22 @@ import { createWriteStream, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { BashToolDetails, ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import {
+	createBashToolDefinition,
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
 	formatSize,
 	truncateTail,
 } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 
 const LOG_DIR = join(tmpdir(), "pi-bash-jobs");
 const MAX_TAIL_BUFFER_BYTES = DEFAULT_MAX_BYTES * 2;
 const DEFAULT_MAX_LOG_BYTES = 4 * 1024 * 1024 * 1024;
 const FALLBACK_BASH_TIMEOUT_SECONDS = 10;
+const BASH_UPDATE_THROTTLE_MS = 100;
 const STALL_CHECK_INTERVAL_MS = 5_000;
 const STALL_THRESHOLD_MS = 45_000;
 
@@ -54,6 +56,7 @@ type BashJob = {
 	killedForLogLimit: boolean;
 	killRequested: boolean;
 	logStream: ReturnType<typeof createWriteStream>;
+	outputListeners: Set<() => void>;
 	chunks: Buffer[];
 	chunksBytes: number;
 	completion: Deferred<void>;
@@ -65,11 +68,6 @@ type TailState = {
 	text: string;
 	truncated: boolean;
 	truncation: ReturnType<typeof truncateTail>;
-};
-
-type BashToolDetails = {
-	truncation?: unknown;
-	fullOutputPath?: string;
 };
 
 type BashToolResult = {
@@ -230,6 +228,7 @@ function formatRunningMessage(job: BashJob, tail = getTailState(job)): string {
 		`Started: ${formatStartedAt(job.startedAt)} (${formatDuration(Date.now() - job.startedAt)} elapsed)`,
 		`PID: ${job.pid ?? "unknown"}`,
 		`Log file: ${job.outputPath}`,
+		`Use bash_wait with jobId \"${job.jobId}\" to wait longer, bash_status to inspect it, bash_kill to stop it, or bash_jobs to list jobs.`,
 		"",
 		"Output so far:",
 		tail.text || "(no output yet)",
@@ -241,10 +240,6 @@ function formatRunningMessage(job: BashJob, tail = getTailState(job)): string {
 	if (job.interactiveStall && job.stallSummary) {
 		lines.push("", `[Possible interactive stall: ${job.stallSummary}]`);
 	}
-	lines.push(
-		"",
-		`Use bash_wait with jobId \"${job.jobId}\" to wait longer, bash_status to inspect it, bash_kill to stop it, or bash_jobs to list jobs.`,
-	);
 
 	return lines.join("\n");
 }
@@ -359,6 +354,7 @@ function registerJob(command: string, cwd: string, child: ChildProcess): BashJob
 		killedForLogLimit: false,
 		killRequested: false,
 		logStream,
+		outputListeners: new Set(),
 		chunks: [],
 		chunksBytes: 0,
 		completion,
@@ -374,6 +370,13 @@ function registerJob(command: string, cwd: string, child: ChildProcess): BashJob
 		appendChunk(job, chunk);
 		if (canWriteLog) {
 			logStream.write(chunk);
+		}
+		for (const listener of job.outputListeners) {
+			try {
+				listener();
+			} catch {
+				// Rendering updates are best-effort; never break output capture.
+			}
 		}
 	};
 
@@ -437,6 +440,67 @@ function buildDetails(job: BashJob, forceFullOutputPath = false, tail = getTailS
 	};
 }
 
+function buildOutputUpdate(job: BashJob, forceFullOutputPath = false, tail = getTailState(job)): BashToolResult {
+	return {
+		content: [{ type: "text", text: tail.text || "" }],
+		details: buildDetails(job, forceFullOutputPath, tail),
+	};
+}
+
+function attachOutputUpdater(
+	job: BashJob,
+	onUpdate: ((result: BashToolResult) => void) | undefined,
+	options: { forceFullOutputPath?: boolean; emitInitialOutput?: boolean } = {},
+): () => void {
+	if (!onUpdate) return () => {};
+
+	const forceFullOutputPath = options.forceFullOutputPath ?? false;
+	let updateTimer: NodeJS.Timeout | undefined;
+	let updateDirty = false;
+	let lastUpdateAt = 0;
+
+	const clearUpdateTimer = () => {
+		if (updateTimer) {
+			clearTimeout(updateTimer);
+			updateTimer = undefined;
+		}
+	};
+
+	const emitOutputUpdate = () => {
+		if (!updateDirty) return;
+		updateDirty = false;
+		lastUpdateAt = Date.now();
+		onUpdate(buildOutputUpdate(job, forceFullOutputPath));
+	};
+
+	const scheduleOutputUpdate = () => {
+		updateDirty = true;
+		const delay = BASH_UPDATE_THROTTLE_MS - (Date.now() - lastUpdateAt);
+		if (delay <= 0) {
+			clearUpdateTimer();
+			emitOutputUpdate();
+			return;
+		}
+		updateTimer ??= setTimeout(() => {
+			updateTimer = undefined;
+			emitOutputUpdate();
+		}, delay);
+	};
+
+	job.outputListeners.add(scheduleOutputUpdate);
+	if (options.emitInitialOutput) {
+		onUpdate(buildOutputUpdate(job, forceFullOutputPath));
+	} else {
+		onUpdate({ content: [], details: undefined });
+	}
+
+	return () => {
+		job.outputListeners.delete(scheduleOutputUpdate);
+		clearUpdateTimer();
+		emitOutputUpdate();
+	};
+}
+
 function completedJobResponseOrThrow(
 	job: BashJob,
 	includeHeader = false,
@@ -461,10 +525,13 @@ async function runManagedBash(
 	cwd: string,
 	timeoutSeconds: number,
 	signal: AbortSignal | undefined,
+	onUpdate: ((result: BashToolResult) => void) | undefined,
 ): Promise<BashToolResult> {
 	const job = spawnManagedJob(command, cwd);
+	const stopUpdating = attachOutputUpdater(job, onUpdate);
 
-	const result = await new Promise<"completed" | "timed_out">((resolve, reject) => {
+	try {
+		const result = await new Promise<"completed" | "timed_out">((resolve, reject) => {
 			let timeoutHandle: NodeJS.Timeout | undefined;
 			let abortHandler: (() => void) | undefined;
 			let settled = false;
@@ -495,24 +562,30 @@ async function runManagedBash(
 			}
 		});
 
-	if (result === "timed_out") {
-		return {
-			content: [{ type: "text", text: formatRunningMessage(job) }],
-			details: buildDetails(job, true),
-		};
-	}
+		if (result === "timed_out") {
+			return {
+				content: [{ type: "text", text: formatRunningMessage(job) }],
+				details: buildDetails(job),
+			};
+		}
 
-	return completedJobResponseOrThrow(job);
+		return completedJobResponseOrThrow(job);
+	} finally {
+		stopUpdating();
+	}
 }
 
 async function waitForJob(
 	job: BashJob,
 	timeoutSeconds: number | undefined,
 	signal: AbortSignal | undefined,
+	onUpdate?: (result: BashToolResult) => void,
 ): Promise<void> {
 	if (job.status !== "running") return;
 
-	await new Promise<void>((resolve, reject) => {
+	const stopUpdating = attachOutputUpdater(job, onUpdate, { emitInitialOutput: true });
+	try {
+		await new Promise<void>((resolve, reject) => {
 			let timeoutHandle: NodeJS.Timeout | undefined;
 			let abortHandler: (() => void) | undefined;
 			let settled = false;
@@ -539,12 +612,15 @@ async function waitForJob(
 				if (timeoutHandle.unref) timeoutHandle.unref();
 			}
 
-		abortHandler = () => fail(new Error(`Stopped waiting for job ${job.jobId}`));
-		if (signal) {
-			if (signal.aborted) abortHandler();
-			else signal.addEventListener("abort", abortHandler, { once: true });
-		}
-	});
+			abortHandler = () => fail(new Error(`Stopped waiting for job ${job.jobId}`));
+			if (signal) {
+				if (signal.aborted) abortHandler();
+				else signal.addEventListener("abort", abortHandler, { once: true });
+			}
+		});
+	} finally {
+		stopUpdating();
+	}
 }
 
 function formatStatus(job: BashJob, tail = getTailState(job)): string {
@@ -668,6 +744,8 @@ async function killJob(job: BashJob, signal?: AbortSignal): Promise<void> {
 }
 
 export default function (pi: ExtensionAPI) {
+	const bashResultRenderer = createBashToolDefinition(process.cwd()).renderResult;
+
 	pi.on("session_start", () => {
 		maxLogBytes = loadMaxLogBytes();
 	});
@@ -728,9 +806,9 @@ export default function (pi: ExtensionAPI) {
 			"Do not use shell backgrounding tricks like &, nohup, or disown to detach work. Instead, let bash create a managed job and then use bash_wait, bash_status, bash_kill, or bash_jobs.",
 		],
 		parameters: bashSchema,
-		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const commandCwd = resolveCommandCwd(ctx.cwd, params.cwd);
-			return runManagedBash(params.command, commandCwd, params.timeout ?? defaultBashTimeoutSeconds, signal);
+			return runManagedBash(params.command, commandCwd, params.timeout ?? defaultBashTimeoutSeconds, signal, onUpdate);
 		},
 	});
 
@@ -745,13 +823,14 @@ export default function (pi: ExtensionAPI) {
 			const timeoutSuffix = args.timeout ? theme.fg("muted", ` (timeout ${args.timeout}s)`) : "";
 			return new Text(theme.fg("toolTitle", theme.bold(`bash_wait ${args.jobId}`)) + timeoutSuffix, 0, 0);
 		},
-		async execute(_toolCallId, params, signal) {
+		renderResult: bashResultRenderer,
+		async execute(_toolCallId, params, signal, onUpdate) {
 			const job = getJob(params.jobId);
-			await waitForJob(job, params.timeout, signal);
+			await waitForJob(job, params.timeout, signal, onUpdate);
 			if (job.status === "running") {
 				return {
 					content: [{ type: "text", text: formatRunningMessage(job) }],
-					details: buildDetails(job, true),
+					details: buildDetails(job),
 				};
 			}
 			return completedJobResponseOrThrow(job, true);
@@ -764,12 +843,13 @@ export default function (pi: ExtensionAPI) {
 		description: "Inspect the current status of a managed bash job, including elapsed time, log path, and recent output.",
 		promptSnippet: "Inspect the status of an existing managed bash job.",
 		parameters: jobIdSchema,
+		renderResult: bashResultRenderer,
 		async execute(_toolCallId, params) {
 			const job = getJob(params.jobId);
 			const tail = getTailState(job);
 			const response = {
 				content: [{ type: "text", text: formatStatus(job, tail) }],
-				details: buildDetails(job, true, tail),
+				details: buildDetails(job, false, tail),
 			};
 			if (job.status !== "running") {
 				forgetJob(job);
@@ -784,10 +864,11 @@ export default function (pi: ExtensionAPI) {
 		description: "Kill a running managed bash job and return its final known output tail.",
 		promptSnippet: "Stop a running managed bash job.",
 		parameters: jobIdSchema,
+		renderResult: bashResultRenderer,
 		async execute(_toolCallId, params, signal) {
 			const job = getJob(params.jobId);
 			await killJob(job, signal);
-			const { text, details } = consumeCompletedJob(job, true, true);
+			const { text, details } = consumeCompletedJob(job, true);
 			return {
 				content: [{ type: "text", text }],
 				details,
