@@ -19,6 +19,7 @@ const MAX_TAIL_BUFFER_BYTES = DEFAULT_MAX_BYTES * 2;
 const DEFAULT_MAX_LOG_BYTES = 4 * 1024 * 1024 * 1024;
 const FALLBACK_BASH_TIMEOUT_SECONDS = 10;
 const BASH_UPDATE_THROTTLE_MS = 100;
+const COMMAND_PREVIEW_MAX_CHARS = 160;
 const STALL_CHECK_INTERVAL_MS = 5_000;
 const STALL_THRESHOLD_MS = 45_000;
 
@@ -179,6 +180,19 @@ function formatStartedAt(timestamp: number): string {
 	return new Date(timestamp).toLocaleTimeString();
 }
 
+function collapseWhitespace(input: string): string {
+	return input.replace(/\s+/g, " ").trim();
+}
+
+function truncateForDisplay(input: string, maxChars: number): string {
+	if (input.length <= maxChars) return input;
+	return `${input.slice(0, maxChars - 1)}…`;
+}
+
+function formatCommandPreview(command: string): string {
+	return truncateForDisplay(collapseWhitespace(command), COMMAND_PREVIEW_MAX_CHARS);
+}
+
 function shellPath(): string {
 	return process.env.SHELL || "/bin/sh";
 }
@@ -225,6 +239,7 @@ function getTailState(job: BashJob): TailState {
 function formatRunningMessage(job: BashJob, tail = getTailState(job)): string {
 	const lines = [
 		`Command is still running as managed bash job ${job.jobId}.`,
+		`Command: ${job.command}`,
 		`Started: ${formatStartedAt(job.startedAt)} (${formatDuration(Date.now() - job.startedAt)} elapsed)`,
 		`PID: ${job.pid ?? "unknown"}`,
 		`Log file: ${job.outputPath}`,
@@ -253,7 +268,7 @@ function formatCompletedMessage(job: BashJob, includeHeader = false, tail = getT
 				: job.status === "killed"
 					? `Job ${job.jobId} was killed.`
 					: `Job ${job.jobId} failed${job.exitCode !== undefined && job.exitCode !== null ? ` with exit code ${job.exitCode}` : ""}.`;
-		lines.push(summary, `Runtime: ${formatDuration((job.endedAt ?? Date.now()) - job.startedAt)}`);
+		lines.push(summary, `Command: ${job.command}`, `Runtime: ${formatDuration((job.endedAt ?? Date.now()) - job.startedAt)}`);
 	}
 
 	lines.push(tail.text || "(no output)");
@@ -821,7 +836,9 @@ export default function (pi: ExtensionAPI) {
 		parameters: waitSchema,
 		renderCall(args, theme) {
 			const timeoutSuffix = args.timeout ? theme.fg("muted", ` (timeout ${args.timeout}s)`) : "";
-			return new Text(theme.fg("toolTitle", theme.bold(`bash_wait ${args.jobId}`)) + timeoutSuffix, 0, 0);
+			const job = typeof args.jobId === "string" ? jobs.get(args.jobId) : undefined;
+			const commandSuffix = job ? theme.fg("muted", ` — ${formatCommandPreview(job.command)}`) : "";
+			return new Text(theme.fg("toolTitle", theme.bold(`bash_wait ${args.jobId}`)) + timeoutSuffix + commandSuffix, 0, 0);
 		},
 		renderResult: bashResultRenderer,
 		async execute(_toolCallId, params, signal, onUpdate) {
