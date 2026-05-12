@@ -22,6 +22,7 @@
  * because the prompts are the load-bearing part of the feature.
  */
 
+import { compact as compactWithModel } from "@mariozechner/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 
@@ -58,12 +59,27 @@ const ENTRY_GOAL_STATUS = "goal-status";
 const ENTRY_GOAL_CLEAR = "goal-clear";
 
 // Sentinel for the auto-continuation user message. Detected in the input
-// event and rewritten to a short user-visible string so the model sees the
+// event and rewritten to a short user-visible string; the model also gets the
 // real continuation prompt via the hidden before_agent_start injection.
 const CONTINUATION_SENTINEL = "[pi-goal:continue]";
-const CONTINUATION_DISPLAY_TEXT = "(goal continuation)";
+const CONTINUATION_OBJECTIVE_MAX_CHARS = 120;
+const GOAL_COMPACTION_THRESHOLD_PERCENT = 80;
+const GOAL_COMPACTION_INSTRUCTIONS =
+	"This compaction is happening between automatic goal-continuation turns. Preserve the active goal, current progress, evidence gathered, remaining work, blockers, and the next concrete action.";
+const GOAL_COMPACTION_MODEL_CANDIDATES = [
+	{ provider: "anthropic", id: "claude-sonnet-4-6" },
+	{ provider: "anthropic", id: "claude-sonnet-4-5" },
+	{ provider: "anthropic", id: "claude-sonnet-4-20250514" },
+] as const;
 
-const GOAL_USAGE = "Usage: /goal <objective> | /goal pause | /goal resume | /goal clear";
+const GOAL_HELP = [
+	"Usage:",
+	"  /goal                  Show the current goal and this help",
+	"  /goal <objective>      Set or replace the active goal",
+	"  /goal pause            Pause auto-continuation",
+	"  /goal resume           Resume auto-continuation",
+	"  /goal clear            Clear the current goal",
+].join("\n");
 
 // ---------- Prompt templates (ported from codex-rs) ----------
 
@@ -141,6 +157,24 @@ function formatGoal(goal: Goal): string {
 	return lines.join("\n");
 }
 
+function formatGoalStatus(goal: Goal): string {
+	return `${formatGoal(goal)}\n\n${GOAL_HELP}`;
+}
+
+function collapseWhitespace(input: string): string {
+	return input.replace(/\s+/g, " ").trim();
+}
+
+function truncateForDisplay(input: string, maxChars: number): string {
+	if (input.length <= maxChars) return input;
+	return `${input.slice(0, maxChars - 1)}…`;
+}
+
+function formatContinuationDisplayText(goal: Goal): string {
+	const objective = truncateForDisplay(collapseWhitespace(goal.objective), CONTINUATION_OBJECTIVE_MAX_CHARS);
+	return `Goal auto-continuation: continue working toward ${objective}`;
+}
+
 /**
  * Walk a finalized agent loop's messages and count assistant tool calls.
  * pi-ai represents these as content blocks with `type: "toolCall"` on
@@ -182,6 +216,7 @@ export default function goalExtension(pi: ExtensionAPI) {
 	let nextLoopIsAutoContinuation = false;
 	let continuationSuppressed = false;
 	let continuationTimer: ReturnType<typeof setTimeout> | undefined = undefined;
+	let goalCompactionInProgress = false;
 
 	function cancelContinuationTimer(): void {
 		if (continuationTimer === undefined) return;
@@ -224,6 +259,7 @@ export default function goalExtension(pi: ExtensionAPI) {
 		// Transient runtime flags don't persist across reload / branch nav.
 		nextLoopIsAutoContinuation = false;
 		continuationSuppressed = false;
+		goalCompactionInProgress = false;
 		cancelContinuationTimer();
 	}
 
@@ -236,6 +272,7 @@ export default function goalExtension(pi: ExtensionAPI) {
 		currentGoal = { id, objective, status: "active", tokenBudget, createdAt: now, updatedAt: now };
 		nextLoopIsAutoContinuation = false;
 		continuationSuppressed = false;
+		goalCompactionInProgress = false;
 		return currentGoal;
 	}
 
@@ -248,9 +285,38 @@ export default function goalExtension(pi: ExtensionAPI) {
 		if (status !== "active") {
 			nextLoopIsAutoContinuation = false;
 			continuationSuppressed = false;
+			goalCompactionInProgress = false;
 			cancelContinuationTimer();
 		}
 		return currentGoal;
+	}
+
+	function triggerGoalCompactionIfNeeded(ctx: ExtensionContext): boolean {
+		if (goalCompactionInProgress) return true;
+
+		const usage = ctx.getContextUsage();
+		if (!usage || usage.percent === null || usage.percent < GOAL_COMPACTION_THRESHOLD_PERCENT) {
+			return false;
+		}
+
+		goalCompactionInProgress = true;
+		ctx.ui.notify(
+			`Goal compaction: context is ${usage.percent.toFixed(1)}% full; compacting before the next goal turn.`,
+			"info",
+		);
+		ctx.compact({
+			customInstructions: GOAL_COMPACTION_INSTRUCTIONS,
+			onComplete: () => {
+				goalCompactionInProgress = false;
+				triggerContinuationIfActive(ctx);
+			},
+			onError: (error) => {
+				goalCompactionInProgress = false;
+				ctx.ui.notify(`Goal compaction failed: ${error.message}`, "warning");
+				triggerContinuationIfActive(ctx);
+			},
+		});
+		return true;
 	}
 
 	/**
@@ -264,7 +330,7 @@ export default function goalExtension(pi: ExtensionAPI) {
 	 * a macrotask instead of queueing a microtask from inside agent_end.
 	 */
 	function triggerContinuationIfActive(ctx: ExtensionContext): void {
-		if (continuationTimer !== undefined) return;
+		if (continuationTimer !== undefined || goalCompactionInProgress) return;
 
 		const attempt = () => {
 			continuationTimer = undefined;
@@ -277,6 +343,8 @@ export default function goalExtension(pi: ExtensionAPI) {
 					continuationTimer = setTimeout(attempt, 25);
 					return;
 				}
+
+				if (triggerGoalCompactionIfNeeded(ctx)) return;
 
 				pi.sendUserMessage(CONTINUATION_SENTINEL);
 			} catch {
@@ -295,9 +363,52 @@ export default function goalExtension(pi: ExtensionAPI) {
 		currentGoal = null;
 		nextLoopIsAutoContinuation = false;
 		continuationSuppressed = false;
+		goalCompactionInProgress = false;
 		cancelContinuationTimer();
 		return true;
 	}
+
+	// ---------- Compaction ----------
+
+	pi.on("session_before_compact", async (event, ctx) => {
+		const model = GOAL_COMPACTION_MODEL_CANDIDATES.map((candidate) =>
+			ctx.modelRegistry.find(candidate.provider, candidate.id),
+		).find((candidate) => candidate !== undefined);
+		if (!model) {
+			ctx.ui.notify("Claude Sonnet compaction model not found; using default compaction.", "warning");
+			return;
+		}
+
+		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+		if (!auth.ok) {
+			ctx.ui.notify(`Claude Sonnet compaction auth failed: ${auth.error}; using default compaction.`, "warning");
+			return;
+		}
+		if (!auth.apiKey) {
+			ctx.ui.notify(`No API key for ${model.provider}; using default compaction.`, "warning");
+			return;
+		}
+
+		try {
+			ctx.ui.notify(`Compacting with ${model.provider}/${model.id}...`, "info");
+			return {
+				compaction: await compactWithModel(
+					event.preparation,
+					model,
+					auth.apiKey,
+					auth.headers,
+					event.customInstructions,
+					event.signal,
+				),
+			};
+		} catch (error) {
+			if (!event.signal.aborted) {
+				const message = error instanceof Error ? error.message : String(error);
+				ctx.ui.notify(`Claude Sonnet compaction failed: ${message}; using default compaction.`, "warning");
+			}
+			return;
+		}
+	});
 
 	// ---------- /goal slash command ----------
 
@@ -306,13 +417,13 @@ export default function goalExtension(pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const trimmed = args.trim();
 
-			// Bare `/goal`: show status.
+			// Bare `/goal`: show status and available subcommands.
 			if (!trimmed) {
 				if (!currentGoal) {
-					ctx.ui.notify(`No goal is currently set.\n${GOAL_USAGE}`, "info");
+					ctx.ui.notify(`No goal is currently set.\n\n${GOAL_HELP}`, "info");
 					return;
 				}
-				ctx.ui.notify(formatGoal(currentGoal), "info");
+				ctx.ui.notify(formatGoalStatus(currentGoal), "info");
 				return;
 			}
 
@@ -494,7 +605,7 @@ You cannot use this tool to pause or resume a goal; those status changes are con
 				return { action: "handled" };
 			}
 			nextLoopIsAutoContinuation = true;
-			return { action: "transform", text: CONTINUATION_DISPLAY_TEXT };
+			return { action: "transform", text: formatContinuationDisplayText(currentGoal) };
 		}
 		// Real user activity (interactive / rpc) clears the suppression latch
 		// so a previously-spinning goal can resume after the user nudges it.
