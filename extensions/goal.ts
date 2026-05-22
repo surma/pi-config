@@ -25,6 +25,7 @@
 
 import { compact as compactWithModel } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 // ---------- Types & constants ----------
@@ -61,6 +62,13 @@ interface GoalCostLimitClearEntry {
 	id: string;
 	clearedAt: number;
 }
+interface GoalPendingCostLimitSetEntry {
+	costLimitUsd: number;
+	updatedAt: number;
+}
+interface GoalPendingCostLimitClearEntry {
+	clearedAt: number;
+}
 interface GoalClearEntry {
 	clearedAt: number;
 }
@@ -69,9 +77,10 @@ const ENTRY_GOAL_SET = "goal-set";
 const ENTRY_GOAL_STATUS = "goal-status";
 const ENTRY_GOAL_COST_LIMIT_SET = "goal-cost-limit-set";
 const ENTRY_GOAL_COST_LIMIT_CLEAR = "goal-cost-limit-clear";
+const ENTRY_GOAL_PENDING_COST_LIMIT_SET = "goal-pending-cost-limit-set";
+const ENTRY_GOAL_PENDING_COST_LIMIT_CLEAR = "goal-pending-cost-limit-clear";
 const ENTRY_GOAL_CLEAR = "goal-clear";
 
-const CONTINUATION_OBJECTIVE_MAX_CHARS = 120;
 const GOAL_COMPACTION_THRESHOLD_PERCENT = 80;
 const GOAL_COMPACTION_INSTRUCTIONS =
 	"This compaction is happening between automatic goal-continuation turns. Preserve the active goal, current progress, evidence gathered, remaining work, blockers, and the next concrete action.";
@@ -88,10 +97,10 @@ const GOAL_HELP = [
 	"  /goal pause                   Pause auto-continuation",
 	"  /goal resume                  Resume auto-continuation",
 	"  /goal clear                   Clear the current goal",
-	"  /goal limit                   Show the current session cost and limit",
+	"  /goal limit                   Show the current session cost and current/next-goal limit",
 	"  /goal limit set <amount>      Stop once session cost reaches <amount> dollars",
 	"  /goal limit set +<amount>     Stop after spending <amount> more dollars",
-	"  /goal limit clear             Clear the cost limit",
+	"  /goal limit clear             Clear the current or next-goal cost limit",
 ].join("\n");
 
 // ---------- Prompt templates (ported from codex-rs) ----------
@@ -244,18 +253,18 @@ function formatGoalStatus(goal: Goal, currentCostUsd: number): string {
 	return `${formatGoal(goal, currentCostUsd)}\n\n${GOAL_HELP}`;
 }
 
-function collapseWhitespace(input: string): string {
-	return input.replace(/\s+/g, " ").trim();
-}
-
-function truncateForDisplay(input: string, maxChars: number): string {
-	if (input.length <= maxChars) return input;
-	return `${input.slice(0, maxChars - 1)}…`;
-}
-
-function formatContinuationDisplayText(goal: Goal): string {
-	const objective = truncateForDisplay(collapseWhitespace(goal.objective), CONTINUATION_OBJECTIVE_MAX_CHARS);
-	return `Goal auto-continuation: continue working toward ${objective}`;
+function formatPendingLimitStatus(pendingCostLimitUsd: number | null, currentCostUsd: number): string {
+	const lines = ["No goal is currently set.", `Session cost: ${formatCurrency(currentCostUsd)}`];
+	if (pendingCostLimitUsd === null) {
+		lines.push("Next-goal cost limit: none");
+	} else {
+		const remaining = pendingCostLimitUsd - currentCostUsd;
+		const suffix = remaining > 0 ? `${formatCurrency(remaining)} remaining` : "already reached";
+		lines.push(
+			`Next-goal cost limit: ${formatCurrency(currentCostUsd)} / ${formatCurrency(pendingCostLimitUsd)} (${suffix})`,
+		);
+	}
+	return `${lines.join("\n")}\n\n${GOAL_HELP}`;
 }
 
 /**
@@ -293,11 +302,38 @@ export default function goalExtension(pi: ExtensionAPI) {
 	// continuationSuppressed: latched true when an auto-continuation loop
 	//   ends with zero tool calls. Reset by any productive turn (>=1 tool
 	//   call) or by genuine user input.
+	// continuationTimer: pending idle-boundary kick-off. agent_end fires before
+	//   pi has flipped to idle, so triggerTurn would otherwise be queued as a
+	//   stranded steering message and only run after the next user input.
 	let nextTurnIsContinuation = false;
 	let continuationSuppressed = false;
+	let continuationTimer: ReturnType<typeof setTimeout> | undefined = undefined;
 	let goalCompactionInProgress = false;
 	let sessionCostUsd = 0;
+	let pendingCostLimitUsd: number | null = null;
 	let lastCostLimitStopNotificationKey: string | null = null;
+
+	pi.registerMessageRenderer("goal-continuation", (message, _options, theme) => {
+		const details = message.details as { objective?: unknown } | undefined;
+		const detailObjective = typeof details?.objective === "string" ? details.objective.trim() : undefined;
+		const objective =
+			detailObjective && detailObjective.length > 0 ? detailObjective : (currentGoal?.objective ?? "active goal");
+		const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
+		box.addChild(
+			new Text(
+				`${theme.fg("accent", "[goal continuation]")}\n${theme.fg("muted", "Continue working toward:")}\n${objective}`,
+				0,
+				0,
+			),
+		);
+		return box;
+	});
+
+	function cancelContinuationTimer(): void {
+		if (continuationTimer === undefined) return;
+		clearTimeout(continuationTimer);
+		continuationTimer = undefined;
+	}
 
 	function resetCostLimitStopNotification(): void {
 		lastCostLimitStopNotificationKey = null;
@@ -306,6 +342,7 @@ export default function goalExtension(pi: ExtensionAPI) {
 	function rebuildFromBranch(ctx: ExtensionContext): void {
 		sessionCostUsd = computeSessionCost(ctx);
 		let goal: Goal | null = null;
+		let pendingLimit: number | null = null;
 		for (const entry of ctx.sessionManager.getBranch()) {
 			if (entry.type !== "custom") continue;
 			switch (entry.customType) {
@@ -344,6 +381,16 @@ export default function goalExtension(pi: ExtensionAPI) {
 					goal.updatedAt = data.clearedAt;
 					break;
 				}
+				case ENTRY_GOAL_PENDING_COST_LIMIT_SET: {
+					const data = entry.data as GoalPendingCostLimitSetEntry | undefined;
+					if (!data) break;
+					pendingLimit = data.costLimitUsd;
+					break;
+				}
+				case ENTRY_GOAL_PENDING_COST_LIMIT_CLEAR: {
+					pendingLimit = null;
+					break;
+				}
 				case ENTRY_GOAL_CLEAR: {
 					goal = null;
 					break;
@@ -351,14 +398,17 @@ export default function goalExtension(pi: ExtensionAPI) {
 			}
 		}
 		currentGoal = goal;
+		pendingCostLimitUsd = pendingLimit;
 		// Transient runtime flags don't persist across reload / branch nav.
 		nextTurnIsContinuation = false;
 		continuationSuppressed = false;
 		goalCompactionInProgress = false;
 		resetCostLimitStopNotification();
+		cancelContinuationTimer();
 	}
 
 	function setNewGoal(objective: string, tokenBudget: number | null): Goal {
+		cancelContinuationTimer();
 		const now = Date.now();
 		const id = newGoalId();
 		const entry: GoalSetEntry = { id, objective, tokenBudget, createdAt: now };
@@ -372,6 +422,18 @@ export default function goalExtension(pi: ExtensionAPI) {
 			createdAt: now,
 			updatedAt: now,
 		};
+		if (pendingCostLimitUsd !== null) {
+			const limitEntry: GoalCostLimitSetEntry = {
+				id,
+				costLimitUsd: pendingCostLimitUsd,
+				updatedAt: now,
+			};
+			pi.appendEntry<GoalCostLimitSetEntry>(ENTRY_GOAL_COST_LIMIT_SET, limitEntry);
+			const pendingClearEntry: GoalPendingCostLimitClearEntry = { clearedAt: now };
+			pi.appendEntry<GoalPendingCostLimitClearEntry>(ENTRY_GOAL_PENDING_COST_LIMIT_CLEAR, pendingClearEntry);
+			currentGoal = { ...currentGoal, costLimitUsd: pendingCostLimitUsd };
+			pendingCostLimitUsd = null;
+		}
 		nextTurnIsContinuation = false;
 		continuationSuppressed = false;
 		goalCompactionInProgress = false;
@@ -390,6 +452,7 @@ export default function goalExtension(pi: ExtensionAPI) {
 			continuationSuppressed = false;
 			goalCompactionInProgress = false;
 			resetCostLimitStopNotification();
+			cancelContinuationTimer();
 		}
 		return currentGoal;
 	}
@@ -415,6 +478,17 @@ export default function goalExtension(pi: ExtensionAPI) {
 		return currentGoal;
 	}
 
+	function setPendingCostLimit(costLimitUsd: number): number {
+		const now = Date.now();
+		const roundedLimitUsd = roundCostUsd(costLimitUsd);
+		resetCostLimitStopNotification();
+		if (pendingCostLimitUsd === roundedLimitUsd) return pendingCostLimitUsd;
+		const entry: GoalPendingCostLimitSetEntry = { costLimitUsd: roundedLimitUsd, updatedAt: now };
+		pi.appendEntry<GoalPendingCostLimitSetEntry>(ENTRY_GOAL_PENDING_COST_LIMIT_SET, entry);
+		pendingCostLimitUsd = roundedLimitUsd;
+		return pendingCostLimitUsd;
+	}
+
 	function clearCostLimit(): boolean {
 		if (!currentGoal || currentGoal.costLimitUsd === null) return false;
 		const now = Date.now();
@@ -423,6 +497,15 @@ export default function goalExtension(pi: ExtensionAPI) {
 		currentGoal = { ...currentGoal, costLimitUsd: null, updatedAt: now };
 		resetCostLimitStopNotification();
 		continuationSuppressed = false;
+		return true;
+	}
+
+	function clearPendingCostLimit(): boolean {
+		if (pendingCostLimitUsd === null) return false;
+		const entry: GoalPendingCostLimitClearEntry = { clearedAt: Date.now() };
+		pi.appendEntry<GoalPendingCostLimitClearEntry>(ENTRY_GOAL_PENDING_COST_LIMIT_CLEAR, entry);
+		pendingCostLimitUsd = null;
+		resetCostLimitStopNotification();
 		return true;
 	}
 
@@ -450,14 +533,14 @@ export default function goalExtension(pi: ExtensionAPI) {
 	}
 
 	function handleLimitCommand(args: string, ctx: ExtensionContext): void {
-		if (!currentGoal) {
-			ctx.ui.notify("No goal is currently set. Set one first with /goal <objective>.", "warning");
-			return;
-		}
-
 		const trimmed = args.trim();
 		if (!trimmed) {
-			ctx.ui.notify(formatGoal(currentGoal, sessionCostUsd), "info");
+			ctx.ui.notify(
+				currentGoal
+					? formatGoal(currentGoal, sessionCostUsd)
+					: formatPendingLimitStatus(pendingCostLimitUsd, sessionCostUsd),
+				"info",
+			);
 			return;
 		}
 
@@ -465,6 +548,18 @@ export default function goalExtension(pi: ExtensionAPI) {
 		const command = parts[0]?.toLowerCase();
 
 		if (command === "clear") {
+			if (!currentGoal) {
+				if (!clearPendingCostLimit()) {
+					ctx.ui.notify("No next-goal cost limit to clear.", "info");
+					return;
+				}
+				ctx.ui.notify(
+					`Next-goal cost limit cleared. Current session cost is ${formatCurrency(sessionCostUsd)}.`,
+					"info",
+				);
+				return;
+			}
+
 			if (!clearCostLimit()) {
 				ctx.ui.notify("No goal cost limit to clear.", "info");
 				return;
@@ -473,7 +568,7 @@ export default function goalExtension(pi: ExtensionAPI) {
 				`Goal cost limit cleared. Current session cost is ${formatCurrency(sessionCostUsd)}.`,
 				"info",
 			);
-			scheduleContinuation();
+			scheduleContinuation(ctx);
 			return;
 		}
 
@@ -496,12 +591,20 @@ export default function goalExtension(pi: ExtensionAPI) {
 			}
 			const baseCostUsd = sessionCostUsd;
 			const costLimitUsd = roundCostUsd(baseCostUsd + additionalCostUsd);
-			setCostLimit(costLimitUsd);
-			ctx.ui.notify(
-				`Goal cost limit set to ${formatCurrency(costLimitUsd)} (${formatCurrency(additionalCostUsd)} from current session cost ${formatCurrency(baseCostUsd)}).`,
-				"info",
-			);
-			scheduleContinuation();
+			if (currentGoal) {
+				setCostLimit(costLimitUsd);
+				ctx.ui.notify(
+					`Goal cost limit set to ${formatCurrency(costLimitUsd)} (${formatCurrency(additionalCostUsd)} from current session cost ${formatCurrency(baseCostUsd)}).`,
+					"info",
+				);
+				scheduleContinuation(ctx);
+			} else {
+				setPendingCostLimit(costLimitUsd);
+				ctx.ui.notify(
+					`Next-goal cost limit set to ${formatCurrency(costLimitUsd)} (${formatCurrency(additionalCostUsd)} from current session cost ${formatCurrency(baseCostUsd)}).`,
+					"info",
+				);
+			}
 			return;
 		}
 
@@ -514,10 +617,15 @@ export default function goalExtension(pi: ExtensionAPI) {
 			return;
 		}
 
-		setCostLimit(costLimitUsd);
-		ctx.ui.notify(`Goal cost limit set to ${formatCurrency(costLimitUsd)}.`, "info");
-		if (!stopForCostLimitIfNeeded(ctx)) {
-			scheduleContinuation();
+		if (currentGoal) {
+			setCostLimit(costLimitUsd);
+			ctx.ui.notify(`Goal cost limit set to ${formatCurrency(costLimitUsd)}.`, "info");
+			if (!stopForCostLimitIfNeeded(ctx)) {
+				scheduleContinuation(ctx);
+			}
+		} else {
+			setPendingCostLimit(costLimitUsd);
+			ctx.ui.notify(`Next-goal cost limit set to ${formatCurrency(costLimitUsd)}.`, "info");
 		}
 	}
 
@@ -538,12 +646,12 @@ export default function goalExtension(pi: ExtensionAPI) {
 			customInstructions: GOAL_COMPACTION_INSTRUCTIONS,
 			onComplete: () => {
 				goalCompactionInProgress = false;
-				scheduleContinuation();
+				scheduleContinuation(ctx);
 			},
 			onError: (error) => {
 				goalCompactionInProgress = false;
 				ctx.ui.notify(`Goal compaction failed: ${error.message}`, "warning");
-				scheduleContinuation();
+				scheduleContinuation(ctx);
 			},
 		});
 		return true;
@@ -551,23 +659,64 @@ export default function goalExtension(pi: ExtensionAPI) {
 
 	/**
 	 * Schedule an auto-continuation if the goal is active and not
-	 * suppressed. Uses pi.sendMessage with triggerTurn to go through Pi's
-	 * standard message delivery pipeline instead of sendUserMessage.
+	 * suppressed. When called from agent_end, wait for Pi's idle boundary
+	 * before using triggerTurn; otherwise Pi still considers the agent
+	 * streaming and queues the message as steering that won't be drained until
+	 * a later user turn.
 	 */
-	function scheduleContinuation(): void {
+	function scheduleContinuation(ctx?: ExtensionContext): void {
 		if (!currentGoal || currentGoal.status !== "active") return;
 		if (continuationSuppressed) return;
 		if (goalCompactionInProgress) return;
+		if (continuationTimer !== undefined) return;
 
-		nextTurnIsContinuation = true;
-		pi.sendMessage(
-			{
-				customType: "goal-continuation",
-				content: renderContinuationPrompt(currentGoal),
-				display: false,
-			},
-			{ triggerTurn: true },
-		);
+		const send = () => {
+			if (!currentGoal || currentGoal.status !== "active") return;
+			if (continuationSuppressed) return;
+			if (goalCompactionInProgress) return;
+
+			nextTurnIsContinuation = true;
+			pi.sendMessage(
+				{
+					customType: "goal-continuation",
+					content: renderContinuationPrompt(currentGoal),
+					display: true,
+					details: { objective: currentGoal.objective },
+				},
+				{ triggerTurn: true },
+			);
+		};
+
+		try {
+			if (!ctx || ctx.isIdle()) {
+				send();
+				return;
+			}
+		} catch {
+			return;
+		}
+
+		const attempt = () => {
+			continuationTimer = undefined;
+
+			if (!currentGoal || currentGoal.status !== "active") return;
+			if (continuationSuppressed) return;
+			if (goalCompactionInProgress) return;
+
+			try {
+				if (!ctx.isIdle()) {
+					continuationTimer = setTimeout(attempt, 25);
+					return;
+				}
+
+				send();
+			} catch {
+				// The runtime may have been reloaded or replaced while a timer was
+				// pending. In that case this stale continuation should be dropped.
+			}
+		};
+
+		continuationTimer = setTimeout(attempt, 0);
 	}
 
 	function clearGoal(): boolean {
@@ -579,6 +728,7 @@ export default function goalExtension(pi: ExtensionAPI) {
 		continuationSuppressed = false;
 		goalCompactionInProgress = false;
 		resetCostLimitStopNotification();
+		cancelContinuationTimer();
 		return true;
 	}
 
@@ -634,7 +784,7 @@ export default function goalExtension(pi: ExtensionAPI) {
 			// Bare `/goal`: show status and available subcommands.
 			if (!trimmed) {
 				if (!currentGoal) {
-					ctx.ui.notify(`No goal is currently set.\n\n${GOAL_HELP}`, "info");
+					ctx.ui.notify(formatPendingLimitStatus(pendingCostLimitUsd, sessionCostUsd), "info");
 					return;
 				}
 				ctx.ui.notify(formatGoalStatus(currentGoal, sessionCostUsd), "info");
@@ -667,17 +817,21 @@ export default function goalExtension(pi: ExtensionAPI) {
 					ctx.ui.notify("No goal to resume.", "warning");
 					return;
 				}
-				if (currentGoal.status === "active") {
-					ctx.ui.notify("Goal is already active.", "info");
-					return;
-				}
 				if (currentGoal.status === "complete") {
 					ctx.ui.notify("Goal is complete. Use /goal <new objective> to start a new one.", "warning");
 					return;
 				}
-				setStatus("active");
-				ctx.ui.notify("Goal resumed.", "info");
-				scheduleContinuation();
+				continuationSuppressed = false;
+				nextTurnIsContinuation = false;
+				if (currentGoal.status === "active") {
+					ctx.ui.notify("Goal is active; queued continuation.", "info");
+				} else {
+					setStatus("active");
+					ctx.ui.notify("Goal resumed.", "info");
+				}
+				if (!stopForCostLimitIfNeeded(ctx)) {
+					scheduleContinuation(ctx);
+				}
 				return;
 			}
 
@@ -708,7 +862,9 @@ export default function goalExtension(pi: ExtensionAPI) {
 
 			const goal = setNewGoal(objective, null);
 			ctx.ui.notify(`Goal set: ${goal.objective}`, "info");
-			scheduleContinuation();
+			if (!stopForCostLimitIfNeeded(ctx)) {
+				scheduleContinuation(ctx);
+			}
 		},
 	});
 
@@ -718,14 +874,18 @@ export default function goalExtension(pi: ExtensionAPI) {
 		name: "get_goal",
 		label: "Get Goal",
 		description:
-			"Get the current goal for this thread, including objective, status, and cost limit. Returns null if no goal is set.",
+			"Get the current goal for this thread, including objective, status, and cost limit. Returns null if no goal is set; pending_cost_limit_usd may be set for the next goal.",
 		parameters: Type.Object({}),
 		async execute() {
 			return {
 				content: [
 					{
 						type: "text",
-						text: JSON.stringify({ goal: currentGoal }, null, 2),
+						text: JSON.stringify(
+							{ goal: currentGoal, pending_cost_limit_usd: pendingCostLimitUsd },
+							null,
+							2,
+						),
 					},
 				],
 				details: undefined,
@@ -866,7 +1026,7 @@ You cannot use this tool to pause or resume a goal; those status changes are con
 		if (stopForCostLimitIfNeeded(ctx)) return;
 		if (triggerGoalCompactionIfNeeded(ctx)) return;
 
-		scheduleContinuation();
+		scheduleContinuation(ctx);
 	});
 
 	// Restore from session history on every load / branch nav.
@@ -878,5 +1038,8 @@ You cannot use this tool to pause or resume a goal; those status changes are con
 	});
 	pi.on("session_tree", async (_event, ctx) => {
 		rebuildFromBranch(ctx);
+	});
+	pi.on("session_shutdown", async () => {
+		cancelContinuationTimer();
 	});
 }
