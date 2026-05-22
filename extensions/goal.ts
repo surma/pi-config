@@ -71,10 +71,6 @@ const ENTRY_GOAL_COST_LIMIT_SET = "goal-cost-limit-set";
 const ENTRY_GOAL_COST_LIMIT_CLEAR = "goal-cost-limit-clear";
 const ENTRY_GOAL_CLEAR = "goal-clear";
 
-// Sentinel for the auto-continuation user message. Detected in the input
-// event and rewritten to a short user-visible string; the model also gets the
-// real continuation prompt via the hidden before_agent_start injection.
-const CONTINUATION_SENTINEL = "[pi-goal:continue]";
 const CONTINUATION_OBJECTIVE_MAX_CHARS = 120;
 const GOAL_COMPACTION_THRESHOLD_PERCENT = 80;
 const GOAL_COMPACTION_INSTRUCTIONS =
@@ -291,27 +287,17 @@ export default function goalExtension(pi: ExtensionAPI) {
 	let currentGoal: Goal | null = null;
 
 	// Auto-continuation tracking.
-	// nextLoopIsAutoContinuation: set when we detect our sentinel in the
-	//   input event; consumed by before_agent_start (to switch injection
-	//   strategy) and agent_end (for anti-spin classification).
+	// nextTurnIsContinuation: set when we schedule a continuation via
+	//   sendMessage; consumed by before_agent_start (to skip system prompt
+	//   addendum) and agent_end (for anti-spin classification).
 	// continuationSuppressed: latched true when an auto-continuation loop
 	//   ends with zero tool calls. Reset by any productive turn (>=1 tool
 	//   call) or by genuine user input.
-	// continuationTimer: pending idle-aware kick-off. Kept singular so a
-	//   /goal command during streaming and the subsequent agent_end can't
-	//   enqueue duplicate continuation turns.
-	let nextLoopIsAutoContinuation = false;
+	let nextTurnIsContinuation = false;
 	let continuationSuppressed = false;
-	let continuationTimer: ReturnType<typeof setTimeout> | undefined = undefined;
 	let goalCompactionInProgress = false;
 	let sessionCostUsd = 0;
 	let lastCostLimitStopNotificationKey: string | null = null;
-
-	function cancelContinuationTimer(): void {
-		if (continuationTimer === undefined) return;
-		clearTimeout(continuationTimer);
-		continuationTimer = undefined;
-	}
 
 	function resetCostLimitStopNotification(): void {
 		lastCostLimitStopNotificationKey = null;
@@ -366,15 +352,13 @@ export default function goalExtension(pi: ExtensionAPI) {
 		}
 		currentGoal = goal;
 		// Transient runtime flags don't persist across reload / branch nav.
-		nextLoopIsAutoContinuation = false;
+		nextTurnIsContinuation = false;
 		continuationSuppressed = false;
 		goalCompactionInProgress = false;
 		resetCostLimitStopNotification();
-		cancelContinuationTimer();
 	}
 
 	function setNewGoal(objective: string, tokenBudget: number | null): Goal {
-		cancelContinuationTimer();
 		const now = Date.now();
 		const id = newGoalId();
 		const entry: GoalSetEntry = { id, objective, tokenBudget, createdAt: now };
@@ -388,7 +372,7 @@ export default function goalExtension(pi: ExtensionAPI) {
 			createdAt: now,
 			updatedAt: now,
 		};
-		nextLoopIsAutoContinuation = false;
+		nextTurnIsContinuation = false;
 		continuationSuppressed = false;
 		goalCompactionInProgress = false;
 		resetCostLimitStopNotification();
@@ -402,11 +386,10 @@ export default function goalExtension(pi: ExtensionAPI) {
 		pi.appendEntry<GoalStatusEntry>(ENTRY_GOAL_STATUS, entry);
 		currentGoal = { ...currentGoal, status, updatedAt: now };
 		if (status !== "active") {
-			nextLoopIsAutoContinuation = false;
+			nextTurnIsContinuation = false;
 			continuationSuppressed = false;
 			goalCompactionInProgress = false;
 			resetCostLimitStopNotification();
-			cancelContinuationTimer();
 		}
 		return currentGoal;
 	}
@@ -455,7 +438,6 @@ export default function goalExtension(pi: ExtensionAPI) {
 			return false;
 		}
 
-		cancelContinuationTimer();
 		const notificationKey = `${currentGoal.id}:${snapshot.limitUsd}`;
 		if (lastCostLimitStopNotificationKey !== notificationKey) {
 			ctx.ui.notify(
@@ -491,7 +473,7 @@ export default function goalExtension(pi: ExtensionAPI) {
 				`Goal cost limit cleared. Current session cost is ${formatCurrency(sessionCostUsd)}.`,
 				"info",
 			);
-			triggerContinuationIfActive(ctx);
+			scheduleContinuation();
 			return;
 		}
 
@@ -519,7 +501,7 @@ export default function goalExtension(pi: ExtensionAPI) {
 				`Goal cost limit set to ${formatCurrency(costLimitUsd)} (${formatCurrency(additionalCostUsd)} from current session cost ${formatCurrency(baseCostUsd)}).`,
 				"info",
 			);
-			triggerContinuationIfActive(ctx);
+			scheduleContinuation();
 			return;
 		}
 
@@ -535,7 +517,7 @@ export default function goalExtension(pi: ExtensionAPI) {
 		setCostLimit(costLimitUsd);
 		ctx.ui.notify(`Goal cost limit set to ${formatCurrency(costLimitUsd)}.`, "info");
 		if (!stopForCostLimitIfNeeded(ctx)) {
-			triggerContinuationIfActive(ctx);
+			scheduleContinuation();
 		}
 	}
 
@@ -556,56 +538,36 @@ export default function goalExtension(pi: ExtensionAPI) {
 			customInstructions: GOAL_COMPACTION_INSTRUCTIONS,
 			onComplete: () => {
 				goalCompactionInProgress = false;
-				triggerContinuationIfActive(ctx);
+				scheduleContinuation();
 			},
 			onError: (error) => {
 				goalCompactionInProgress = false;
 				ctx.ui.notify(`Goal compaction failed: ${error.message}`, "warning");
-				triggerContinuationIfActive(ctx);
+				scheduleContinuation();
 			},
 		});
 		return true;
 	}
 
 	/**
-	 * Schedule an auto-continuation kick-off if a goal is active. Used
-	 * after `/goal <obj>` and `/goal resume` to match Codex's behavior of
-	 * driving the loop without requiring a follow-up user nudge.
-	 *
-	 * pi-agent's `agent_end` event is the final event for a run, but it is
-	 * not the idle boundary. `pi.sendUserMessage()` without `deliverAs` is
-	 * only safe once the agent has fully settled, so poll ctx.isIdle() from
-	 * a macrotask instead of queueing a microtask from inside agent_end.
+	 * Schedule an auto-continuation if the goal is active and not
+	 * suppressed. Uses pi.sendMessage with triggerTurn to go through Pi's
+	 * standard message delivery pipeline instead of sendUserMessage.
 	 */
-	function triggerContinuationIfActive(ctx: ExtensionContext): void {
+	function scheduleContinuation(): void {
 		if (!currentGoal || currentGoal.status !== "active") return;
 		if (continuationSuppressed) return;
-		if (stopForCostLimitIfNeeded(ctx)) return;
-		if (continuationTimer !== undefined || goalCompactionInProgress) return;
+		if (goalCompactionInProgress) return;
 
-		const attempt = () => {
-			continuationTimer = undefined;
-
-			if (!currentGoal || currentGoal.status !== "active") return;
-			if (continuationSuppressed) return;
-
-			try {
-				if (!ctx.isIdle()) {
-					continuationTimer = setTimeout(attempt, 25);
-					return;
-				}
-
-				if (stopForCostLimitIfNeeded(ctx)) return;
-				if (triggerGoalCompactionIfNeeded(ctx)) return;
-
-				pi.sendUserMessage(CONTINUATION_SENTINEL);
-			} catch {
-				// The runtime may have been reloaded or replaced while a timer was
-				// pending. In that case this stale continuation should be dropped.
-			}
-		};
-
-		continuationTimer = setTimeout(attempt, 0);
+		nextTurnIsContinuation = true;
+		pi.sendMessage(
+			{
+				customType: "goal-continuation",
+				content: renderContinuationPrompt(currentGoal),
+				display: false,
+			},
+			{ triggerTurn: true },
+		);
 	}
 
 	function clearGoal(): boolean {
@@ -613,11 +575,10 @@ export default function goalExtension(pi: ExtensionAPI) {
 		const entry: GoalClearEntry = { clearedAt: Date.now() };
 		pi.appendEntry<GoalClearEntry>(ENTRY_GOAL_CLEAR, entry);
 		currentGoal = null;
-		nextLoopIsAutoContinuation = false;
+		nextTurnIsContinuation = false;
 		continuationSuppressed = false;
 		goalCompactionInProgress = false;
 		resetCostLimitStopNotification();
-		cancelContinuationTimer();
 		return true;
 	}
 
@@ -716,7 +677,7 @@ export default function goalExtension(pi: ExtensionAPI) {
 				}
 				setStatus("active");
 				ctx.ui.notify("Goal resumed.", "info");
-				triggerContinuationIfActive(ctx);
+				scheduleContinuation();
 				return;
 			}
 
@@ -747,7 +708,7 @@ export default function goalExtension(pi: ExtensionAPI) {
 
 			const goal = setNewGoal(objective, null);
 			ctx.ui.notify(`Goal set: ${goal.objective}`, "info");
-			triggerContinuationIfActive(ctx);
+			scheduleContinuation();
 		},
 	});
 
@@ -853,40 +814,23 @@ You cannot use this tool to pause or resume a goal; those status changes are con
 
 	// ---------- Event handlers ----------
 
-	// Detect our sentinel and any genuine user input that should clear the
-	// anti-spin latch.
+	// Real user activity clears the anti-spin suppression latch so a
+	// previously-spinning goal can resume after the user nudges it.
 	pi.on("input", async (event, _ctx) => {
-		if (event.source === "extension" && event.text === CONTINUATION_SENTINEL) {
-			// This loop was triggered by us. If the goal disappeared between
-			// scheduling and now, swallow it instead of nudging an empty agent.
-			if (!currentGoal || currentGoal.status !== "active") {
-				return { action: "handled" };
-			}
-			nextLoopIsAutoContinuation = true;
-			return { action: "transform", text: formatContinuationDisplayText(currentGoal) };
-		}
-		// Real user activity (interactive / rpc) clears the suppression latch
-		// so a previously-spinning goal can resume after the user nudges it.
 		if (event.source !== "extension") {
 			continuationSuppressed = false;
+			nextTurnIsContinuation = false;
 		}
 		return { action: "continue" };
 	});
 
-	// Inject the continuation harness (full template hidden message on
-	// auto-continue, lighter reminder via system prompt on user turns).
+	// On user-initiated turns while a goal is active, append a lighter
+	// reminder to the system prompt. Continuation turns already have the
+	// full prompt injected via sendMessage.
 	pi.on("before_agent_start", async (event, _ctx) => {
 		if (!currentGoal || currentGoal.status !== "active") return undefined;
 
-		if (nextLoopIsAutoContinuation) {
-			return {
-				message: {
-					customType: "goal-continuation",
-					content: renderContinuationPrompt(currentGoal),
-					display: false,
-				},
-			};
-		}
+		if (nextTurnIsContinuation) return undefined;
 
 		return {
 			systemPrompt: `${event.systemPrompt}\n\n${renderSystemPromptAddendum(currentGoal)}`,
@@ -898,10 +842,13 @@ You cannot use this tool to pause or resume a goal; those status changes are con
 		const messages = (event as { messages?: unknown }).messages;
 		sessionCostUsd = roundCostUsd(sessionCostUsd + getAssistantMessagesCost(messages));
 
-		const wasAutoContinuation = nextLoopIsAutoContinuation;
-		nextLoopIsAutoContinuation = false;
+		const wasAutoContinuation = nextTurnIsContinuation;
+		nextTurnIsContinuation = false;
 
 		if (!currentGoal || currentGoal.status !== "active") return;
+
+		// If the user pressed Escape (abort), stop the loop.
+		if (ctx.signal?.aborted) return;
 
 		const toolCalls = countToolCalls(messages);
 
@@ -916,12 +863,13 @@ You cannot use this tool to pause or resume a goal; those status changes are con
 		}
 
 		if (continuationSuppressed) return;
+		if (stopForCostLimitIfNeeded(ctx)) return;
+		if (triggerGoalCompactionIfNeeded(ctx)) return;
 
-		triggerContinuationIfActive(ctx);
+		scheduleContinuation();
 	});
 
-	// Restore from session history on every load / branch nav. Same
-	// pattern as btw.ts.
+	// Restore from session history on every load / branch nav.
 	// session_start fires for startup, reload, new, resume, and fork (after
 	// session switch). session_tree fires for branch navigation. Together
 	// they cover all the cases where we need to re-derive currentGoal.
@@ -930,8 +878,5 @@ You cannot use this tool to pause or resume a goal; those status changes are con
 	});
 	pi.on("session_tree", async (_event, ctx) => {
 		rebuildFromBranch(ctx);
-	});
-	pi.on("session_shutdown", async () => {
-		cancelContinuationTimer();
 	});
 }
