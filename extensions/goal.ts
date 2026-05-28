@@ -27,6 +27,7 @@ import { compact as compactWithModel } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { dlog } from "./escape-debug/log.js";
 
 // ---------- Types & constants ----------
 
@@ -665,17 +666,38 @@ export default function goalExtension(pi: ExtensionAPI) {
 	 * a later user turn.
 	 */
 	function scheduleContinuation(ctx?: ExtensionContext): void {
+		dlog("GOAL", "scheduleContinuation_enter", {
+			haveGoal: !!currentGoal,
+			goalStatus: currentGoal?.status,
+			continuationSuppressed,
+			goalCompactionInProgress,
+			continuationTimerPending: continuationTimer !== undefined,
+			haveCtx: !!ctx,
+			ctxIsIdle: ctx?.isIdle?.(),
+			ctxSignalAborted: ctx?.signal?.aborted ?? null,
+		});
 		if (!currentGoal || currentGoal.status !== "active") return;
 		if (continuationSuppressed) return;
 		if (goalCompactionInProgress) return;
 		if (continuationTimer !== undefined) return;
 
 		const send = () => {
+			dlog("GOAL", "send_enter", {
+				haveGoal: !!currentGoal,
+				goalStatus: currentGoal?.status,
+				continuationSuppressed,
+				goalCompactionInProgress,
+				ctxSignalAborted: ctx?.signal?.aborted ?? null,
+			});
 			if (!currentGoal || currentGoal.status !== "active") return;
 			if (continuationSuppressed) return;
 			if (goalCompactionInProgress) return;
 
 			nextTurnIsContinuation = true;
+			dlog("GOAL", "send_calling_pi_sendMessage", {
+				objectivePreview:
+					typeof currentGoal.objective === "string" ? currentGoal.objective.slice(0, 80) : null,
+			});
 			pi.sendMessage(
 				{
 					customType: "goal-continuation",
@@ -689,15 +711,27 @@ export default function goalExtension(pi: ExtensionAPI) {
 
 		try {
 			if (!ctx || ctx.isIdle()) {
+				dlog("GOAL", "scheduleContinuation_send_immediate", {});
 				send();
 				return;
 			}
-		} catch {
+		} catch (err) {
+			dlog("GOAL", "scheduleContinuation_isIdle_threw", {
+				error: (err as Error)?.message ?? String(err),
+			});
 			return;
 		}
 
 		const attempt = () => {
 			continuationTimer = undefined;
+			dlog("GOAL", "attempt_fire", {
+				haveGoal: !!currentGoal,
+				goalStatus: currentGoal?.status,
+				continuationSuppressed,
+				goalCompactionInProgress,
+				ctxIsIdle: ctx?.isIdle?.(),
+				ctxSignalAborted: ctx?.signal?.aborted ?? null,
+			});
 
 			if (!currentGoal || currentGoal.status !== "active") return;
 			if (continuationSuppressed) return;
@@ -706,17 +740,23 @@ export default function goalExtension(pi: ExtensionAPI) {
 			try {
 				if (!ctx.isIdle()) {
 					continuationTimer = setTimeout(attempt, 25);
+					dlog("GOAL", "attempt_repoll", {});
 					return;
 				}
 
+				dlog("GOAL", "attempt_send", {});
 				send();
-			} catch {
+			} catch (err) {
+				dlog("GOAL", "attempt_threw", {
+					error: (err as Error)?.message ?? String(err),
+				});
 				// The runtime may have been reloaded or replaced while a timer was
 				// pending. In that case this stale continuation should be dropped.
 			}
 		};
 
 		continuationTimer = setTimeout(attempt, 0);
+		dlog("GOAL", "scheduleContinuation_timer_set", {});
 	}
 
 	function clearGoal(): boolean {
@@ -1005,10 +1045,26 @@ You cannot use this tool to pause or resume a goal; those status changes are con
 		const wasAutoContinuation = nextTurnIsContinuation;
 		nextTurnIsContinuation = false;
 
+		dlog("GOAL", "agent_end", {
+			haveGoal: !!currentGoal,
+			goalStatus: currentGoal?.status,
+			wasAutoContinuation,
+			ctxSignalAborted: ctx.signal?.aborted ?? null,
+			ctxIsIdle: ctx.isIdle?.(),
+			continuationTimerPending: continuationTimer !== undefined,
+			continuationSuppressed,
+			goalCompactionInProgress,
+		});
+
 		if (!currentGoal || currentGoal.status !== "active") return;
 
 		// If the user pressed Escape (abort), stop the loop.
-		if (ctx.signal?.aborted) return;
+		if (ctx.signal?.aborted) {
+			dlog("GOAL", "agent_end_aborted_early_return", {
+				continuationTimerPending: continuationTimer !== undefined,
+			});
+			return;
+		}
 
 		const toolCalls = countToolCalls(messages);
 

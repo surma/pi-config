@@ -13,6 +13,7 @@ import {
 } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import { Type } from "typebox";
+import { dlog } from "./escape-debug/log.js";
 
 const LOG_DIR = join(tmpdir(), "pi-bash-jobs");
 const MAX_TAIL_BUFFER_BYTES = DEFAULT_MAX_BYTES * 2;
@@ -543,6 +544,14 @@ async function runManagedBash(
 	onUpdate: ((result: BashToolResult) => void) | undefined,
 ): Promise<BashToolResult> {
 	const job = spawnManagedJob(command, cwd);
+	dlog("BASH", "runManagedBash_spawned", {
+		jobId: job.jobId,
+		pid: job.pid,
+		command: command.slice(0, 200),
+		timeoutSeconds,
+		haveSignal: !!signal,
+		signalAlreadyAborted: signal?.aborted ?? null,
+	});
 	const stopUpdating = attachOutputUpdater(job, onUpdate);
 
 	try {
@@ -556,6 +565,11 @@ async function runManagedBash(
 				settled = true;
 				if (timeoutHandle) clearTimeout(timeoutHandle);
 				if (abortHandler && signal) signal.removeEventListener("abort", abortHandler);
+				dlog("BASH", "runManagedBash_finish", {
+					jobId: job.jobId,
+					outcome: value,
+					signalAborted: signal?.aborted ?? null,
+				});
 				resolve(value);
 			};
 
@@ -564,6 +578,11 @@ async function runManagedBash(
 			if (timeoutHandle.unref) timeoutHandle.unref();
 
 			abortHandler = () => {
+				dlog("BASH", "runManagedBash_abort_fired", {
+					jobId: job.jobId,
+					settled,
+					signalAborted: signal?.aborted ?? null,
+				});
 				if (settled) return;
 				settled = true;
 				if (timeoutHandle) clearTimeout(timeoutHandle);
@@ -572,8 +591,15 @@ async function runManagedBash(
 				reject(new Error("Command aborted"));
 			};
 			if (signal) {
-				if (signal.aborted) abortHandler();
-				else signal.addEventListener("abort", abortHandler, { once: true });
+				if (signal.aborted) {
+					dlog("BASH", "runManagedBash_signal_already_aborted", { jobId: job.jobId });
+					abortHandler();
+				} else {
+					signal.addEventListener("abort", abortHandler, { once: true });
+					dlog("BASH", "runManagedBash_listener_attached", { jobId: job.jobId });
+				}
+			} else {
+				dlog("BASH", "runManagedBash_no_signal", { jobId: job.jobId });
 			}
 		});
 
@@ -596,7 +622,18 @@ async function waitForJob(
 	signal: AbortSignal | undefined,
 	onUpdate?: (result: BashToolResult) => void,
 ): Promise<void> {
-	if (job.status !== "running") return;
+	dlog("BASH", "waitForJob_enter", {
+		jobId: job.jobId,
+		jobStatus: job.status,
+		timeoutSeconds,
+		haveSignal: !!signal,
+		signalAlreadyAborted: signal?.aborted ?? null,
+		haveOnUpdate: !!onUpdate,
+	});
+	if (job.status !== "running") {
+		dlog("BASH", "waitForJob_short_circuit_not_running", { jobId: job.jobId, status: job.status });
+		return;
+	}
 
 	const stopUpdating = attachOutputUpdater(job, onUpdate, { emitInitialOutput: true });
 	try {
@@ -610,6 +647,11 @@ async function waitForJob(
 				settled = true;
 				if (timeoutHandle) clearTimeout(timeoutHandle);
 				if (abortHandler && signal) signal.removeEventListener("abort", abortHandler);
+				dlog("BASH", "waitForJob_finish", {
+					jobId: job.jobId,
+					jobStatus: job.status,
+					signalAborted: signal?.aborted ?? null,
+				});
 				resolve();
 			};
 
@@ -618,6 +660,11 @@ async function waitForJob(
 				settled = true;
 				if (timeoutHandle) clearTimeout(timeoutHandle);
 				if (abortHandler && signal) signal.removeEventListener("abort", abortHandler);
+				dlog("BASH", "waitForJob_fail", {
+					jobId: job.jobId,
+					error: error.message,
+					signalAborted: signal?.aborted ?? null,
+				});
 				reject(error);
 			};
 
@@ -627,13 +674,32 @@ async function waitForJob(
 				if (timeoutHandle.unref) timeoutHandle.unref();
 			}
 
-			abortHandler = () => fail(new Error(`Stopped waiting for job ${job.jobId}`));
+			abortHandler = () => {
+				dlog("BASH", "waitForJob_abort_fired", {
+					jobId: job.jobId,
+					settled,
+					signalAborted: signal?.aborted ?? null,
+				});
+				fail(new Error(`Stopped waiting for job ${job.jobId}`));
+			};
 			if (signal) {
-				if (signal.aborted) abortHandler();
-				else signal.addEventListener("abort", abortHandler, { once: true });
+				if (signal.aborted) {
+					dlog("BASH", "waitForJob_signal_already_aborted", { jobId: job.jobId });
+					abortHandler();
+				} else {
+					signal.addEventListener("abort", abortHandler, { once: true });
+					dlog("BASH", "waitForJob_listener_attached", { jobId: job.jobId });
+				}
+			} else {
+				dlog("BASH", "waitForJob_no_signal", { jobId: job.jobId });
 			}
 		});
 	} finally {
+		dlog("BASH", "waitForJob_exit", {
+			jobId: job.jobId,
+			jobStatus: job.status,
+			signalAborted: signal?.aborted ?? null,
+		});
 		stopUpdating();
 	}
 }
@@ -823,7 +889,33 @@ export default function (pi: ExtensionAPI) {
 		parameters: bashSchema,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const commandCwd = resolveCommandCwd(ctx.cwd, params.cwd);
-			return runManagedBash(params.command, commandCwd, params.timeout ?? defaultBashTimeoutSeconds, signal, onUpdate);
+			dlog("BASH", "tool_bash_enter", {
+				toolCallId: _toolCallId,
+				command: typeof params.command === "string" ? params.command.slice(0, 200) : null,
+				haveSignal: !!signal,
+				signalAlreadyAborted: signal?.aborted ?? null,
+			});
+			try {
+				return await runManagedBash(
+					params.command,
+					commandCwd,
+					params.timeout ?? defaultBashTimeoutSeconds,
+					signal,
+					onUpdate,
+				);
+			} catch (err) {
+				dlog("BASH", "tool_bash_threw", {
+					toolCallId: _toolCallId,
+					error: (err as Error)?.message ?? String(err),
+					signalAborted: signal?.aborted ?? null,
+				});
+				throw err;
+			} finally {
+				dlog("BASH", "tool_bash_exit", {
+					toolCallId: _toolCallId,
+					signalAborted: signal?.aborted ?? null,
+				});
+			}
 		},
 	});
 
@@ -842,15 +934,43 @@ export default function (pi: ExtensionAPI) {
 		},
 		renderResult: bashResultRenderer,
 		async execute(_toolCallId, params, signal, onUpdate) {
-			const job = getJob(params.jobId);
-			await waitForJob(job, params.timeout, signal, onUpdate);
-			if (job.status === "running") {
-				return {
-					content: [{ type: "text", text: formatRunningMessage(job) }],
-					details: buildDetails(job),
-				};
+			dlog("BASH", "tool_bash_wait_enter", {
+				toolCallId: _toolCallId,
+				jobId: params.jobId,
+				timeout: params.timeout,
+				haveSignal: !!signal,
+				signalAlreadyAborted: signal?.aborted ?? null,
+			});
+			try {
+				const job = getJob(params.jobId);
+				await waitForJob(job, params.timeout, signal, onUpdate);
+				if (job.status === "running") {
+					dlog("BASH", "tool_bash_wait_still_running", {
+						toolCallId: _toolCallId,
+						jobId: params.jobId,
+						signalAborted: signal?.aborted ?? null,
+					});
+					return {
+						content: [{ type: "text", text: formatRunningMessage(job) }],
+						details: buildDetails(job),
+					};
+				}
+				dlog("BASH", "tool_bash_wait_completed", {
+					toolCallId: _toolCallId,
+					jobId: params.jobId,
+					finalStatus: job.status,
+					signalAborted: signal?.aborted ?? null,
+				});
+				return completedJobResponseOrThrow(job, true);
+			} catch (err) {
+				dlog("BASH", "tool_bash_wait_threw", {
+					toolCallId: _toolCallId,
+					jobId: params.jobId,
+					error: (err as Error)?.message ?? String(err),
+					signalAborted: signal?.aborted ?? null,
+				});
+				throw err;
 			}
-			return completedJobResponseOrThrow(job, true);
 		},
 	});
 
@@ -883,9 +1003,19 @@ export default function (pi: ExtensionAPI) {
 		parameters: jobIdSchema,
 		renderResult: bashResultRenderer,
 		async execute(_toolCallId, params, signal) {
+			dlog("BASH", "tool_bash_kill_enter", {
+				toolCallId: _toolCallId,
+				jobId: params.jobId,
+				signalAlreadyAborted: signal?.aborted ?? null,
+			});
 			const job = getJob(params.jobId);
 			await killJob(job, signal);
 			const { text, details } = consumeCompletedJob(job, true);
+			dlog("BASH", "tool_bash_kill_exit", {
+				toolCallId: _toolCallId,
+				jobId: params.jobId,
+				signalAborted: signal?.aborted ?? null,
+			});
 			return {
 				content: [{ type: "text", text }],
 				details,
