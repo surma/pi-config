@@ -82,7 +82,11 @@ const ENTRY_GOAL_PENDING_COST_LIMIT_SET = "goal-pending-cost-limit-set";
 const ENTRY_GOAL_PENDING_COST_LIMIT_CLEAR = "goal-pending-cost-limit-clear";
 const ENTRY_GOAL_CLEAR = "goal-clear";
 
-const GOAL_COMPACTION_THRESHOLD_PERCENT = 80;
+// Must stay in sync with `compaction.reserveTokens` in ~/.pi/agent/settings.json.
+// pi auto-compacts when contextTokens > contextWindow - reserveTokens; the goal
+// continuation uses the identical formula (compactionImminent) to hold off so it
+// never starts a turn that races pi's compaction.
+const COMPACTION_RESERVE_TOKENS = 50000;
 const GOAL_COMPACTION_INSTRUCTIONS =
 	"This compaction is happening between automatic goal-continuation turns. Preserve the active goal, current progress, evidence gathered, remaining work, blockers, and the next concrete action.";
 const GOAL_COMPACTION_MODEL_CANDIDATES = [
@@ -630,32 +634,16 @@ export default function goalExtension(pi: ExtensionAPI) {
 		}
 	}
 
-	function triggerGoalCompactionIfNeeded(ctx: ExtensionContext): boolean {
-		if (goalCompactionInProgress) return true;
-
+	// True when pi is at or over its auto-compaction threshold and will compact on
+	// this idle boundary. Mirrors pi's shouldCompact():
+	//   contextTokens > contextWindow - reserveTokens
+	// so the continuation holds off exactly when (and only when) pi compacts.
+	// `tokens` is null right after a compaction (no usage yet) — treated as "not
+	// imminent" so the post-compaction continuation proceeds.
+	function compactionImminent(ctx: ExtensionContext): boolean {
 		const usage = ctx.getContextUsage();
-		if (!usage || usage.percent === null || usage.percent < GOAL_COMPACTION_THRESHOLD_PERCENT) {
-			return false;
-		}
-
-		goalCompactionInProgress = true;
-		ctx.ui.notify(
-			`Goal compaction: context is ${usage.percent.toFixed(1)}% full; compacting before the next goal turn.`,
-			"info",
-		);
-		ctx.compact({
-			customInstructions: GOAL_COMPACTION_INSTRUCTIONS,
-			onComplete: () => {
-				goalCompactionInProgress = false;
-				scheduleContinuation(ctx);
-			},
-			onError: (error) => {
-				goalCompactionInProgress = false;
-				ctx.ui.notify(`Goal compaction failed: ${error.message}`, "warning");
-				scheduleContinuation(ctx);
-			},
-		});
-		return true;
+		if (!usage || usage.tokens === null) return false;
+		return usage.tokens > usage.contextWindow - COMPACTION_RESERVE_TOKENS;
 	}
 
 	/**
@@ -679,6 +667,11 @@ export default function goalExtension(pi: ExtensionAPI) {
 		if (!currentGoal || currentGoal.status !== "active") return;
 		if (continuationSuppressed) return;
 		if (goalCompactionInProgress) return;
+		// Hold off while pi is at/over its auto-compaction threshold: starting a turn
+		// now would run concurrently with compaction, which corrupts Escape handling
+		// (sendCustomMessage(triggerTurn) has no compaction guard). pi's auto-compaction
+		// emits session_compact, which reschedules this.
+		if (ctx && compactionImminent(ctx)) return;
 		if (continuationTimer !== undefined) return;
 
 		const send = () => {
@@ -736,6 +729,7 @@ export default function goalExtension(pi: ExtensionAPI) {
 			if (!currentGoal || currentGoal.status !== "active") return;
 			if (continuationSuppressed) return;
 			if (goalCompactionInProgress) return;
+			if (compactionImminent(ctx)) return;
 
 			try {
 				if (!ctx.isIdle()) {
@@ -801,7 +795,9 @@ export default function goalExtension(pi: ExtensionAPI) {
 					model,
 					auth.apiKey,
 					auth.headers,
-					event.customInstructions,
+					currentGoal?.status === "active"
+						? GOAL_COMPACTION_INSTRUCTIONS
+						: event.customInstructions,
 					event.signal,
 				),
 			};
@@ -812,6 +808,15 @@ export default function goalExtension(pi: ExtensionAPI) {
 			}
 			return;
 		}
+	});
+
+	// After pi auto-compacts, resume the goal loop. The continuation gate
+	// (compactionImminent) makes agent_end hold off while context is over the
+	// threshold; this re-kicks the loop once compaction has freed the window.
+	pi.on("session_compact", async (_event, ctx) => {
+		if (!currentGoal || currentGoal.status !== "active") return;
+		if (continuationSuppressed) return;
+		scheduleContinuation(ctx);
 	});
 
 	// ---------- /goal slash command ----------
@@ -1080,7 +1085,6 @@ You cannot use this tool to pause or resume a goal; those status changes are con
 
 		if (continuationSuppressed) return;
 		if (stopForCostLimitIfNeeded(ctx)) return;
-		if (triggerGoalCompactionIfNeeded(ctx)) return;
 
 		scheduleContinuation(ctx);
 	});
