@@ -28,6 +28,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { dlog } from "./escape-debug/log.js";
+import { readReserveTokens } from "./lib/compaction-settings.js";
 
 // ---------- Types & constants ----------
 
@@ -82,11 +83,6 @@ const ENTRY_GOAL_PENDING_COST_LIMIT_SET = "goal-pending-cost-limit-set";
 const ENTRY_GOAL_PENDING_COST_LIMIT_CLEAR = "goal-pending-cost-limit-clear";
 const ENTRY_GOAL_CLEAR = "goal-clear";
 
-// Must stay in sync with `compaction.reserveTokens` in ~/.pi/agent/settings.json.
-// pi auto-compacts when contextTokens > contextWindow - reserveTokens; the goal
-// continuation uses the identical formula (compactionImminent) to hold off so it
-// never starts a turn that races pi's compaction.
-const COMPACTION_RESERVE_TOKENS = 50000;
 const GOAL_COMPACTION_INSTRUCTIONS =
 	"This compaction is happening between automatic goal-continuation turns. Preserve the active goal, current progress, evidence gathered, remaining work, blockers, and the next concrete action.";
 const GOAL_COMPACTION_MODEL_CANDIDATES = [
@@ -318,6 +314,13 @@ export default function goalExtension(pi: ExtensionAPI) {
 	let pendingCostLimitUsd: number | null = null;
 	let lastCostLimitStopNotificationKey: string | null = null;
 
+	// pi auto-compacts when contextTokens > contextWindow - reserveTokens. The
+	// continuation uses the identical formula (compactionImminent) to hold off so
+	// it never starts a turn that races pi's compaction. Read from pi's global
+	// settings (fail-safe default) and refreshed on every branch rebuild so it
+	// always matches pi's actual threshold without a hand-synced constant.
+	let reserveTokens = readReserveTokens();
+
 	pi.registerMessageRenderer("goal-continuation", (message, _options, theme) => {
 		const details = message.details as { objective?: unknown } | undefined;
 		const detailObjective = typeof details?.objective === "string" ? details.objective.trim() : undefined;
@@ -345,6 +348,7 @@ export default function goalExtension(pi: ExtensionAPI) {
 	}
 
 	function rebuildFromBranch(ctx: ExtensionContext): void {
+		reserveTokens = readReserveTokens();
 		sessionCostUsd = computeSessionCost(ctx);
 		let goal: Goal | null = null;
 		let pendingLimit: number | null = null;
@@ -643,7 +647,7 @@ export default function goalExtension(pi: ExtensionAPI) {
 	function compactionImminent(ctx: ExtensionContext): boolean {
 		const usage = ctx.getContextUsage();
 		if (!usage || usage.tokens === null) return false;
-		return usage.tokens > usage.contextWindow - COMPACTION_RESERVE_TOKENS;
+		return usage.tokens > usage.contextWindow - reserveTokens;
 	}
 
 	/**
