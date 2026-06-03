@@ -103,7 +103,6 @@ const waitSchema = Type.Object({
 
 const jobs = new Map<string, BashJob>();
 let maxLogBytes = DEFAULT_MAX_LOG_BYTES;
-let remindedRunningJobsSignature: string | undefined;
 
 function createDeferred<T>(): Deferred<T> {
 	let resolve!: (value: T) => void;
@@ -731,27 +730,6 @@ function getRunningJobs(): BashJob[] {
 	return [...jobs.values()].filter((job) => job.status === "running");
 }
 
-function getRunningJobsSignature(runningJobs: BashJob[]): string | undefined {
-	if (runningJobs.length === 0) return undefined;
-	return runningJobs
-		.map((job) => `${job.jobId}:${job.command}`)
-		.sort()
-		.join("|");
-}
-
-function formatRunningJobsReminder(runningJobs: BashJob[]): string {
-	const lines = runningJobs
-		.sort((a, b) => a.startedAt - b.startedAt)
-		.map((job) => `- ${job.jobId} — ${job.command}`);
-	return [
-		"You still have managed bash jobs running:",
-		...lines,
-		"",
-		"Before you stop, either use bash_wait to wait for them, use bash_kill to stop them, or explicitly tell the user why they should remain running.",
-		"Do not use shell backgrounding operators like &, nohup, or disown for this. Prefer managed bash jobs via timeout plus bash_wait/bash_status/bash_kill/bash_jobs.",
-	].join("\n");
-}
-
 function formatJobsList(): string {
 	const runningJobs = getRunningJobs();
 	if (runningJobs.length === 0) {
@@ -829,31 +807,6 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", () => {
 		maxLogBytes = loadMaxLogBytes();
-	});
-
-	pi.on("turn_end", async (event, ctx) => {
-		if (event.message.stopReason !== "stop") return;
-		if (event.toolResults.length > 0) return;
-		if (ctx.hasPendingMessages()) return;
-
-		const runningJobs = getRunningJobs();
-		const signature = getRunningJobsSignature(runningJobs);
-		if (!signature) {
-			remindedRunningJobsSignature = undefined;
-			return;
-		}
-		if (signature === remindedRunningJobsSignature) {
-			return;
-		}
-		remindedRunningJobsSignature = signature;
-		pi.sendMessage(
-			{
-				customType: "bash-jobs-reminder",
-				content: formatRunningJobsReminder(runningJobs),
-				display: false,
-			},
-			{ deliverAs: "followUp", triggerTurn: true },
-		);
 	});
 
 	pi.on("session_shutdown", async () => {
