@@ -23,7 +23,6 @@
  * because the prompts are the load-bearing part of the feature.
  */
 
-import { compact as compactWithModel } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
@@ -82,14 +81,6 @@ const ENTRY_GOAL_COST_LIMIT_CLEAR = "goal-cost-limit-clear";
 const ENTRY_GOAL_PENDING_COST_LIMIT_SET = "goal-pending-cost-limit-set";
 const ENTRY_GOAL_PENDING_COST_LIMIT_CLEAR = "goal-pending-cost-limit-clear";
 const ENTRY_GOAL_CLEAR = "goal-clear";
-
-const GOAL_COMPACTION_INSTRUCTIONS =
-	"This compaction is happening between automatic goal-continuation turns. Preserve the active goal, current progress, evidence gathered, remaining work, blockers, and the next concrete action.";
-const GOAL_COMPACTION_MODEL_CANDIDATES = [
-	{ provider: "anthropic", id: "claude-sonnet-4-6" },
-	{ provider: "anthropic", id: "claude-sonnet-4-5" },
-	{ provider: "anthropic", id: "claude-sonnet-4-20250514" },
-] as const;
 
 const GOAL_HELP = [
 	"Usage:",
@@ -771,48 +762,11 @@ export default function goalExtension(pi: ExtensionAPI) {
 	}
 
 	// ---------- Compaction ----------
-
-	pi.on("session_before_compact", async (event, ctx) => {
-		const model = GOAL_COMPACTION_MODEL_CANDIDATES.map((candidate) =>
-			ctx.modelRegistry.find(candidate.provider, candidate.id),
-		).find((candidate) => candidate !== undefined);
-		if (!model) {
-			ctx.ui.notify("Claude Sonnet compaction model not found; using default compaction.", "warning");
-			return;
-		}
-
-		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-		if (!auth.ok) {
-			ctx.ui.notify(`Claude Sonnet compaction auth failed: ${auth.error}; using default compaction.`, "warning");
-			return;
-		}
-		if (!auth.apiKey) {
-			ctx.ui.notify(`No API key for ${model.provider}; using default compaction.`, "warning");
-			return;
-		}
-
-		try {
-			ctx.ui.notify(`Compacting with ${model.provider}/${model.id}...`, "info");
-			return {
-				compaction: await compactWithModel(
-					event.preparation,
-					model,
-					auth.apiKey,
-					auth.headers,
-					currentGoal?.status === "active"
-						? GOAL_COMPACTION_INSTRUCTIONS
-						: event.customInstructions,
-					event.signal,
-				),
-			};
-		} catch (error) {
-			if (!event.signal.aborted) {
-				const message = error instanceof Error ? error.message : String(error);
-				ctx.ui.notify(`Claude Sonnet compaction failed: ${message}; using default compaction.`, "warning");
-			}
-			return;
-		}
-	});
+	//
+	// Compaction customization (swapping in a large-context summary model) now
+	// lives in the standalone `compaction-model` extension. goal.ts deliberately
+	// does NOT touch compaction: it only stays out of its way (compactionImminent
+	// holds off continuation) and re-kicks the loop afterwards.
 
 	// After pi auto-compacts, resume the goal loop. The continuation gate
 	// (compactionImminent) makes agent_end hold off while context is over the
