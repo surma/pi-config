@@ -1,8 +1,9 @@
 /**
- * Agent-done desktop notification.
+ * Agent-done notification.
  *
- * Fires `noti local "Agent is done"` when the agent genuinely stops — not when
- * it's only momentarily idle between auto-continuations or busy compacting.
+ * Fires `noti local "Agent is done"` or `noti mobile "Agent is done"` when the
+ * agent genuinely stops — not when it's only momentarily idle between
+ * auto-continuations or busy compacting.
  *
  * The hard part is deciding what "done" means. Two things keep the agent going
  * after an `agent_end` event, and neither should trigger a notification:
@@ -34,10 +35,9 @@
 import { execFile } from "node:child_process";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-// The notification command: `noti <target> "<message>"`. Set NOTI_TARGET to
-// "mobile" to push to your phone instead of a desktop notification. (The bare
-// `noti "..."` form errors; noti requires a subcommand.)
-const NOTI_TARGET = "local";
+// The notification command: `noti <target> "<message>"`. Mobile mode switches
+// the target from `local` to `mobile`; the bare `noti "..."` form errors.
+type NotiTarget = "local" | "mobile";
 const NOTI_MESSAGE = "Agent is done";
 
 // How long the agent must stay idle after agent_end / compaction before we
@@ -45,7 +45,19 @@ const NOTI_MESSAGE = "Agent is done";
 // auto-continuations (sub-second).
 const IDLE_GRACE_MS = 2000;
 
+function formatStatus(target: NotiTarget): string {
+	return [
+		"Agent-done notifications",
+		`Current target: noti ${target}`,
+		"Usage:",
+		"  /noti status",
+		"  /noti mobile enable",
+		"  /noti mobile disable",
+	].join("\n");
+}
+
 export default function agentDoneNoti(pi: ExtensionAPI) {
+	let notiTarget: NotiTarget = "local";
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	// Set when compaction interrupts a pending notification, so we know to
 	// resume watching for idle once compaction finishes (vs. a manual /compact
@@ -69,11 +81,36 @@ export default function agentDoneNoti(pi: ExtensionAPI) {
 				// Runtime may have been reloaded while the timer was pending.
 				return;
 			}
-			execFile("noti", [NOTI_TARGET, NOTI_MESSAGE], () => {
+			execFile("noti", [notiTarget, NOTI_MESSAGE], () => {
 				// Fire-and-forget; ignore errors (e.g. noti not installed).
 			});
 		}, IDLE_GRACE_MS);
 	}
+
+	pi.registerCommand("noti", {
+		description: "Configure agent-done notifications. Subcommands: status | mobile enable | mobile disable",
+		handler: async (args, ctx) => {
+			const trimmed = args.trim().toLowerCase();
+			if (!trimmed || trimmed === "status" || trimmed === "mobile") {
+				ctx.ui.notify(formatStatus(notiTarget), "info");
+				return;
+			}
+
+			if (trimmed === "mobile enable") {
+				notiTarget = "mobile";
+				ctx.ui.notify("Agent-done notifications will use `noti mobile`.", "info");
+				return;
+			}
+
+			if (trimmed === "mobile disable") {
+				notiTarget = "local";
+				ctx.ui.notify("Agent-done notifications will use `noti local`.", "info");
+				return;
+			}
+
+			ctx.ui.notify(`Unknown /noti command.\n\n${formatStatus(notiTarget)}`, "warning");
+		},
+	});
 
 	pi.on("agent_end", async (_event, ctx) => {
 		// User pressed Escape: interrupted, not done — don't notify. (Also drops
