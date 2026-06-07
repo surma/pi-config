@@ -763,10 +763,9 @@ export default function goalExtension(pi: ExtensionAPI) {
 
 	// ---------- Compaction ----------
 	//
-	// Compaction customization (swapping in a large-context summary model) now
-	// lives in the standalone `compaction-model` extension. goal.ts deliberately
-	// does NOT touch compaction: it only stays out of its way (compactionImminent
-	// holds off continuation) and re-kicks the loop afterwards.
+	// goal.ts deliberately does NOT initiate compaction: it only stays out of its
+	// way (compactionImminent holds off continuation) and re-kicks the loop
+	// afterwards.
 
 	// After pi auto-compacts, resume the goal loop. The continuation gate
 	// (compactionImminent) makes agent_end hold off while context is over the

@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, SessionEntry, Theme } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { readReserveTokens } from "./lib/compaction-settings.js";
@@ -6,6 +6,7 @@ import { readReserveTokens } from "./lib/compaction-settings.js";
 const ENTRY_CONFIG = "token-window-reminder-config";
 const ENTRY_REMINDER = "token-window-reminder-fired";
 const ENTRY_RESET = "token-window-reminder-reset";
+const ENTRY_HANDOFF_MARKER = "token-window-reminder-handoff-marker";
 
 const DEFAULT_ENABLED = true;
 
@@ -99,7 +100,7 @@ function renderWarning(rungIndex: number, usage: UsageInfo): string {
 	const remaining = Math.round(usage.tokensToFull).toLocaleString();
 	const lines = [
 		"<system_reminder>",
-		`Your context has reached pi's compaction point: now at ${usageLabel(usage)}, ~${remaining} tokens before the window is full. pi will compact (summarize) this conversation only once you hand control back to the user — it cannot compact while you keep working or are being steered. Hand off via the \`compaction_handoff\` tool: it records a thorough hand-off (your goal, current work, next steps, and every key decision, file path, and fact needed to resume) and ends your turn so pi can compact. Be complete, not terse — a future instance with no memory of this session depends entirely on it.`,
+		`Your context has reached pi's compaction point: now at ${usageLabel(usage)}, ~${remaining} tokens before the window is full. pi will compact only once you hand control back to the user — it cannot compact while you keep working or are being steered. Hand off via the \`compaction_handoff\` tool: it records a thorough hand-off (your goal, current work, next steps, and every key decision, file path, and fact needed to resume), then pi uses those notes directly as the compaction summary. Be complete, not terse — a future instance with no memory of this session depends entirely on it.`,
 	];
 	for (let i = 0; i <= rungIndex; i++) {
 		lines.push("", REMINDER_LADDER[i].escalation);
@@ -146,6 +147,22 @@ type HandoffParams = {
 	key_context?: unknown;
 };
 
+type HandoffNotes = {
+	goal: string;
+	work_in_progress: string;
+	next_steps: string;
+	key_context: string;
+};
+
+type PendingHandoff = HandoffNotes & {
+	createdAt: number;
+	markerEntryId?: string;
+};
+
+type HandoffMarkerEntry = PendingHandoff & {
+	version: 1;
+};
+
 function handoffText(value: unknown): string {
 	if (typeof value !== "string") return "…";
 	const trimmed = value.trim();
@@ -159,7 +176,7 @@ function renderHandoffSection(theme: Theme, title: string, value: unknown): stri
 function renderHandoffForUser(theme: Theme, args: HandoffParams): string {
 	return [
 		theme.fg("toolTitle", theme.bold("Compaction hand-off")),
-		theme.fg("dim", "Recorded hand-off notes visible to the user; tool result stays terse for the model."),
+		theme.fg("dim", "These notes will be used directly as the next compaction summary; the tool result stays terse for the model."),
 		"",
 		renderHandoffSection(theme, "Goal", args.goal),
 		"",
@@ -168,6 +185,102 @@ function renderHandoffForUser(theme: Theme, args: HandoffParams): string {
 		renderHandoffSection(theme, "Next Steps", args.next_steps),
 		"",
 		renderHandoffSection(theme, "Key Context", args.key_context),
+	].join("\n");
+}
+
+function normalizeHandoff(args: HandoffParams): HandoffNotes {
+	return {
+		goal: handoffText(args.goal),
+		work_in_progress: handoffText(args.work_in_progress),
+		next_steps: handoffText(args.next_steps),
+		key_context: handoffText(args.key_context),
+	};
+}
+
+function isHandoffMarkerEntryData(data: unknown): data is HandoffMarkerEntry {
+	if (!data || typeof data !== "object") return false;
+	const candidate = data as Partial<HandoffMarkerEntry>;
+	return (
+		candidate.version === 1 &&
+		typeof candidate.goal === "string" &&
+		typeof candidate.work_in_progress === "string" &&
+		typeof candidate.next_steps === "string" &&
+		typeof candidate.key_context === "string" &&
+		typeof candidate.createdAt === "number"
+	);
+}
+
+function entryContributesToContext(entry: SessionEntry): boolean {
+	return entry.type === "message" || entry.type === "custom_message" || entry.type === "branch_summary";
+}
+
+function findUsableHandoffMarker(branch: readonly SessionEntry[]): PendingHandoff | undefined {
+	let candidate: PendingHandoff | undefined;
+	for (const entry of branch) {
+		if (entry.type === "compaction") {
+			candidate = undefined;
+			continue;
+		}
+		if (candidate && entryContributesToContext(entry)) {
+			candidate = undefined;
+		}
+		if (entry.type === "custom" && entry.customType === ENTRY_HANDOFF_MARKER && isHandoffMarkerEntryData(entry.data)) {
+			candidate = { ...entry.data, markerEntryId: entry.id };
+		}
+	}
+	return candidate;
+}
+
+function formatFileList(files: string[]): string {
+	return files.join("\n");
+}
+
+function fileListsFromOps(fileOps: { read: Set<string>; written: Set<string>; edited: Set<string> }): {
+	readFiles: string[];
+	modifiedFiles: string[];
+} {
+	const modified = new Set<string>([...fileOps.written, ...fileOps.edited]);
+	return {
+		readFiles: [...fileOps.read].filter((file) => !modified.has(file)).sort(),
+		modifiedFiles: [...modified].sort(),
+	};
+}
+
+function renderHandoffCompactionSummary(handoff: PendingHandoff, readFiles: string[], modifiedFiles: string[]): string {
+	return [
+		"## Goal",
+		handoff.goal,
+		"",
+		"## Constraints & Preferences",
+		"- The previous assistant explicitly handed off for context compaction.",
+		"- Treat this summary as authoritative; the pre-compaction transcript has intentionally been dropped from live context.",
+		"",
+		"## Progress",
+		"### Done",
+		"- [x] Recorded a detailed handoff using `compaction_handoff`.",
+		"",
+		"### In Progress",
+		handoff.work_in_progress,
+		"",
+		"### Blocked",
+		"- None recorded in the handoff unless stated in the context below.",
+		"",
+		"## Key Decisions",
+		"- **Use handoff as compaction summary**: The model-authored handoff replaced an additional LLM summarization pass.",
+		"",
+		"## Next Steps",
+		handoff.next_steps,
+		"",
+		"## Critical Context",
+		handoff.key_context,
+		"",
+		"<read-files>",
+		formatFileList(readFiles),
+		"</read-files>",
+		"",
+		"<modified-files>",
+		formatFileList(modifiedFiles),
+		"</modified-files>",
 	].join("\n");
 }
 
@@ -224,6 +337,7 @@ export default function tokenWindowReminder(pi: ExtensionAPI) {
 	// Set when a compaction drops usage after we had warned, so the next turn can
 	// announce the recovery once usage is known again.
 	let recoveryPending = false;
+	let pendingHandoff: PendingHandoff | undefined;
 
 	function persistConfig(nextEnabled: boolean): void {
 		enabled = nextEnabled;
@@ -246,8 +360,9 @@ export default function tokenWindowReminder(pi: ExtensionAPI) {
 		enabled = DEFAULT_ENABLED;
 		lastWarnedRung = undefined;
 		recoveryPending = false;
+		const branch = ctx.sessionManager.getBranch();
 
-		for (const entry of ctx.sessionManager.getBranch()) {
+		for (const entry of branch) {
 			if (entry.type === "compaction") {
 				// Compaction shrinks the live context back down, so a reminder fired
 				// before this point no longer reflects current usage. Re-arm the ladder.
@@ -278,6 +393,8 @@ export default function tokenWindowReminder(pi: ExtensionAPI) {
 				}
 			}
 		}
+
+		pendingHandoff = findUsableHandoffMarker(branch);
 	}
 
 	function deliver(message: string, ctx: ExtensionContext): void {
@@ -295,6 +412,9 @@ export default function tokenWindowReminder(pi: ExtensionAPI) {
 
 	function maybeSendReminder(ctx: ExtensionContext): void {
 		if (!enabled) return;
+		// The model has already handed off in this agent run; don't queue another
+		// low-context steering message behind the terminating handoff tool call.
+		if (pendingHandoff && !pendingHandoff.markerEntryId) return;
 
 		const usage = ctx.getContextUsage();
 		if (!usage || usage.tokens === null || usage.contextWindow <= 0) return;
@@ -342,9 +462,9 @@ export default function tokenWindowReminder(pi: ExtensionAPI) {
 		name: "compaction_handoff",
 		label: "Compaction Hand-off",
 		description: [
-			"Record a hand-off and END YOUR TURN so pi can compact (summarize) the conversation and free the context window.",
+			"Record a hand-off and END YOUR TURN so pi can compact the conversation and free the context window.",
 			"Call this when you are asked to hand off for compaction, or when the context is nearly full and you have reached a safe stopping point.",
-			"After calling it, STOP: do not call any more tools or keep working. pi compacts once you yield, and your hand-off stays in the conversation that gets summarized.",
+			"After calling it, STOP: do not call any more tools or keep working. pi compacts once you yield, and uses your hand-off directly as the new compaction summary.",
 			"Be exhaustive — a future instance with no memory of this session relies entirely on what you write here. Do not be terse.",
 		].join(" "),
 		parameters: Type.Object({
@@ -370,14 +490,15 @@ export default function tokenWindowReminder(pi: ExtensionAPI) {
 			const message = result.content.find((content) => content.type === "text")?.text ?? "End your turn now.";
 			return new Text(`${theme.fg("success", "✓ Hand-off recorded")}\n${theme.fg("muted", message)}`, 0, 0);
 		},
-		async execute(_id, _params, _signal, _onUpdate, ctx) {
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			pendingHandoff = { ...normalizeHandoff(params), createdAt: Date.now() };
 			const usage = ctx?.getContextUsage();
 			// pi compacts at a run boundary when tokens > contextWindow - reserveTokens.
 			const overCompactionPoint =
 				!!usage && usage.tokens !== null && usage.contextWindow > 0 && usage.tokens > usage.contextWindow - reserveTokens;
 			const tail = overCompactionPoint
-				? "pi will compact the conversation once you yield."
-				: "Note: context is not over pi's compaction point yet, so pi may not compact right away — still stop if you were asked to hand off.";
+				? "pi will compact the conversation using this hand-off once you yield."
+				: "Note: context is not over pi's compaction point yet, so pi may not compact right away — if it does compact before more conversation is added, it will use this hand-off directly.";
 			return {
 				content: [
 					{
@@ -386,6 +507,7 @@ export default function tokenWindowReminder(pi: ExtensionAPI) {
 					},
 				],
 				details: undefined,
+				terminate: true,
 			};
 		},
 	});
@@ -436,6 +558,52 @@ export default function tokenWindowReminder(pi: ExtensionAPI) {
 		maybeSendReminder(ctx);
 	});
 
+	pi.on("agent_end", async (_event, ctx) => {
+		if (pendingHandoff?.markerEntryId) {
+			pendingHandoff = findUsableHandoffMarker(ctx.sessionManager.getBranch());
+		}
+		if (!pendingHandoff || pendingHandoff.markerEntryId) return;
+
+		pi.appendEntry<HandoffMarkerEntry>(ENTRY_HANDOFF_MARKER, {
+			...pendingHandoff,
+			version: 1,
+		});
+
+		const marker = ctx.sessionManager.getLeafEntry();
+		if (marker?.type === "custom" && marker.customType === ENTRY_HANDOFF_MARKER) {
+			pendingHandoff = { ...pendingHandoff, markerEntryId: marker.id };
+			return;
+		}
+
+		pendingHandoff = undefined;
+		if (ctx.hasUI) ctx.ui.notify("Compaction hand-off marker could not be recorded; falling back to normal compaction.", "warning");
+	});
+
+	pi.on("session_before_compact", async (event, ctx) => {
+		const handoff = findUsableHandoffMarker(ctx.sessionManager.getBranch());
+		pendingHandoff = handoff;
+		if (!handoff?.markerEntryId) return;
+
+		const { readFiles, modifiedFiles } = fileListsFromOps(event.preparation.fileOps);
+		const summary = renderHandoffCompactionSummary(handoff, readFiles, modifiedFiles);
+		if (ctx.hasUI) ctx.ui.notify("Using compaction_handoff notes as the compaction summary.", "info");
+
+		return {
+			compaction: {
+				summary,
+				firstKeptEntryId: handoff.markerEntryId,
+				tokensBefore: event.preparation.tokensBefore,
+				details: {
+					source: "compaction_handoff",
+					markerEntryId: handoff.markerEntryId,
+					handoffCreatedAt: handoff.createdAt,
+					readFiles,
+					modifiedFiles,
+				},
+			},
+		};
+	});
+
 	pi.on("session_compact", async (_event, _ctx) => {
 		// Compaction drops utilization. If we had warned, queue a recovery notice so
 		// the model learns it has headroom again, and re-arm the whole ladder. OR in
@@ -443,6 +611,7 @@ export default function tokenWindowReminder(pi: ExtensionAPI) {
 		// drop a recovery already queued by the first.
 		recoveryPending = recoveryPending || lastWarnedRung !== undefined;
 		lastWarnedRung = undefined;
+		pendingHandoff = undefined;
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
