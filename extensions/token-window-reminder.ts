@@ -1,4 +1,5 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { readReserveTokens } from "./lib/compaction-settings.js";
 
@@ -137,6 +138,38 @@ type ReminderEntry = {
 type ResetEntry = {
 	createdAt: number;
 };
+
+type HandoffParams = {
+	goal?: unknown;
+	work_in_progress?: unknown;
+	next_steps?: unknown;
+	key_context?: unknown;
+};
+
+function handoffText(value: unknown): string {
+	if (typeof value !== "string") return "…";
+	const trimmed = value.trim();
+	return trimmed.length > 0 ? trimmed : "…";
+}
+
+function renderHandoffSection(theme: Theme, title: string, value: unknown): string {
+	return `${theme.fg("accent", theme.bold(title))}\n${theme.fg("toolOutput", handoffText(value))}`;
+}
+
+function renderHandoffForUser(theme: Theme, args: HandoffParams): string {
+	return [
+		theme.fg("toolTitle", theme.bold("Compaction hand-off")),
+		theme.fg("dim", "Recorded hand-off notes visible to the user; tool result stays terse for the model."),
+		"",
+		renderHandoffSection(theme, "Goal", args.goal),
+		"",
+		renderHandoffSection(theme, "Work in Progress", args.work_in_progress),
+		"",
+		renderHandoffSection(theme, "Next Steps", args.next_steps),
+		"",
+		renderHandoffSection(theme, "Key Context", args.key_context),
+	].join("\n");
+}
 
 function formatStatus(
 	enabled: boolean,
@@ -330,6 +363,13 @@ export default function tokenWindowReminder(pi: ExtensionAPI) {
 					"Key decisions and their rationale, constraints, file paths, commands, findings, and any other facts needed to resume. Be exhaustive.",
 			}),
 		}),
+		renderCall(args, theme) {
+			return new Text(renderHandoffForUser(theme, args), 0, 0);
+		},
+		renderResult(result, _options, theme) {
+			const message = result.content.find((content) => content.type === "text")?.text ?? "End your turn now.";
+			return new Text(`${theme.fg("success", "✓ Hand-off recorded")}\n${theme.fg("muted", message)}`, 0, 0);
+		},
 		async execute(_id, _params, _signal, _onUpdate, ctx) {
 			const usage = ctx?.getContextUsage();
 			// pi compacts at a run boundary when tokens > contextWindow - reserveTokens.
