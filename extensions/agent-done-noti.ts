@@ -1,8 +1,9 @@
 /**
  * Agent-done notification.
  *
- * Fires `noti local "Agent is done"` or `noti mobile "Agent is done"` when the
- * agent genuinely stops — not when it's only momentarily idle between
+ * Fires `noti local "Agent is done"` (and, when mobile mode is enabled, also
+ * `noti mobile "Agent is done"`) when the agent genuinely stops — not when it's
+ * only momentarily idle between
  * auto-continuations or busy compacting.
  *
  * The hard part is deciding what "done" means. Two things keep the agent going
@@ -35,8 +36,8 @@
 import { execFile } from "node:child_process";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-// The notification command: `noti <target> "<message>"`. Mobile mode switches
-// the target from `local` to `mobile`; the bare `noti "..."` form errors.
+// The notification command is `noti <target> "<message>"`. Local notifications
+// always fire; mobile mode adds a second `noti mobile` notification.
 type NotiTarget = "local" | "mobile";
 const NOTI_MESSAGE = "Agent is done";
 
@@ -45,10 +46,11 @@ const NOTI_MESSAGE = "Agent is done";
 // auto-continuations (sub-second).
 const IDLE_GRACE_MS = 2000;
 
-function formatStatus(target: NotiTarget): string {
+function formatStatus(mobileEnabled: boolean): string {
 	return [
 		"Agent-done notifications",
-		`Current target: noti ${target}`,
+		"Local target: noti local (always)",
+		`Mobile target: ${mobileEnabled ? "enabled (noti mobile in addition)" : "disabled"}`,
 		"Usage:",
 		"  /noti status",
 		"  /noti mobile enable",
@@ -57,7 +59,7 @@ function formatStatus(target: NotiTarget): string {
 }
 
 export default function agentDoneNoti(pi: ExtensionAPI) {
-	let notiTarget: NotiTarget = "local";
+	let mobileEnabled = false;
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	// Set when compaction interrupts a pending notification, so we know to
 	// resume watching for idle once compaction finishes (vs. a manual /compact
@@ -68,6 +70,12 @@ export default function agentDoneNoti(pi: ExtensionAPI) {
 		if (timer === undefined) return;
 		clearTimeout(timer);
 		timer = undefined;
+	}
+
+	function runNoti(target: NotiTarget): void {
+		execFile("noti", [target, NOTI_MESSAGE], () => {
+			// Fire-and-forget; ignore errors (e.g. noti not installed).
+		});
 	}
 
 	function arm(ctx: ExtensionContext): void {
@@ -81,9 +89,8 @@ export default function agentDoneNoti(pi: ExtensionAPI) {
 				// Runtime may have been reloaded while the timer was pending.
 				return;
 			}
-			execFile("noti", [notiTarget, NOTI_MESSAGE], () => {
-				// Fire-and-forget; ignore errors (e.g. noti not installed).
-			});
+			runNoti("local");
+			if (mobileEnabled) runNoti("mobile");
 		}, IDLE_GRACE_MS);
 	}
 
@@ -92,23 +99,23 @@ export default function agentDoneNoti(pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const trimmed = args.trim().toLowerCase();
 			if (!trimmed || trimmed === "status" || trimmed === "mobile") {
-				ctx.ui.notify(formatStatus(notiTarget), "info");
+				ctx.ui.notify(formatStatus(mobileEnabled), "info");
 				return;
 			}
 
 			if (trimmed === "mobile enable") {
-				notiTarget = "mobile";
-				ctx.ui.notify("Agent-done notifications will use `noti mobile`.", "info");
+				mobileEnabled = true;
+				ctx.ui.notify("Agent-done notifications will use `noti local` and `noti mobile`.", "info");
 				return;
 			}
 
 			if (trimmed === "mobile disable") {
-				notiTarget = "local";
-				ctx.ui.notify("Agent-done notifications will use `noti local`.", "info");
+				mobileEnabled = false;
+				ctx.ui.notify("Agent-done notifications will use `noti local` only.", "info");
 				return;
 			}
 
-			ctx.ui.notify(`Unknown /noti command.\n\n${formatStatus(notiTarget)}`, "warning");
+			ctx.ui.notify(`Unknown /noti command.\n\n${formatStatus(mobileEnabled)}`, "warning");
 		},
 	});
 
