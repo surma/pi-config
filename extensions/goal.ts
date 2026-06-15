@@ -916,7 +916,7 @@ export default function goalExtension(pi: ExtensionAPI) {
 		async execute(_id, params) {
 			if (currentGoal && currentGoal.status !== "complete") {
 				throw new Error(
-					"cannot create a new goal because this thread already has a goal; use update_goal only when the existing goal is complete",
+					"cannot create a new goal because this thread already has a goal; use clear_goal to remove it first, or update_goal to mark it complete",
 				);
 			}
 			const goal = setNewGoal(params.objective, params.token_budget ?? null);
@@ -967,6 +967,33 @@ You cannot use this tool to pause or resume a goal; those status changes are con
 					{
 						type: "text",
 						text: `Goal marked complete. Briefly summarize what was accomplished for the user.\n${JSON.stringify({ goal }, null, 2)}`,
+					},
+				],
+				details: undefined,
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "clear_goal",
+		label: "Clear Goal",
+		description:
+			"Clear (cancel) the current goal without marking it complete. Use when the user wants to abandon, cancel, or discard the current goal. This stops auto-continuation and removes the goal entirely.",
+		parameters: Type.Object({}),
+		async execute() {
+			if (!currentGoal) {
+				return {
+					content: [{ type: "text", text: "No goal is currently set." }],
+					details: undefined,
+				};
+			}
+			const previousObjective = currentGoal.objective;
+			clearGoal();
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Goal cleared: "${previousObjective}"`,
 					},
 				],
 				details: undefined,
