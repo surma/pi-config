@@ -490,20 +490,13 @@ export default function tokenWindowReminder(pi: ExtensionAPI) {
 			const message = result.content.find((content) => content.type === "text")?.text ?? "End your turn now.";
 			return new Text(`${theme.fg("success", "✓ Hand-off recorded")}\n${theme.fg("muted", message)}`, 0, 0);
 		},
-		async execute(_id, params, _signal, _onUpdate, ctx) {
+		async execute(_id, params, _signal, _onUpdate, _ctx) {
 			pendingHandoff = { ...normalizeHandoff(params), createdAt: Date.now() };
-			const usage = ctx?.getContextUsage();
-			// pi compacts at a run boundary when tokens > contextWindow - reserveTokens.
-			const overCompactionPoint =
-				!!usage && usage.tokens !== null && usage.contextWindow > 0 && usage.tokens > usage.contextWindow - reserveTokens;
-			const tail = overCompactionPoint
-				? "pi will compact the conversation using this hand-off once you yield."
-				: "Note: context is not over pi's compaction point yet, so pi may not compact right away — if it does compact before more conversation is added, it will use this hand-off directly.";
 			return {
 				content: [
 					{
 						type: "text",
-						text: `Hand-off recorded. End your turn now — do not call any more tools or keep working. ${tail}`,
+						text: "Hand-off recorded. End your turn now — do not call any more tools or keep working. Compaction will run automatically once you yield.",
 					},
 				],
 				details: undefined,
@@ -572,6 +565,9 @@ export default function tokenWindowReminder(pi: ExtensionAPI) {
 		const marker = ctx.sessionManager.getLeafEntry();
 		if (marker?.type === "custom" && marker.customType === ENTRY_HANDOFF_MARKER) {
 			pendingHandoff = { ...pendingHandoff, markerEntryId: marker.id };
+			// Trigger compaction now — the session_before_compact hook will pick
+			// up the marker and use the handoff notes as the compaction summary.
+			ctx.compact();
 			return;
 		}
 
