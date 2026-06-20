@@ -140,7 +140,7 @@ function resolveKnownModel(ctx: ExtensionContext, rawModel: string): { ref?: str
 	const exact = known.find((candidate) => candidate.ref.toLowerCase() === lower);
 	if (exact) {
 		if (!exact.available) {
-			return { error: `Model \"${exact.ref}\" is known but unavailable in this session. Choose an available model from subagent_models.` };
+			return { error: `Model \"${exact.ref}\" is known but unavailable in this session. Choose an available model from list_models.` };
 		}
 		return { ref: exact.ref };
 	}
@@ -150,23 +150,23 @@ function resolveKnownModel(ctx: ExtensionContext, rawModel: string): { ref?: str
 		const provider = model.slice(0, slashIndex);
 		const knownProvider = known.find((candidate) => candidate.provider.toLowerCase() === provider.toLowerCase());
 		if (!knownProvider) {
-			return { error: `Unknown provider \"${provider}\". Use subagent_models to inspect valid models.` };
+			return { error: `Unknown provider \"${provider}\". Use list_models to inspect valid models.` };
 		}
-		return { error: `Unknown model \"${model}\". Use subagent_models to inspect valid models.` };
+		return { error: `Unknown model \"${model}\". Use list_models to inspect valid models.` };
 	}
 
 	const byId = known.filter((candidate) => candidate.id.toLowerCase() === lower);
 	if (byId.length === 1) {
 		if (!byId[0]!.available) {
-			return { error: `Model \"${byId[0]!.ref}\" is known but unavailable in this session. Choose an available model from subagent_models.` };
+			return { error: `Model \"${byId[0]!.ref}\" is known but unavailable in this session. Choose an available model from list_models.` };
 		}
 		return { ref: byId[0]!.ref };
 	}
 	if (byId.length > 1) {
-		return { error: `Model \"${model}\" is ambiguous. Use a full provider/model id from subagent_models.` };
+		return { error: `Model \"${model}\" is ambiguous. Use a full provider/model id from list_models.` };
 	}
 
-	return { error: `Unknown model \"${model}\". Use subagent_models to inspect valid models.` };
+	return { error: `Unknown model \"${model}\". Use list_models to inspect valid models.` };
 }
 
 function truncate(text: string | undefined, max = 80): string {
@@ -601,11 +601,6 @@ const RunSchema = Type.Object({
 	systemPrompt: Type.Optional(Type.String({ description: "Optional ad hoc system prompt override for single-agent mode" })),
 	tasks: Type.Optional(ParallelSchema.properties.tasks),
 	chain: Type.Optional(ChainSchema.properties.chain),
-});
-
-const ModelsSchema = Type.Object({
-	includeUnavailable: Type.Optional(Type.Boolean({ default: true, description: "Include known but unavailable models in the listing" })),
-	search: Type.Optional(Type.String({ description: "Optional case-insensitive substring filter over provider/model and name" })),
 });
 
 const WaitSchema = Type.Object({
@@ -1166,61 +1161,11 @@ If further delegation seems useful, report that back to the parent agent instead
 			: `\n\nSubagent extension is available.
 Do not use subagent_run or subagent_start unless the user explicitly asks you to delegate work to a subagent or spawn one.
 Use subagent_list, subagent_wait, and subagent_kill to inspect or control background subagents when relevant.
-Use subagent_models to inspect the exact model ids accepted by subagent model overrides in this session.
+Use list_models to inspect the exact model ids accepted by subagent model overrides in this session.
 A subagent call may either reference a predefined agent via {agent: "name", ...} or be ad hoc by omitting agent and providing task plus optional systemPrompt/tools/model overrides.
 Per-call model overrides are supported via model: "provider/model-id".
 Available predefined subagents:\n${formatAgentList(discovery.agents, 20)}`;
 		return { systemPrompt: event.systemPrompt + guidance };
-	});
-
-	pi.registerTool({
-		name: "subagent_models",
-		label: "Subagent Models",
-		description: "List the exact model ids accepted by subagent model overrides in this session, and whether they are available here.",
-		promptSnippet: "Inspect the exact model ids accepted by subagent model overrides before setting one.",
-		promptGuidelines: [
-			"Use subagent_models before setting a subagent model override when you are not sure which exact model ids are accepted.",
-			"Prefer available models from subagent_models; unavailable ones will be rejected for subagent launches.",
-		],
-		parameters: ModelsSchema,
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			rememberContext(ctx);
-			const includeUnavailable = params.includeUnavailable ?? true;
-			const search = params.search?.trim().toLowerCase();
-			let models = getKnownModels(ctx).filter((model) => includeUnavailable || model.available);
-			if (search) {
-				models = models.filter(
-					(model) =>
-						model.ref.toLowerCase().includes(search) ||
-						model.name.toLowerCase().includes(search) ||
-						model.provider.toLowerCase().includes(search) ||
-						model.id.toLowerCase().includes(search),
-				);
-			}
-			if (models.length === 0) {
-				const scope = includeUnavailable ? "known" : "available";
-				const suffix = search ? ` matching \"${params.search}\"` : "";
-				return {
-					content: [{ type: "text", text: `No ${scope} subagent models found${suffix}.` }],
-					details: { models: [] },
-				};
-			}
-
-			const availableCount = models.filter((model) => model.available).length;
-			const lines = [
-				`${models.length} model${models.length === 1 ? "" : "s"} (${availableCount} available)`,
-				...models.map((model) => {
-					const flags = [model.available ? "available" : "unavailable", model.reasoning ? "reasoning" : undefined, model.input.includes("image") ? "image" : undefined]
-						.filter(Boolean)
-						.join(", ");
-					return `${model.available ? "✓" : "·"} ${model.ref}${model.name && model.name !== model.id ? ` — ${model.name}` : ""}${flags ? ` (${flags})` : ""}`;
-				}),
-			];
-			return {
-				content: [{ type: "text", text: lines.join("\n") }],
-				details: { models },
-			};
-		},
 	});
 
 	pi.registerTool({
@@ -1233,7 +1178,7 @@ Available predefined subagents:\n${formatAgentList(discovery.agents, 20)}`;
 			"Do not use subagent_run unless the user explicitly asks for delegation, a subagent, or a swarm.",
 			"Never call subagent_run from within a delegated subagent; nested delegation is disabled.",
 			"Use tasks[] for small independent swarms, and chain[] for stepwise handoffs using {previous}.",
-			"Use subagent_models before setting a child model override when you are unsure which exact model ids are accepted.",
+			"Use list_models before setting a child model override when you are unsure which exact model ids are accepted.",
 			"You can override the child model per call with model: \"provider/model-id\".",
 			"For ad hoc subagents, omit agent and provide task plus optional systemPrompt, tools, and model.",
 		],
