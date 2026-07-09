@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ExtensionContext, SessionEntry, Theme } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { readReserveTokens } from "./lib/compaction-settings.js";
@@ -6,7 +6,7 @@ import { readReserveTokens } from "./lib/compaction-settings.js";
 const ENTRY_CONFIG = "token-window-reminder-config";
 const ENTRY_REMINDER = "token-window-reminder-fired";
 const ENTRY_RESET = "token-window-reminder-reset";
-const ENTRY_HANDOFF_MARKER = "token-window-reminder-handoff-marker";
+const ENTRY_HANDOFF_SUMMARY = "token-window-reminder-handoff-summary";
 
 const DEFAULT_ENABLED = true;
 
@@ -42,7 +42,7 @@ const REMINDER_LADDER: readonly { reserveFraction: number; escalation: string }[
 	{
 		reserveFraction: 0.0,
 		escalation:
-			"When you reach a natural stopping point, call the `compaction_handoff` tool to record a thorough hand-off and end your turn so pi can compact.",
+			"When you reach a natural stopping point, call the `compaction_handoff` tool to record a thorough hand-off and end your turn so the next model call can resume from it.",
 	},
 	{
 		reserveFraction: 0.5,
@@ -52,7 +52,7 @@ const REMINDER_LADDER: readonly { reserveFraction: number; escalation: string }[
 	{
 		reserveFraction: 0.85,
 		escalation:
-			"URGENT: you are about to run out of context entirely. Call `compaction_handoff` immediately and stop — do not begin anything new. Yielding is the only thing that lets pi compact and recover the window.",
+			"URGENT: you are about to run out of context entirely. Call `compaction_handoff` immediately and stop — do not begin anything new. Yielding is the only thing that lets the next model call recover the window.",
 	},
 ];
 
@@ -100,7 +100,7 @@ function renderWarning(rungIndex: number, usage: UsageInfo): string {
 	const remaining = Math.round(usage.tokensToFull).toLocaleString();
 	const lines = [
 		"<system_reminder>",
-		`Your context has reached pi's compaction point: now at ${usageLabel(usage)}, ~${remaining} tokens before the window is full. pi will compact only once you hand control back to the user — it cannot compact while you keep working or are being steered. Hand off via the \`compaction_handoff\` tool: it records a thorough hand-off (your goal, current work, next steps, and every key decision, file path, and fact needed to resume), then pi uses those notes directly as the compaction summary. Be complete, not terse — a future instance with no memory of this session depends entirely on it.`,
+		`Your context has reached pi's compaction point: now at ${usageLabel(usage)}, ~${remaining} tokens before the window is full. The live model context can reset only once you hand control back to the user — it cannot reset while you keep working or are being steered. Hand off via the \`compaction_handoff\` tool: it records a thorough hand-off (your goal, current work, next steps, and every key decision, file path, and fact needed to resume), then the next model call starts from those notes and drops the earlier transcript. Be complete, not terse — a future instance with no memory of this session depends entirely on it.`,
 	];
 	for (let i = 0; i <= rungIndex; i++) {
 		lines.push("", REMINDER_LADDER[i].escalation);
@@ -109,7 +109,7 @@ function renderWarning(rungIndex: number, usage: UsageInfo): string {
 	return lines.join("\n");
 }
 
-// Sent once after compaction frees the context back up, so the model stops
+// Sent once after native or virtual compaction frees the context back up, so the model stops
 // acting on the earlier hand-off / yield reminders. Edit the wording freely.
 function renderRecovery(usage: UsageInfo): string {
 	return `<system_reminder>
@@ -154,15 +154,6 @@ type HandoffNotes = {
 	key_context: string;
 };
 
-type PendingHandoff = HandoffNotes & {
-	createdAt: number;
-	markerEntryId?: string;
-};
-
-type HandoffMarkerEntry = PendingHandoff & {
-	version: 1;
-};
-
 function handoffText(value: unknown): string {
 	if (typeof value !== "string") return "…";
 	const trimmed = value.trim();
@@ -197,56 +188,89 @@ function normalizeHandoff(args: HandoffParams): HandoffNotes {
 	};
 }
 
-function isHandoffMarkerEntryData(data: unknown): data is HandoffMarkerEntry {
-	if (!data || typeof data !== "object") return false;
-	const candidate = data as Partial<HandoffMarkerEntry>;
-	return (
-		candidate.version === 1 &&
-		typeof candidate.goal === "string" &&
-		typeof candidate.work_in_progress === "string" &&
-		typeof candidate.next_steps === "string" &&
-		typeof candidate.key_context === "string" &&
-		typeof candidate.createdAt === "number"
-	);
-}
+type HandoffToolCall = {
+	id: string;
+	notes: HandoffNotes;
+};
 
-function entryContributesToContext(entry: SessionEntry): boolean {
-	return entry.type === "message" || entry.type === "custom_message" || entry.type === "branch_summary";
-}
+type HandoffBoundary = HandoffToolCall & {
+	assistantIndex: number;
+	tailStart: number;
+	timestamp: number;
+};
 
-function findUsableHandoffMarker(branch: readonly SessionEntry[]): PendingHandoff | undefined {
-	let candidate: PendingHandoff | undefined;
-	for (const entry of branch) {
-		if (entry.type === "compaction") {
-			candidate = undefined;
+function handoffToolCalls(message: unknown): HandoffToolCall[] {
+	if (!message || typeof message !== "object") return [];
+	const candidate = message as { role?: unknown; content?: unknown };
+	if (candidate.role !== "assistant" || !Array.isArray(candidate.content)) return [];
+
+	const calls: HandoffToolCall[] = [];
+	for (const block of candidate.content) {
+		if (!block || typeof block !== "object") continue;
+		const toolCall = block as { type?: unknown; id?: unknown; name?: unknown; arguments?: unknown };
+		if (
+			toolCall.type !== "toolCall" ||
+			toolCall.name !== "compaction_handoff" ||
+			typeof toolCall.id !== "string" ||
+			!toolCall.arguments ||
+			typeof toolCall.arguments !== "object"
+		) {
 			continue;
 		}
-		if (candidate && entryContributesToContext(entry)) {
-			candidate = undefined;
+		calls.push({
+			id: toolCall.id,
+			notes: normalizeHandoff(toolCall.arguments as HandoffParams),
+		});
+	}
+	return calls;
+}
+
+// A handoff becomes authoritative only after its matching tool result succeeds.
+// Everything through that assistant's complete tool-result batch is discarded,
+// preventing an orphan tool result from becoming the first provider message.
+function findLatestSuccessfulHandoff(messages: readonly unknown[]): HandoffBoundary | undefined {
+	for (let assistantIndex = messages.length - 1; assistantIndex >= 0; assistantIndex--) {
+		const calls = handoffToolCalls(messages[assistantIndex]);
+		if (calls.length === 0) continue;
+
+		const successfulIds = new Set<string>();
+		let tailStart = assistantIndex + 1;
+		while (tailStart < messages.length) {
+			const message = messages[tailStart];
+			if (!message || typeof message !== "object" || (message as { role?: unknown }).role !== "toolResult") break;
+			const result = message as { toolCallId?: unknown; toolName?: unknown; isError?: unknown };
+			if (
+				result.toolName === "compaction_handoff" &&
+				result.isError === false &&
+				typeof result.toolCallId === "string"
+			) {
+				successfulIds.add(result.toolCallId);
+			}
+			tailStart++;
 		}
-		if (entry.type === "custom" && entry.customType === ENTRY_HANDOFF_MARKER && isHandoffMarkerEntryData(entry.data)) {
-			candidate = { ...entry.data, markerEntryId: entry.id };
+
+		for (let callIndex = calls.length - 1; callIndex >= 0; callIndex--) {
+			const call = calls[callIndex];
+			if (!successfulIds.has(call.id)) continue;
+			const timestamp = (messages[assistantIndex] as { timestamp?: unknown }).timestamp;
+			return {
+				...call,
+				assistantIndex,
+				tailStart,
+				timestamp: typeof timestamp === "number" ? timestamp : Date.now(),
+			};
 		}
 	}
-	return candidate;
+	return undefined;
 }
 
-function formatFileList(files: string[]): string {
-	return files.join("\n");
+function assistantResponseSucceeded(message: unknown): boolean {
+	if (!message || typeof message !== "object") return false;
+	const candidate = message as { role?: unknown; stopReason?: unknown };
+	return candidate.role === "assistant" && candidate.stopReason !== "error" && candidate.stopReason !== "aborted";
 }
 
-function fileListsFromOps(fileOps: { read: Set<string>; written: Set<string>; edited: Set<string> }): {
-	readFiles: string[];
-	modifiedFiles: string[];
-} {
-	const modified = new Set<string>([...fileOps.written, ...fileOps.edited]);
-	return {
-		readFiles: [...fileOps.read].filter((file) => !modified.has(file)).sort(),
-		modifiedFiles: [...modified].sort(),
-	};
-}
-
-function renderHandoffCompactionSummary(handoff: PendingHandoff, readFiles: string[], modifiedFiles: string[]): string {
+function renderHandoffCompactionSummary(handoff: HandoffNotes): string {
 	return [
 		"## Goal",
 		handoff.goal,
@@ -273,14 +297,6 @@ function renderHandoffCompactionSummary(handoff: PendingHandoff, readFiles: stri
 		"",
 		"## Critical Context",
 		handoff.key_context,
-		"",
-		"<read-files>",
-		formatFileList(readFiles),
-		"</read-files>",
-		"",
-		"<modified-files>",
-		formatFileList(modifiedFiles),
-		"</modified-files>",
 	].join("\n");
 }
 
@@ -330,14 +346,17 @@ export default function tokenWindowReminder(pi: ExtensionAPI) {
 	// branch rebuild so the compaction point always matches pi's actual point.
 	let reserveTokens = readReserveTokens();
 	// Index of the highest ladder rung already warned this episode; undefined == none.
-	// Re-armed ONLY by an actual compaction (session_compact), a config change, a
-	// reset, or a branch rebuild — never by usage merely dipping below a rung, so
-	// jitter around a threshold can never re-fire the same warning.
+	// Re-armed only by native/virtual compaction, a config change, a reset, or a
+	// branch rebuild — never by usage merely dipping below a rung, so jitter around
+	// a threshold can never re-fire the same warning.
 	let lastWarnedRung: number | undefined;
-	// Set when a compaction drops usage after we had warned, so the next turn can
+	// Set when compaction drops usage after we had warned, so the next turn can
 	// announce the recovery once usage is known again.
 	let recoveryPending = false;
-	let pendingHandoff: PendingHandoff | undefined;
+	// Provider-reported usage still describes the pre-handoff request until one
+	// response has been generated from the trimmed context. Suppress reminders in
+	// that interval so stale usage cannot immediately re-fire the ladder.
+	let handoffAwaitingFreshUsage = false;
 
 	function persistConfig(nextEnabled: boolean): void {
 		enabled = nextEnabled;
@@ -360,15 +379,46 @@ export default function tokenWindowReminder(pi: ExtensionAPI) {
 		enabled = DEFAULT_ENABLED;
 		lastWarnedRung = undefined;
 		recoveryPending = false;
-		const branch = ctx.sessionManager.getBranch();
+		handoffAwaitingFreshUsage = false;
+		const pendingHandoffCallIds = new Set<string>();
 
-		for (const entry of branch) {
+		for (const entry of ctx.sessionManager.getBranch()) {
 			if (entry.type === "compaction") {
-				// Compaction shrinks the live context back down, so a reminder fired
-				// before this point no longer reflects current usage. Re-arm the ladder.
+				// Native compaction supersedes any earlier virtual boundary.
 				lastWarnedRung = undefined;
+				recoveryPending = false;
+				handoffAwaitingFreshUsage = false;
+				pendingHandoffCallIds.clear();
 				continue;
 			}
+
+			if (entry.type === "message") {
+				const message = entry.message;
+				if (message.role === "assistant") {
+					// A completed response after a handoff means provider usage now
+					// reflects the trimmed context. Historical recovery notices are not
+					// replayed when rebuilding an already-continued session.
+					if (handoffAwaitingFreshUsage && assistantResponseSucceeded(message)) {
+						handoffAwaitingFreshUsage = false;
+						recoveryPending = false;
+					}
+					pendingHandoffCallIds.clear();
+					for (const call of handoffToolCalls(message)) pendingHandoffCallIds.add(call.id);
+				} else if (
+					message.role === "toolResult" &&
+					message.toolName === "compaction_handoff" &&
+					pendingHandoffCallIds.has(message.toolCallId)
+				) {
+					pendingHandoffCallIds.delete(message.toolCallId);
+					if (!message.isError) {
+						recoveryPending = recoveryPending || lastWarnedRung !== undefined;
+						lastWarnedRung = undefined;
+						handoffAwaitingFreshUsage = true;
+					}
+				}
+				continue;
+			}
+
 			if (entry.type !== "custom") continue;
 			switch (entry.customType) {
 				case ENTRY_CONFIG: {
@@ -376,6 +426,7 @@ export default function tokenWindowReminder(pi: ExtensionAPI) {
 					if (!data) break;
 					enabled = data.enabled;
 					lastWarnedRung = undefined;
+					recoveryPending = false;
 					break;
 				}
 				case ENTRY_REMINDER: {
@@ -389,12 +440,11 @@ export default function tokenWindowReminder(pi: ExtensionAPI) {
 				}
 				case ENTRY_RESET: {
 					lastWarnedRung = undefined;
+					recoveryPending = false;
 					break;
 				}
 			}
 		}
-
-		pendingHandoff = findUsableHandoffMarker(branch);
 	}
 
 	function deliver(message: string, ctx: ExtensionContext): void {
@@ -411,10 +461,7 @@ export default function tokenWindowReminder(pi: ExtensionAPI) {
 	}
 
 	function maybeSendReminder(ctx: ExtensionContext): void {
-		if (!enabled) return;
-		// The model has already handed off in this agent run; don't queue another
-		// low-context steering message behind the terminating handoff tool call.
-		if (pendingHandoff && !pendingHandoff.markerEntryId) return;
+		if (!enabled || handoffAwaitingFreshUsage) return;
 
 		const usage = ctx.getContextUsage();
 		if (!usage || usage.tokens === null || usage.contextWindow <= 0) return;
@@ -439,8 +486,8 @@ export default function tokenWindowReminder(pi: ExtensionAPI) {
 		}
 
 		const rungIndex = highestRungAtOrBelow(tokens, contextWindow, reserveTokens);
-		// Below the compaction point. Do NOT re-arm here — re-arming only on a real
-		// compaction is what keeps jitter around a threshold from re-firing.
+		// Below the compaction point. Do NOT re-arm here — re-arming only on native
+		// or virtual compaction is what keeps jitter around a threshold from re-firing.
 		if (rungIndex < 0) return;
 		if (lastWarnedRung !== undefined && rungIndex <= lastWarnedRung) return;
 
@@ -462,9 +509,9 @@ export default function tokenWindowReminder(pi: ExtensionAPI) {
 		name: "compaction_handoff",
 		label: "Compaction Hand-off",
 		description: [
-			"Record a hand-off and END YOUR TURN so pi can compact the conversation and free the context window.",
+			"Record a hand-off and END YOUR TURN so the next model call can discard the earlier transcript and free the context window.",
 			"Call this when you are asked to hand off for compaction, or when the context is nearly full and you have reached a safe stopping point.",
-			"After calling it, STOP: do not call any more tools or keep working. pi compacts once you yield, and uses your hand-off directly as the new compaction summary.",
+			"After calling it, STOP: do not call any more tools or keep working. Once you yield, subsequent model calls use your hand-off directly as the new context summary.",
 			"Be exhaustive — a future instance with no memory of this session relies entirely on what you write here. Do not be terse.",
 		].join(" "),
 		parameters: Type.Object({
@@ -490,13 +537,12 @@ export default function tokenWindowReminder(pi: ExtensionAPI) {
 			const message = result.content.find((content) => content.type === "text")?.text ?? "End your turn now.";
 			return new Text(`${theme.fg("success", "✓ Hand-off recorded")}\n${theme.fg("muted", message)}`, 0, 0);
 		},
-		async execute(_id, params, _signal, _onUpdate, _ctx) {
-			pendingHandoff = { ...normalizeHandoff(params), createdAt: Date.now() };
+		async execute(_id, _params, _signal, _onUpdate, _ctx) {
 			return {
 				content: [
 					{
 						type: "text",
-						text: "Hand-off recorded. End your turn now — do not call any more tools or keep working. Compaction will run automatically once you yield.",
+						text: "Hand-off recorded. End your turn now — do not call any more tools or keep working. The next model call will resume from these notes.",
 					},
 				],
 				details: undefined,
@@ -547,67 +593,54 @@ export default function tokenWindowReminder(pi: ExtensionAPI) {
 		},
 	});
 
-	pi.on("turn_end", async (_event, ctx) => {
-		maybeSendReminder(ctx);
-	});
-
-	pi.on("agent_end", async (_event, ctx) => {
-		if (pendingHandoff?.markerEntryId) {
-			pendingHandoff = findUsableHandoffMarker(ctx.sessionManager.getBranch());
-		}
-		if (!pendingHandoff || pendingHandoff.markerEntryId) return;
-
-		pi.appendEntry<HandoffMarkerEntry>(ENTRY_HANDOFF_MARKER, {
-			...pendingHandoff,
-			version: 1,
-		});
-
-		const marker = ctx.sessionManager.getLeafEntry();
-		if (marker?.type === "custom" && marker.customType === ENTRY_HANDOFF_MARKER) {
-			pendingHandoff = { ...pendingHandoff, markerEntryId: marker.id };
-			// Trigger compaction now — the session_before_compact hook will pick
-			// up the marker and use the handoff notes as the compaction summary.
-			ctx.compact();
-			return;
-		}
-
-		pendingHandoff = undefined;
-		if (ctx.hasUI) ctx.ui.notify("Compaction hand-off marker could not be recorded; falling back to normal compaction.", "warning");
-	});
-
-	pi.on("session_before_compact", async (event, ctx) => {
-		const handoff = findUsableHandoffMarker(ctx.sessionManager.getBranch());
-		pendingHandoff = handoff;
-		if (!handoff?.markerEntryId) return;
-
-		const { readFiles, modifiedFiles } = fileListsFromOps(event.preparation.fileOps);
-		const summary = renderHandoffCompactionSummary(handoff, readFiles, modifiedFiles);
-		if (ctx.hasUI) ctx.ui.notify("Using compaction_handoff notes as the compaction summary.", "info");
+	pi.on("context", async (event) => {
+		const handoff = findLatestSuccessfulHandoff(event.messages);
+		if (!handoff) return;
 
 		return {
-			compaction: {
-				summary,
-				firstKeptEntryId: handoff.markerEntryId,
-				tokensBefore: event.preparation.tokensBefore,
-				details: {
-					source: "compaction_handoff",
-					markerEntryId: handoff.markerEntryId,
-					handoffCreatedAt: handoff.createdAt,
-					readFiles,
-					modifiedFiles,
+			messages: [
+				{
+					role: "custom",
+					customType: ENTRY_HANDOFF_SUMMARY,
+					content: renderHandoffCompactionSummary(handoff.notes),
+					display: false,
+					details: { source: "compaction_handoff", toolCallId: handoff.id },
+					timestamp: handoff.timestamp,
 				},
-			},
+				...event.messages.slice(handoff.tailStart),
+			],
 		};
 	});
 
+	pi.on("turn_end", async (event, ctx) => {
+		const completedHandoff = findLatestSuccessfulHandoff([event.message, ...event.toolResults]);
+		if (completedHandoff?.assistantIndex === 0) {
+			recoveryPending = recoveryPending || lastWarnedRung !== undefined;
+			lastWarnedRung = undefined;
+			handoffAwaitingFreshUsage = true;
+			return;
+		}
+
+		if (handoffAwaitingFreshUsage) {
+			if (!assistantResponseSucceeded(event.message)) return;
+			handoffAwaitingFreshUsage = false;
+		}
+		maybeSendReminder(ctx);
+	});
+
+	pi.on("session_before_compact", async (event) => {
+		// Own normal threshold compaction so it cannot race the virtual handoff.
+		// Explicit /compact and overflow recovery remain available as escape hatches.
+		if (event.reason === "threshold") return { cancel: true };
+	});
+
 	pi.on("session_compact", async (_event, _ctx) => {
-		// Compaction drops utilization. If we had warned, queue a recovery notice so
-		// the model learns it has headroom again, and re-arm the whole ladder. OR in
-		// (rather than overwrite) so a second compaction before the next turn cannot
-		// drop a recovery already queued by the first.
+		// Native compaction drops utilization. If we had warned, queue a recovery
+		// notice and re-arm the ladder. OR in so a second compaction before the next
+		// turn cannot drop a recovery already queued by the first.
 		recoveryPending = recoveryPending || lastWarnedRung !== undefined;
 		lastWarnedRung = undefined;
-		pendingHandoff = undefined;
+		handoffAwaitingFreshUsage = false;
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
