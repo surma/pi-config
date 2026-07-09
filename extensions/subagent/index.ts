@@ -6,16 +6,13 @@ import { fileURLToPath } from "node:url";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "@sinclair/typebox";
-import {
-	clearAgentDiscoveryCache,
-	discoverAgents,
-	formatAgentList,
-	isThinkingLevel,
-	type AgentConfig,
-	type AgentDiscoveryDiagnostic,
-	type ThinkingLevel,
-} from "./agents.js";
 import { SubagentInspector, sanitizeTerminalText, type InspectorHandle } from "./ui.js";
+
+type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+
+function isThinkingLevel(value: unknown): value is ThinkingLevel {
+	return value === "off" || value === "minimal" || value === "low" || value === "medium" || value === "high" || value === "xhigh";
+}
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const childExtensionPath = join(__dirname, "child.ts");
@@ -58,7 +55,7 @@ interface RpcPendingRequest {
 
 interface SubagentHandle {
 	id: string;
-	agent: AgentConfig;
+	name?: string;
 	task: string;
 	cwd: string;
 	state: SubagentState;
@@ -105,10 +102,7 @@ interface SubagentHandle {
 
 interface SerializableHandle {
 	id: string;
-	name: string;
-	agent: string;
-	source: string;
-	sourcePath: string;
+	name?: string;
 	state: SubagentState;
 	killing: boolean;
 	task: string;
@@ -144,7 +138,6 @@ interface SerializableHandle {
 }
 
 interface TaskSpec {
-	agent?: string;
 	name?: string;
 	task: string;
 	cwd?: string;
@@ -166,8 +159,6 @@ interface SubagentModelInfo {
 	maxTokens: number;
 }
 
-type AgentDiscovery = Awaited<ReturnType<typeof discoverAgents>>;
-
 function now(): number {
 	return Date.now();
 }
@@ -186,14 +177,6 @@ function formatActualModel(model: ActualModel): string {
 
 function createUsage(): UsageStats {
 	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
-}
-
-function safeFileFragment(value: string): string {
-	const normalized = value
-		.toLowerCase()
-		.replace(/[^a-z0-9._-]+/g, "-")
-		.replace(/^-+|-+$/g, "");
-	return normalized || "subagent";
 }
 
 function hashText(text: string): string {
@@ -328,14 +311,13 @@ function isRpcResponse(value: unknown): value is Record<string, any> {
 const ThinkingSchema = StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"] as const);
 
 const TaskSpecSchema = Type.Object({
-	agent: Type.Optional(Type.String({ description: "Optional predefined subagent name to use as a base" })),
-	name: Type.Optional(Type.String({ description: "Optional display name for an ad hoc subagent" })),
+	name: Type.Optional(Type.String({ description: "Optional display name for the child" })),
 	task: Type.String({ minLength: 1, description: "Focused task to delegate" }),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the child process" })),
 	model: Type.Optional(Type.String({ description: "Optional child model override in provider/model form" })),
 	thinking: Type.Optional(ThinkingSchema),
 	tools: Type.Optional(Type.Array(Type.String(), { description: "Optional active-tool narrowing for the child" })),
-	systemPrompt: Type.Optional(Type.String({ description: "Optional ad hoc prompt appended to the predefined role" })),
+	systemPrompt: Type.Optional(Type.String({ description: "Optional direct delegated guidance for the child" })),
 });
 
 const ListSchema = Type.Object({
@@ -413,7 +395,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			const model = formatActualModel(handle.actualModel!);
 			const elapsedSeconds = Math.max(0, Math.floor((now() - handle.createdAt) / 1000));
 			const elapsed = `${Math.floor(elapsedSeconds / 60)}:${String(elapsedSeconds % 60).padStart(2, "0")}`;
-			return `${theme.fg("warning", icon)} ${handle.id} ${theme.bold(sanitizeTerminalText(handle.agent.name))}  ${elapsed}  ${theme.fg("muted", `${model} · thinking:${handle.actualThinking}`)}  ${sanitizeTerminalText(activityLabel(handle))}`;
+			const label = handle.name ? ` ${theme.bold(sanitizeTerminalText(handle.name))}` : "";
+			return `${theme.fg("warning", icon)} ${handle.id}${label}  ${elapsed}  ${theme.fg("muted", `${model} · thinking:${handle.actualThinking}`)}  ${sanitizeTerminalText(activityLabel(handle))}`;
 		});
 		if (active.length > MAX_WIDGET_ITEMS) lines.push(theme.fg("dim", `… ${active.length - MAX_WIDGET_ITEMS} more active subagents`));
 		ctx.ui.setWidget("subagent", lines);
@@ -762,10 +745,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		const transcript = await transcriptStatus(handle);
 		return {
 			id: handle.id,
-			name: handle.agent.name,
-			agent: handle.agent.name,
-			source: handle.agent.source,
-			sourcePath: handle.agent.filePath,
+			name: handle.name,
 			state: handle.state,
 			killing: !!handle.killRequestedAt && !handle.completionSettled,
 			task: handle.task,
@@ -809,10 +789,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		if (!handle.actualModel || !handle.actualThinking || !handle.sessionPath) return undefined;
 		return {
 			id: handle.id,
-			name: handle.agent.name,
-			agent: handle.agent.name,
-			source: handle.agent.source,
-			sourcePath: handle.agent.filePath,
+			name: handle.name,
 			state: handle.state,
 			killing: !!handle.killRequestedAt && !handle.completionSettled,
 			task: handle.task,
@@ -851,8 +828,9 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		const serial = await serializeHandle(handle);
 		const duration = Math.max(0, Math.floor(((serial.completedAt || now()) - serial.createdAt) / 1000));
 		const activity = serial.killing ? "killing" : serial.currentTool || serial.lastTool || (serial.isStreaming ? "responding" : "idle");
+		const label = serial.name ? ` ${serial.name}` : "";
 		const lines = [
-			`#${serial.id} ${serial.name} ${serial.killing ? "killing" : serial.state} (${Math.floor(duration / 60)}:${String(duration % 60).padStart(2, "0")})`,
+			`#${serial.id}${label} ${serial.killing ? "killing" : serial.state} (${Math.floor(duration / 60)}:${String(duration % 60).padStart(2, "0")})`,
 			`  actual ${formatActualModel(serial.actualModel)} · thinking:${serial.actualThinking} · ${activity}`,
 			`  session ${serial.sessionPath} (${serial.transcriptNote})`,
 			`  prompt ${serial.promptPath}`,
@@ -869,9 +847,9 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		return (await Promise.all(selected.map((handle) => formatHandleSummary(handle)))).join("\n\n");
 	}
 
-	function getRequestedChildTools(agent: AgentConfig): string[] {
+	function getRequestedChildTools(tools: string[] | undefined): string[] {
 		const parentActiveTools = new Set(pi.getActiveTools());
-		const requested = agent.tools && agent.tools.length > 0 ? agent.tools : Array.from(parentActiveTools);
+		const requested = tools && tools.length > 0 ? tools : Array.from(parentActiveTools);
 		return requested.filter((toolName) => parentActiveTools.has(toolName));
 	}
 
@@ -899,75 +877,20 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		}
 	}
 
-	async function getAgents(ctx: ExtensionContext, cwd = ctx.cwd): Promise<AgentDiscovery> {
-		return discoverAgents(cwd, __dirname);
-	}
-
-	function selectedAgentDiagnostic(discovery: AgentDiscovery, agent: AgentConfig): AgentDiscoveryDiagnostic | undefined {
-		return discovery.diagnostics.find((diagnostic) => diagnostic.agent === agent.name && diagnostic.sourcePath === agent.filePath);
-	}
-
-	async function materializeAgent(
+	function validateSubagentSpec(
 		ctx: ExtensionContext,
 		spec: TaskSpec,
-	): Promise<{ discovery: AgentDiscovery; agent?: AgentConfig; error?: string; diagnostic?: AgentDiscoveryDiagnostic }> {
-		const cwd = spec.cwd || ctx.cwd;
-		const discovery = await getAgents(ctx, cwd);
-		const base = spec.agent ? discovery.agents.find((candidate) => candidate.name === spec.agent) : undefined;
-		if (spec.agent && !base) return { discovery, error: `Unknown subagent: ${spec.agent}` };
-		if (base) {
-			const diagnostic = selectedAgentDiagnostic(discovery, base);
-			if (diagnostic) {
-				return {
-					discovery,
-					diagnostic,
-					error: `Invalid selected-agent frontmatter: ${JSON.stringify(diagnostic)}`,
-				};
-			}
-		}
-
-		const defaultPrompt = `You are an ad hoc delegated subagent working in an isolated context.
-- Stay tightly scoped to the assigned task.
-- Be concise and high-signal.
-- Use tools as needed, but avoid unnecessary work.
-- Return a definitive answer useful to the parent agent.
-- Never call subagent_start from within a subagent; nested delegation is disabled.`;
-		return {
-			discovery,
-			agent: {
-				name: spec.name || base?.name || "adhoc",
-				description: base?.description || "Ad hoc delegated subagent",
-				tools: spec.tools && spec.tools.length > 0 ? spec.tools : base?.tools,
-				model: spec.model ?? base?.model,
-				thinking: spec.thinking ?? base?.thinking,
-				systemPrompt: [base?.systemPrompt || defaultPrompt, spec.systemPrompt || ""].filter(Boolean).join("\n\n"),
-				source: base?.source || "builtin",
-				filePath: base?.filePath || "(ad hoc)",
-			},
-		};
-	}
-
-	async function materializeValidatedAgent(
-		ctx: ExtensionContext,
-		spec: TaskSpec,
-	): Promise<{ discovery: AgentDiscovery; agent?: AgentConfig; requestedModel?: string; requestedThinking?: ThinkingLevel; error?: string; diagnostic?: AgentDiscoveryDiagnostic }> {
-		const materialized = await materializeAgent(ctx, spec);
-		if (!materialized.agent) return materialized;
-		const requestedModel = materialized.agent.model || getParentModel(ctx);
-		if (!requestedModel) return { ...materialized, error: "No parent model is selected, and this subagent did not specify model." };
+	): { requestedModel?: string; requestedThinking?: ThinkingLevel; error?: string } {
+		const requestedModel = spec.model || getParentModel(ctx);
+		if (!requestedModel) return { error: "No parent model is selected, and this subagent did not specify model." };
 		const resolvedModel = resolveKnownModel(ctx, requestedModel);
-		if (!resolvedModel.ref) return { ...materialized, error: resolvedModel.error || "Invalid subagent model." };
-		const requestedThinking = materialized.agent.thinking || pi.getThinkingLevel();
-		if (!isThinkingLevel(requestedThinking)) return { ...materialized, error: `Invalid requested thinking level: ${String(requestedThinking)}` };
-		return {
-			...materialized,
-			agent: { ...materialized.agent, model: resolvedModel.ref, thinking: requestedThinking },
-			requestedModel: resolvedModel.ref,
-			requestedThinking,
-		};
+		if (!resolvedModel.ref) return { error: resolvedModel.error || "Invalid subagent model." };
+		const requestedThinking = spec.thinking || pi.getThinkingLevel();
+		if (!isThinkingLevel(requestedThinking)) return { error: `Invalid requested thinking level: ${String(requestedThinking)}` };
+		return { requestedModel: resolvedModel.ref, requestedThinking };
 	}
 
-	async function spawnSubagent(agent: AgentConfig, task: string, cwd: string, requestedModel: string, requestedThinking: ThinkingLevel): Promise<SubagentHandle> {
+	async function spawnSubagent(spec: TaskSpec, cwd: string, requestedModel: string, requestedThinking: ThinkingLevel): Promise<SubagentHandle> {
 		const cwdError = await validateCwd(cwd);
 		if (cwdError) throw new Error(cwdError);
 		const id = createId();
@@ -978,13 +901,13 @@ export default function subagentExtension(pi: ExtensionAPI) {
 
 		const handle: SubagentHandle = {
 			id,
-			agent,
-			task,
+			name: spec.name?.trim() || undefined,
+			task: spec.task,
 			cwd,
 			state: "starting",
 			requestedModel,
 			requestedThinking,
-			configuredTools: getRequestedChildTools(agent),
+			configuredTools: getRequestedChildTools(spec.tools),
 			sessionDir,
 			promptPath,
 			resultText: "",
@@ -1010,8 +933,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				"rpc",
 				"--session-dir",
 				sessionDir,
-				"--name",
-				`${safeFileFragment(agent.name)}-${id.slice(0, 6)}`,
 				"--extension",
 				childExtensionPath,
 				"--model",
@@ -1028,8 +949,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				shell: false,
 				env: {
 					...process.env,
-					PI_SUBAGENT_AGENT_NAME: agent.name,
-					PI_SUBAGENT_SYSTEM_PROMPT: agent.systemPrompt,
+					PI_SUBAGENT_CHILD: "1",
+					PI_SUBAGENT_SYSTEM_PROMPT: spec.systemPrompt || "",
 					PI_SUBAGENT_ACTIVE_TOOLS: handle.configuredTools.join(","),
 					PI_SUBAGENT_DEPTH: String(getSubagentDepth() + 1),
 					PI_SUBAGENT_PROMPT_PATH: promptPath,
@@ -1049,7 +970,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			handle.sessionPath = sessionPath;
 			handle.rpcReadyAt = now();
 			updateHandle(handle);
-			await requestRpc(handle, "prompt", { message: task }, STARTUP_TIMEOUT_MS);
+			await requestRpc(handle, "prompt", { message: spec.task }, STARTUP_TIMEOUT_MS);
 			if (handle.state === "starting") handle.state = "running";
 			updateHandle(handle);
 			return handle;
@@ -1105,7 +1026,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		if (!message.trim()) throw new Error("Steering message must not be empty.");
 		await requestRpc(handle, "steer", { message: message.trim() }, RPC_TIMEOUT_MS);
 		updateHandle(handle);
-		return `Pi accepted steering for #${handle.id} (${handle.agent.name}); it will be applied at Pi's next safe point.`;
+		const label = handle.name ? ` (${handle.name})` : "";
+		return `Pi accepted steering for #${handle.id}${label}; it will be applied at Pi's next safe point.`;
 	}
 
 	function clearFinishedHandles(): number {
@@ -1121,7 +1043,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		rememberContext(ctx);
-		clearAgentDiscoveryCache();
 		refreshUi();
 	});
 
@@ -1134,7 +1055,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 
 	pi.on("before_agent_start", async (event, ctx) => {
 		rememberContext(ctx);
-		const discovery = await getAgents(ctx);
 		const guidance = isNestedSubagent()
 			? `\n\nSubagent extension is loaded in this delegated child to preserve the parent environment.
 You are already inside a subagent. Never call subagent_start from within a subagent.
@@ -1143,9 +1063,7 @@ If further delegation seems useful, report that back to the parent agent instead
 Only use subagent_start when the user explicitly asks to delegate work. It starts in the background after a bounded startup handshake.
 Use subagent_list and subagent_status to inspect children. Use subagent_wait with a required finite timeoutSeconds when waiting; timeout or cancellation never kills a child. Use subagent_steer to redirect running work and subagent_kill only to terminate it.
 Use list_models to inspect exact accepted child model IDs before setting model when needed.
-A subagent call may reference a predefined agent via {agent: "name", ...} or be ad hoc by omitting agent and providing task plus optional systemPrompt/tools/model/thinking overrides.
-Model and thinking precedence is per-call, then predefined agent, then parent session. Nested delegation is blocked.
-Available predefined subagents:\n${formatAgentList(discovery.agents, 20)}`;
+A subagent call requires task. Its optional name is only a display label; cwd, systemPrompt, tools, model, and thinking are direct per-call controls. Model and thinking default to the parent session. Nested delegation is blocked.`;
 		return { systemPrompt: event.systemPrompt + guidance };
 	});
 
@@ -1164,24 +1082,16 @@ Available predefined subagents:\n${formatAgentList(discovery.agents, 20)}`;
 			rememberContext(ctx);
 			if (isNestedSubagent()) return nestedDelegationBlocked();
 			const spec = params as TaskSpec;
-			const materialized = await materializeValidatedAgent(ctx, spec);
-			if (!materialized.agent || !materialized.requestedModel || !materialized.requestedThinking) {
-				return {
-					content: [{ type: "text", text: `${materialized.error || "Invalid subagent spec"}\n\nAvailable subagents:\n${formatAgentList(materialized.discovery.agents)}` }],
-					details: { diagnostic: materialized.diagnostic },
-				};
+			const validated = validateSubagentSpec(ctx, spec);
+			if (!validated.requestedModel || !validated.requestedThinking) {
+				return { content: [{ type: "text", text: validated.error || "Invalid subagent spec" }], details: {} };
 			}
 			try {
-				const handle = await spawnSubagent(
-					materialized.agent,
-					spec.task,
-					spec.cwd || ctx.cwd,
-					materialized.requestedModel,
-					materialized.requestedThinking,
-				);
+				const handle = await spawnSubagent(spec, spec.cwd || ctx.cwd, validated.requestedModel, validated.requestedThinking);
 				const serial = await serializeHandle(handle);
+				const label = serial.name ? ` (${serial.name})` : "";
 				return {
-					content: [{ type: "text", text: sanitizeTerminalText(`Started subagent #${serial.id} (${serial.name}) in the background. Actual ${formatActualModel(serial.actualModel)} · thinking:${serial.actualThinking}. Session: ${serial.sessionPath} (${serial.transcriptNote}). Use subagent_status, subagent_wait with timeoutSeconds, subagent_steer, or subagent_kill to control it.`) }],
+					content: [{ type: "text", text: sanitizeTerminalText(`Started subagent #${serial.id}${label} in the background. Actual ${formatActualModel(serial.actualModel)} · thinking:${serial.actualThinking}. Session: ${serial.sessionPath} (${serial.transcriptNote}). Use subagent_status, subagent_wait with timeoutSeconds, subagent_steer, or subagent_kill to control it.`) }],
 					details: { handle: serial },
 				};
 			} catch (error) {
@@ -1303,11 +1213,13 @@ Available predefined subagents:\n${formatAgentList(discovery.agents, 20)}`;
 			const handle = handles.get(params.id);
 			if (!handle) return { content: [{ type: "text", text: `Unknown subagent id: ${params.id}` }], details: {} };
 			if (!isHandleActive(handle)) {
-				return { content: [{ type: "text", text: `Subagent #${handle.id} (${handle.agent.name}) is already ${handle.state}.` }], details: { handle: handle.actualModel ? await serializeHandle(handle) : undefined } };
+				const label = handle.name ? ` (${handle.name})` : "";
+				return { content: [{ type: "text", text: `Subagent #${handle.id}${label} is already ${handle.state}.` }], details: { handle: handle.actualModel ? await serializeHandle(handle) : undefined } };
 			}
 			const result = await terminateHandle(handle, "Killed via subagent_kill");
+			const label = result.name ? ` (${result.name})` : "";
 			return {
-				content: [{ type: "text", text: sanitizeTerminalText(`Terminated subagent #${result.id} (${result.agent.name}); ${resultKind(result) === "partial" ? "partial result was preserved" : "no assistant result was captured"}.\n\n${await formatHandleSummary(result)}`) }],
+				content: [{ type: "text", text: sanitizeTerminalText(`Terminated subagent #${result.id}${label}; ${resultKind(result) === "partial" ? "partial result was preserved" : "no assistant result was captured"}.\n\n${await formatHandleSummary(result)}`) }],
 				details: { handle: await serializeHandle(result) },
 			};
 		},
@@ -1339,7 +1251,8 @@ Available predefined subagents:\n${formatAgentList(discovery.agents, 20)}`;
 						kill: async (id) => {
 							const handle = handles.get(id);
 							if (!handle || !isHandleActive(handle)) return `Kill unavailable: #${id} is not active.`;
-							const confirmed = await ctx.ui.confirm("Kill subagent?", sanitizeTerminalText(`Abort and force-terminate #${id} (${handle.agent.name}) if needed. Persisted artifacts are kept.`));
+							const label = handle.name ? ` (${handle.name})` : "";
+							const confirmed = await ctx.ui.confirm("Kill subagent?", sanitizeTerminalText(`Abort and force-terminate #${id}${label} if needed. Persisted artifacts are kept.`));
 							if (!confirmed) return "Kill canceled.";
 							await terminateHandle(handle, "Killed from /subagents");
 							return `Killed #${id}; artifacts were kept.`;

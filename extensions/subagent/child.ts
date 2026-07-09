@@ -2,7 +2,6 @@ import * as fs from "node:fs/promises";
 import { dirname } from "node:path";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
-const agentName = process.env.PI_SUBAGENT_AGENT_NAME || "subagent";
 const delegatedPrompt = process.env.PI_SUBAGENT_SYSTEM_PROMPT || "";
 const promptPath = process.env.PI_SUBAGENT_PROMPT_PATH;
 const hasInheritedActiveTools = process.env.PI_SUBAGENT_ACTIVE_TOOLS !== undefined;
@@ -38,7 +37,7 @@ export default function childSubagentExtension(pi: ExtensionAPI) {
 		applyInheritedActiveTools();
 		const sections = [event.systemPrompt];
 		if (delegatedPrompt.trim()) {
-			sections.push(`Delegated subagent role (${agentName}):\n${delegatedPrompt.trim()}`);
+			sections.push(`Direct delegated guidance:\n${delegatedPrompt.trim()}`);
 		}
 		sections.push(`Subagent execution rules:
 - You are handling a delegated subtask for a parent agent.

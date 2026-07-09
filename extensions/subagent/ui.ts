@@ -3,10 +3,7 @@ import { Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, type 
 
 export interface InspectorHandle {
 	id: string;
-	name: string;
-	agent: string;
-	source: string;
-	sourcePath: string;
+	name?: string;
 	state: "starting" | "running" | "done" | "error" | "killed";
 	killing: boolean;
 	task: string;
@@ -262,7 +259,8 @@ export class SubagentInspector implements Focusable {
 			const model = `${handle.actualModel.provider}/${handle.actualModel.id}`;
 			const state = handle.killing ? "killing" : handle.state;
 			const result = handle.resultKind === "partial" ? " · partial result" : handle.resultKind === "final" ? " · final result" : "";
-			const row = sanitizeTerminalText(`${icon} ${handle.id} ${handle.name} ${state} ${elapsed(handle.createdAt, handle.completedAt)} ${model} · thinking:${handle.actualThinking} · ${activity}${result}`);
+			const label = handle.name ? ` ${handle.name}` : "";
+			const row = sanitizeTerminalText(`${icon} ${handle.id}${label} ${state} ${elapsed(handle.createdAt, handle.completedAt)} ${model} · thinking:${handle.actualThinking} · ${activity}${result}`);
 			const rendered = truncateToWidth(row, width, "…");
 			return selected ? this.theme.fg("accent", `› ${rendered}`) : `  ${rendered}`;
 		});
@@ -272,8 +270,7 @@ export class SubagentInspector implements Focusable {
 		const handle = this.selected();
 		if (!handle) return ["Selected handle no longer exists."];
 		const rows = [
-			`Agent: ${handle.name} (${handle.source})`,
-			`Source: ${handle.sourcePath}`,
+			`Display name: ${handle.name || "(none)"}`,
 			`State: ${handle.killing ? "killing" : handle.state}`,
 			`Task: ${handle.task}`,
 			`Cwd: ${handle.cwd}`,
@@ -302,9 +299,7 @@ export class SubagentInspector implements Focusable {
 		if (!handle) return ["Selected handle no longer exists."];
 		const header = [
 			"Pi effective system prompt",
-			`Agent: ${handle.name}`,
-			`Source: ${handle.source}`,
-			`Source path: ${handle.sourcePath}`,
+			`Display name: ${handle.name || "(none)"}`,
 			"",
 			"Delegated task",
 			handle.task,

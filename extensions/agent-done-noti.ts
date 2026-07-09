@@ -59,6 +59,8 @@ function formatStatus(mobileEnabled: boolean): string {
 }
 
 export default function agentDoneNoti(pi: ExtensionAPI) {
+	if (process.env.PI_SUBAGENT_CHILD === "1") return;
+
 	let mobileEnabled = false;
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	// Set when compaction interrupts a pending notification, so we know to

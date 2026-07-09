@@ -1,6 +1,6 @@
 # subagent
 
-A Pi extension for isolated, background-first subagents.
+A Pi extension for isolated, background-first delegated work.
 
 ## What it does
 
@@ -14,11 +14,16 @@ A Pi extension for isolated, background-first subagents.
 
 Each child runs in a private directory below Pi agent data (`<agent-dir>/sessions/subagents/<id>/`, permissions `0700`). Prompt and result sidecars use `0600` permissions. The session path returned by `get_state.sessionFile` is authoritative even before its JSONL exists. Pi may create that file only after it persists the first assistant message, so an early failure or kill can legitimately leave **no persisted transcript yet**.
 
+Children receive `PI_SUBAGENT_CHILD=1`. This disables the `agent-done-noti` extension in the child while leaving its parent behavior unchanged.
+
 ## Tools
 
 - `subagent_start`
   - only use when the user explicitly asks to delegate work
-  - starts one background child with `{ agent?, name?, task, cwd?, model?, thinking?, tools?, systemPrompt? }`
+  - starts one background child with `{ task, name?, cwd?, model?, thinking?, tools?, systemPrompt? }`
+  - `task` is required; all other fields are direct per-call configuration
+  - `name` is an optional display label only
+  - `systemPrompt` is optional direct delegated guidance
   - returns the ID, PID, actual model/thinking, allocated session path, prompt path, and timestamps after startup succeeds
   - nested delegation is blocked
 - `subagent_list`
@@ -43,41 +48,11 @@ Each child runs in a private directory below Pi agent data (`<agent-dir>/session
 
 Use the shared `list_models` tool to discover exact accepted model IDs. There is no subagent-specific model-discovery tool.
 
-## Model and thinking selection
+## Model, thinking, and tools
 
-For both values, precedence is:
+For model and thinking, direct per-call values override the current parent session. The extension resolves and validates the selected model before spawning. It passes model and thinking separately to the child, then exposes the child’s actual `get_state.model` and `get_state.thinkingLevel` in every successful start/list/status record. An unavailable model or a startup `get_state` response without model or session path fails launch and cleans up the child.
 
-1. per-call override
-2. predefined-agent frontmatter
-3. current parent session
-
-The extension resolves and validates the selected model before spawning. It passes model and thinking separately to the child, then exposes the child’s actual `get_state.model` and `get_state.thinkingLevel` in every successful start/list/status record. An unavailable model or a startup `get_state` response without model or session path fails launch and cleans up the child.
-
-## Starter and custom agents
-
-This extension ships with `scout` and `reviewer`.
-
-Agent lookup order is:
-
-1. built-ins in `extensions/subagent/agents/`
-2. user overrides in `~/.pi/agent/subagents/`
-3. project overrides in the nearest `.pi/subagents/`
-
-Higher-priority locations override lower ones by name. Existing active-tool inheritance is preserved; an agent or call can narrow it with `tools`.
-
-```md
----
-name: cheap-scout
-description: Fast reconnaissance agent for broad code search
-tools: read,grep,find,ls
-model: anthropic/claude-haiku-4-5
-thinking: low
----
-
-You are a fast reconnaissance specialist...
-```
-
-`thinking` must be one of `off`, `minimal`, `low`, `medium`, `high`, or `xhigh`. Invalid selected-agent frontmatter is reported as a structured discovery diagnostic containing the agent, source path, field, and message; it is never silently ignored.
+A child inherits the parent’s active tools by default. A per-call `tools` list can narrow that set to tools active in the parent.
 
 ## Lifecycle
 
@@ -88,8 +63,8 @@ The child extension has no `update_status` tool and no progress-reporting prompt
 ## Commands
 
 - `/subagents` opens a TUI-only selectable inspector:
-  - overview with metadata and paths
-  - complete captured **Pi effective system prompt**, agent/source/source path provenance, and delegated task
+  - overview with the optional display name, metadata, and paths
+  - complete captured **Pi effective system prompt** and delegated task
   - read-only, live JSONL transcript that tolerates a partial final record
   - `s` opens steering input for active children
   - `x` confirms kill for active children
