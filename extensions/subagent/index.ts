@@ -1,27 +1,44 @@
 import { createHash, randomBytes } from "node:crypto";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { promises as fs } from "node:fs";
-import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { Key, matchesKey, truncateToWidth, visibleWidth, type Focusable, type KeybindingsManager, type TUI } from "@mariozechner/pi-tui";
+import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "@sinclair/typebox";
-import { clearAgentDiscoveryCache, discoverAgents, formatAgentList, type AgentConfig } from "./agents.js";
+import {
+	clearAgentDiscoveryCache,
+	discoverAgents,
+	formatAgentList,
+	isThinkingLevel,
+	type AgentConfig,
+	type AgentDiscoveryDiagnostic,
+	type ThinkingLevel,
+} from "./agents.js";
+import { SubagentInspector, sanitizeTerminalText, type InspectorHandle } from "./ui.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const childExtensionPath = join(__dirname, "child.ts");
 
-const MAX_PARALLEL_TASKS = 64;
-const MAX_CONCURRENCY = 4;
-const MAX_WIDGET_ITEMS = 12;
 const MAX_RETAINED_HANDLES = 24;
-const INLINE_RESULT_MAX = 4_000;
+const MAX_WIDGET_ITEMS = 12;
+const STARTUP_TIMEOUT_MS = 10_000;
+const RPC_TIMEOUT_MS = 10_000;
+const ABORT_ACK_TIMEOUT_MS = 1_000;
+const TERM_DEADLINE_MS = 1_500;
+const KILL_DEADLINE_MS = 4_000;
+const SETTLEMENT_DEADLINE_MS = 6_000;
 const RESULT_PREVIEW_MAX = 1_200;
-const SERIALIZED_RESULT_PREVIEW_MAX = 200;
-const RESULT_FILE_DIR = "pi-subagent-results";
+const SERIALIZED_RESULT_PREVIEW_MAX = 240;
 
 type SubagentState = "starting" | "running" | "done" | "error" | "killed";
+type ResultKind = "none" | "final" | "partial";
+
+interface ActualModel {
+	provider: string;
+	id: string;
+	name?: string;
+}
 
 interface UsageStats {
 	input: number;
@@ -32,48 +49,98 @@ interface UsageStats {
 	turns: number;
 }
 
+interface RpcPendingRequest {
+	command: string;
+	resolve: (response: Record<string, any>) => void;
+	reject: (error: Error) => void;
+	timer: NodeJS.Timeout;
+}
+
 interface SubagentHandle {
 	id: string;
 	agent: AgentConfig;
 	task: string;
 	cwd: string;
 	state: SubagentState;
-	statusText: string;
-	lastTool?: string;
+	requestedModel: string;
+	requestedThinking: ThinkingLevel;
+	configuredTools: string[];
+	sessionDir: string;
+	promptPath: string;
+	actualModel?: ActualModel;
+	actualThinking?: ThinkingLevel;
+	sessionPath?: string;
+	transcriptPersisted?: boolean;
 	resultText: string;
 	resultPath?: string;
 	persistedResultHash?: string;
 	stderr: string;
+	diagnostics: string[];
 	error?: string;
 	stopReason?: string;
-	model?: string;
+	pid?: number;
 	exitCode?: number;
-	startedAt: number;
-	updatedAt: number;
+	createdAt: number;
+	rpcReadyAt?: number;
+	agentStartedAt?: number;
+	lastActivityAt: number;
+	completedAt?: number;
+	currentTool?: string;
+	currentToolStartedAt?: number;
+	lastTool?: string;
+	activeTools: Map<string, { name: string; startedAt: number }>;
+	isStreaming: boolean;
 	usage: UsageStats;
 	process?: ChildProcessWithoutNullStreams;
-	completionSettled?: boolean;
+	requestSequence: number;
+	pendingRequests: Map<string, RpcPendingRequest>;
+	completionSettled: boolean;
 	completionPromise?: Promise<SubagentHandle>;
-	waiters: Array<{ resolve: (handle: SubagentHandle) => void; timer?: NodeJS.Timeout }>;
+	waiters: Set<() => void>;
+	killRequestedAt?: number;
+	terminationPromise?: Promise<SubagentHandle>;
+	terminationTimers: Set<NodeJS.Timeout>;
+	agentEndedAt?: number;
 }
 
 interface SerializableHandle {
 	id: string;
+	name: string;
 	agent: string;
 	source: string;
+	sourcePath: string;
 	state: SubagentState;
+	killing: boolean;
 	task: string;
-	statusText: string;
-	lastTool?: string;
-	resultText: string;
-	resultPath?: string;
-	error?: string;
-	stopReason?: string;
-	model?: string;
+	cwd: string;
+	pid?: number;
 	exitCode?: number;
-	startedAt: number;
-	updatedAt: number;
+	requestedModel: string;
+	requestedThinking: ThinkingLevel;
+	actualModel: ActualModel;
+	actualThinking: ThinkingLevel;
+	configuredTools: string[];
+	sessionPath: string;
+	promptPath: string;
+	resultPath?: string;
+	resultKind: ResultKind;
+	transcriptPersisted: boolean;
+	transcriptNote: string;
+	createdAt: number;
+	rpcReadyAt?: number;
+	agentStartedAt?: number;
+	lastActivityAt: number;
+	completedAt?: number;
+	currentTool?: string;
+	currentToolStartedAt?: number;
+	lastTool?: string;
+	isStreaming: boolean;
 	usage: UsageStats;
+	stopReason?: string;
+	error?: string;
+	stderrPreview?: string;
+	resultPreview?: string;
+	diagnostics?: string[];
 }
 
 interface TaskSpec {
@@ -82,6 +149,7 @@ interface TaskSpec {
 	task: string;
 	cwd?: string;
 	model?: string;
+	thinking?: ThinkingLevel;
 	tools?: string[];
 	systemPrompt?: string;
 }
@@ -105,11 +173,93 @@ function now(): number {
 }
 
 function createId(): string {
-	return randomBytes(3).toString("hex");
+	return randomBytes(4).toString("hex");
 }
 
 function formatModelRef(provider: string, modelId: string): string {
 	return `${provider}/${modelId}`;
+}
+
+function formatActualModel(model: ActualModel): string {
+	return sanitizeTerminalText(`${model.provider}/${model.id}`);
+}
+
+function createUsage(): UsageStats {
+	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
+}
+
+function safeFileFragment(value: string): string {
+	const normalized = value
+		.toLowerCase()
+		.replace(/[^a-z0-9._-]+/g, "-")
+		.replace(/^-+|-+$/g, "");
+	return normalized || "subagent";
+}
+
+function hashText(text: string): string {
+	return createHash("sha1").update(text).digest("hex");
+}
+
+function truncate(text: string | undefined, max = 120): string {
+	const normalized = (text || "").replace(/\s+/g, " ").trim();
+	if (!normalized) return "";
+	return normalized.length > max ? `${normalized.slice(0, max - 1)}…` : normalized;
+}
+
+function previewResult(text: string, max = RESULT_PREVIEW_MAX): string {
+	if (text.length <= max) return text;
+	return `${text.slice(0, max).trimEnd()}\n…`;
+}
+
+function extractText(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.map((part) => {
+			if (!part || typeof part !== "object") return "";
+			const block = part as Record<string, unknown>;
+			return block.type === "text" && typeof block.text === "string" ? block.text : "";
+		})
+		.filter(Boolean)
+		.join("\n");
+}
+
+/**
+ * RPC message updates are snapshots. Keep the longest non-empty snapshot so a
+ * late empty or stale-shorter update cannot erase already captured output.
+ */
+function retainAssistantText(handle: SubagentHandle, candidate: string): void {
+	if (!candidate || candidate.length < handle.resultText.length) return;
+	if (candidate.length === handle.resultText.length && candidate === handle.resultText) return;
+	handle.resultText = candidate;
+}
+
+function isHandleActive(handle: SubagentHandle): boolean {
+	return !handle.completionSettled && (handle.state === "starting" || handle.state === "running");
+}
+
+function isTerminal(handle: SubagentHandle): boolean {
+	return handle.state === "done" || handle.state === "error" || handle.state === "killed";
+}
+
+function resultKind(handle: SubagentHandle): ResultKind {
+	if (!handle.resultText) return "none";
+	return handle.state === "done" && !handle.killRequestedAt ? "final" : "partial";
+}
+
+function getPiInvocation(args: string[]): { command: string; args: string[] } {
+	const configuredBinary = process.env.PI_SUBAGENT_PI_BIN;
+	if (configuredBinary) return { command: configuredBinary, args };
+	const currentScript = process.argv[1];
+	const looksLikeScriptPath =
+		typeof currentScript === "string" &&
+		!currentScript.startsWith("-") &&
+		(currentScript.includes("/") || currentScript.endsWith(".js") || currentScript.endsWith(".mjs"));
+	if (looksLikeScriptPath) return { command: process.execPath, args: [currentScript, ...args] };
+
+	const execName = basename(process.execPath).toLowerCase();
+	if (!/^(node|bun)(\.exe)?$/.test(execName)) return { command: process.execPath, args };
+	return { command: "pi", args };
 }
 
 function getKnownModels(ctx: ExtensionContext): SubagentModelInfo[] {
@@ -132,24 +282,20 @@ function getKnownModels(ctx: ExtensionContext): SubagentModelInfo[] {
 function resolveKnownModel(ctx: ExtensionContext, rawModel: string): { ref?: string; error?: string } {
 	const model = rawModel.trim();
 	const known = getKnownModels(ctx);
-	if (known.length === 0) {
-		return { error: "No models are configured. Use pi model configuration or --list-models first." };
-	}
+	if (!model) return { error: "A child model is required, but the selected model is empty." };
+	if (known.length === 0) return { error: "No models are configured. Use list_models to inspect configured models." };
 
 	const lower = model.toLowerCase();
 	const exact = known.find((candidate) => candidate.ref.toLowerCase() === lower);
 	if (exact) {
-		if (!exact.available) {
-			return { error: `Model \"${exact.ref}\" is known but unavailable in this session. Choose an available model from list_models.` };
-		}
+		if (!exact.available) return { error: `Model \"${exact.ref}\" is known but unavailable. Use list_models to choose an available model.` };
 		return { ref: exact.ref };
 	}
 
 	const slashIndex = model.indexOf("/");
 	if (slashIndex !== -1) {
 		const provider = model.slice(0, slashIndex);
-		const knownProvider = known.find((candidate) => candidate.provider.toLowerCase() === provider.toLowerCase());
-		if (!knownProvider) {
+		if (!known.some((candidate) => candidate.provider.toLowerCase() === provider.toLowerCase())) {
 			return { error: `Unknown provider \"${provider}\". Use list_models to inspect valid models.` };
 		}
 		return { error: `Unknown model \"${model}\". Use list_models to inspect valid models.` };
@@ -157,473 +303,570 @@ function resolveKnownModel(ctx: ExtensionContext, rawModel: string): { ref?: str
 
 	const byId = known.filter((candidate) => candidate.id.toLowerCase() === lower);
 	if (byId.length === 1) {
-		if (!byId[0]!.available) {
-			return { error: `Model \"${byId[0]!.ref}\" is known but unavailable in this session. Choose an available model from list_models.` };
-		}
+		if (!byId[0]!.available) return { error: `Model \"${byId[0]!.ref}\" is known but unavailable. Use list_models to choose an available model.` };
 		return { ref: byId[0]!.ref };
 	}
-	if (byId.length > 1) {
-		return { error: `Model \"${model}\" is ambiguous. Use a full provider/model id from list_models.` };
-	}
-
+	if (byId.length > 1) return { error: `Model \"${model}\" is ambiguous. Use a full provider/model ID from list_models.` };
 	return { error: `Unknown model \"${model}\". Use list_models to inspect valid models.` };
 }
 
-function truncate(text: string | undefined, max = 80): string {
-	const value = (text || "").replace(/\s+/g, " ").trim();
-	if (!value) return "";
-	return value.length > max ? `${value.slice(0, max - 1)}…` : value;
+function getParentModel(ctx: ExtensionContext): string | undefined {
+	return ctx.model ? formatModelRef(ctx.model.provider, ctx.model.id) : undefined;
 }
 
-function safeFileFragment(value: string | undefined): string {
-	const normalized = (value || "")
-		.toLowerCase()
-		.replace(/[^a-z0-9._-]+/g, "-")
-		.replace(/^-+|-+$/g, "");
-	return normalized || "subagent";
+function asActualModel(value: unknown): ActualModel | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	const model = value as { provider?: unknown; id?: unknown; name?: unknown };
+	if (typeof model.provider !== "string" || typeof model.id !== "string") return undefined;
+	return { provider: model.provider, id: model.id, name: typeof model.name === "string" ? model.name : undefined };
 }
 
-function hashText(text: string): string {
-	return createHash("sha1").update(text).digest("hex");
+function isRpcResponse(value: unknown): value is Record<string, any> {
+	return !!value && typeof value === "object" && (value as { type?: unknown }).type === "response";
 }
 
-async function ensureResultPersisted(handle: SubagentHandle): Promise<string | undefined> {
-	if (!handle.resultText) return undefined;
-	const nextHash = hashText(handle.resultText);
-	if (handle.resultPath && handle.persistedResultHash === nextHash) return handle.resultPath;
-	try {
-		const directory = join(tmpdir(), RESULT_FILE_DIR);
-		await fs.mkdir(directory, { recursive: true, mode: 0o700 });
-		await fs.chmod(directory, 0o700).catch(() => {});
-		const path = join(directory, `${safeFileFragment(handle.agent.name)}-${handle.id}.md`);
-		await fs.writeFile(path, handle.resultText, { encoding: "utf8", mode: 0o600 });
-		await fs.chmod(path, 0o600).catch(() => {});
-		handle.resultPath = path;
-		handle.persistedResultHash = nextHash;
-		return path;
-	} catch (error) {
-		handle.resultPath = undefined;
-		handle.persistedResultHash = undefined;
-		const message = error instanceof Error ? error.message : String(error);
-		handle.stderr += `Failed to persist subagent result: ${message}\n`;
-		return undefined;
-	}
-}
-
-function previewResult(text: string, max = RESULT_PREVIEW_MAX): string {
-	if (text.length <= max) return text;
-	return `${text.slice(0, max).trimEnd()}\n…`;
-}
-
-function isAbortedAssistantMessage(message: unknown): boolean {
-	if (!message || typeof message !== "object") return false;
-	const value = message as { role?: unknown; stopReason?: unknown };
-	return value.role === "assistant" && value.stopReason === "aborted";
-}
-
-function isHandleActive(handle: SubagentHandle): boolean {
-	return handle.state === "starting" || handle.state === "running" || (handle.state === "killed" && !handle.completionSettled);
-}
-
-function extractText(content: unknown): string {
-	if (typeof content === "string") return content;
-	if (!Array.isArray(content)) return "";
-	return content
-		.map((part) => {
-			if (!part || typeof part !== "object") return "";
-			const block = part as Record<string, unknown>;
-			if (block.type === "text" && typeof block.text === "string") return block.text;
-			return "";
-		})
-		.filter(Boolean)
-		.join("\n");
-}
-
-function getPiInvocation(args: string[]): { command: string; args: string[] } {
-	const currentScript = process.argv[1];
-	const looksLikeScriptPath =
-		typeof currentScript === "string" &&
-		!currentScript.startsWith("-") &&
-		(currentScript.includes("/") || currentScript.endsWith(".js") || currentScript.endsWith(".mjs"));
-	if (looksLikeScriptPath) {
-		return { command: process.execPath, args: [currentScript, ...args] };
-	}
-
-	const execName = basename(process.execPath).toLowerCase();
-	const isGenericRuntime = /^(node|bun)(\.exe)?$/.test(execName);
-	if (!isGenericRuntime) return { command: process.execPath, args };
-
-	return { command: process.env.PI_SUBAGENT_PI_BIN || "pi", args };
-}
-
-function createUsage(): UsageStats {
-	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
-}
-
-function getModelCliArg(ctx: ExtensionContext): string | undefined {
-	if (!ctx.model) return undefined;
-	return `${ctx.model.provider}/${ctx.model.id}`;
-}
-
-function getSubagentDepth(): number {
-	return Math.max(0, Number.parseInt(process.env.PI_SUBAGENT_DEPTH || "0", 10) || 0);
-}
-
-function isNestedSubagent(): boolean {
-	return getSubagentDepth() > 0;
-}
-
-function formatUsage(usage: UsageStats, model?: string): string {
-	const parts: string[] = [];
-	if (usage.turns) parts.push(`${usage.turns}t`);
-	if (usage.input) parts.push(`↑${usage.input}`);
-	if (usage.output) parts.push(`↓${usage.output}`);
-	if (usage.cacheRead) parts.push(`R${usage.cacheRead}`);
-	if (usage.cacheWrite) parts.push(`W${usage.cacheWrite}`);
-	if (usage.cost) parts.push(`$${usage.cost.toFixed(4)}`);
-	if (model) parts.push(model);
-	return parts.join(" ");
-}
-
-function formatHandleDetail(handle: SubagentHandle): string {
-	return (
-		handle.statusText ||
-		(handle.state === "done" ? truncate(handle.resultText, 140) : "") ||
-		(handle.lastTool ? `tool: ${handle.lastTool}` : "") ||
-		truncate(handle.error, 140)
-	);
-}
-
-function formatTimeOfDay(timestamp: number): string {
-	return new Date(timestamp).toISOString().slice(11, 19);
-}
-
-class SubagentOverlay implements Focusable {
-	focused = false;
-
-	private scrollOffset = 0;
-	private viewHeight = 0;
-	private totalLines = 0;
-
-	constructor(
-		private readonly tui: TUI,
-		private readonly theme: ExtensionContext["ui"]["theme"],
-		private readonly keybindings: KeybindingsManager,
-		private readonly getHandles: () => SubagentHandle[],
-		private readonly onClose: () => void,
-	) {}
-
-	handleInput(data: string): void {
-		if (
-			this.keybindings.matches(data, "app.interrupt") ||
-			this.keybindings.matches(data, "tui.select.cancel") ||
-			data === "q"
-		) {
-			this.onClose();
-			return;
-		}
-
-		const mouseScrollDelta = this.parseMouseScrollDelta(data);
-		if (mouseScrollDelta !== 0) {
-			this.scrollBy(mouseScrollDelta);
-			return;
-		}
-
-		if (this.keybindings.matches(data, "tui.select.up") || matchesKey(data, Key.up)) {
-			this.scrollBy(-1);
-			return;
-		}
-		if (this.keybindings.matches(data, "tui.select.down") || matchesKey(data, Key.down)) {
-			this.scrollBy(1);
-			return;
-		}
-		if (this.keybindings.matches(data, "tui.select.pageUp") || matchesKey(data, Key.pageUp)) {
-			this.scrollBy(-(this.viewHeight || 1));
-			return;
-		}
-		if (this.keybindings.matches(data, "tui.select.pageDown") || matchesKey(data, Key.pageDown)) {
-			this.scrollBy(this.viewHeight || 1);
-			return;
-		}
-		if (matchesKey(data, Key.home)) {
-			this.setScroll(0);
-			return;
-		}
-		if (matchesKey(data, Key.end)) {
-			this.setScroll(Math.max(0, this.totalLines - this.viewHeight));
-			return;
-		}
-	}
-
-	render(width: number): string[] {
-		const innerWidth = Math.max(28, width - 2);
-		const rows = this.tui.terminal.rows || 24;
-		const maxPanelHeight = Math.max(8, rows - 2);
-		const panelHeight = Math.min(maxPanelHeight, Math.max(12, Math.floor(rows * 0.85)));
-		const chromeLines = 7;
-		const contentHeight = Math.max(1, panelHeight - chromeLines);
-		const handles = this.getHandles();
-		const contentLines = this.buildContentLines(handles);
-		const running = handles.filter((handle) => handle.state === "running" || handle.state === "starting").length;
-		const done = handles.filter((handle) => handle.state === "done").length;
-		const failed = handles.filter((handle) => handle.state === "error").length;
-		const killed = handles.filter((handle) => handle.state === "killed").length;
-
-		this.totalLines = contentLines.length;
-		this.viewHeight = contentHeight;
-		const maxScroll = Math.max(0, this.totalLines - contentHeight);
-		this.scrollOffset = Math.max(0, Math.min(this.scrollOffset, maxScroll));
-
-		const visibleLines = contentLines.slice(this.scrollOffset, this.scrollOffset + contentHeight);
-		const padding = Math.max(0, contentHeight - visibleLines.length);
-		const start = this.totalLines === 0 ? 0 : Math.min(this.totalLines, this.scrollOffset + 1);
-		const end = Math.min(this.totalLines, this.scrollOffset + visibleLines.length);
-		const scrollInfo = this.totalLines > contentHeight ? `${start}-${end}/${this.totalLines}` : `${this.totalLines}/${this.totalLines}`;
-
-		const summaryParts = [
-			this.theme.fg("warning", `${running} running`),
-			this.theme.fg("success", `${done} done`),
-		];
-		if (failed) summaryParts.push(this.theme.fg("error", `${failed} failed`));
-		if (killed) summaryParts.push(this.theme.fg("muted", `${killed} killed`));
-
-		const lines = [
-			this.borderLine(innerWidth, "top"),
-			this.frameLine(this.theme.fg("accent", this.theme.bold(" Subagents ")) + this.theme.fg("dim", " newest first"), innerWidth),
-			this.frameLine(summaryParts.join(this.theme.fg("muted", " · ")), innerWidth),
-			this.theme.fg("borderMuted", `├${"─".repeat(innerWidth)}┤`),
-			...visibleLines.map((line) => this.frameLine(line, innerWidth)),
-		];
-		for (let i = 0; i < padding; i++) {
-			lines.push(this.frameLine("", innerWidth));
-		}
-		lines.push(this.theme.fg("borderMuted", `├${"─".repeat(innerWidth)}┤`));
-		lines.push(
-			this.frameLine(
-				this.theme.fg("dim", `Esc/q close · ↑/↓ scroll · PgUp/PgDn page · Home/End jump · ${scrollInfo}`),
-				innerWidth,
-			),
-		);
-		lines.push(this.borderLine(innerWidth, "bottom"));
-		return lines.map((line) => truncateToWidth(line, width, ""));
-	}
-
-	invalidate(): void {}
-
-	private buildContentLines(handles: SubagentHandle[]): string[] {
-		if (handles.length === 0) {
-			return [this.theme.fg("dim", "No subagents tracked yet.")];
-		}
-
-		const lines: string[] = [];
-		for (const handle of handles) {
-			const icon =
-				handle.state === "running" || handle.state === "starting"
-					? this.theme.fg("warning", "●")
-					: handle.state === "done"
-						? this.theme.fg("success", "✓")
-						: handle.state === "killed"
-							? this.theme.fg("muted", "■")
-							: this.theme.fg("error", "✗");
-			const stateColor: "warning" | "success" | "muted" | "error" =
-				handle.state === "running" || handle.state === "starting"
-					? "warning"
-					: handle.state === "done"
-						? "success"
-						: handle.state === "killed"
-							? "muted"
-							: "error";
-			const header = [
-				icon,
-				this.theme.fg("accent", `#${handle.id}`),
-				this.theme.bold(handle.agent.name),
-				this.theme.fg(stateColor, handle.state),
-				this.theme.fg("dim", formatTimeOfDay(handle.startedAt)),
-			].join(" ");
-			lines.push(header);
-			lines.push(`${this.theme.fg("dim", "  task:")} ${this.theme.fg("muted", truncate(handle.task, 180))}`);
-
-			const detail = formatHandleDetail(handle);
-			if (detail) {
-				const detailColor: "error" | "muted" = handle.state === "error" ? "error" : "muted";
-				lines.push(`${this.theme.fg("dim", "  info:")} ${this.theme.fg(detailColor, truncate(detail, 180))}`);
-			}
-
-			const metaParts: string[] = [];
-			if (handle.model) metaParts.push(`model ${truncate(handle.model, 48)}`);
-			const usage = formatUsage(handle.usage);
-			if (usage) metaParts.push(usage);
-			metaParts.push(`cwd ${truncate(handle.cwd, 56)}`);
-			lines.push(`${this.theme.fg("dim", "  ")}${this.theme.fg("dim", metaParts.join(" • "))}`);
-			lines.push("");
-		}
-		return lines;
-	}
-
-	private scrollBy(delta: number): void {
-		this.setScroll(this.scrollOffset + delta);
-	}
-
-	private setScroll(next: number): void {
-		const maxScroll = Math.max(0, this.totalLines - this.viewHeight);
-		const clamped = Math.max(0, Math.min(next, maxScroll));
-		if (clamped === this.scrollOffset) return;
-		this.scrollOffset = clamped;
-		this.tui.requestRender();
-	}
-
-	private frameLine(content: string, innerWidth: number): string {
-		const truncated = truncateToWidth(content, innerWidth, "");
-		const padding = Math.max(0, innerWidth - visibleWidth(truncated));
-		return `${this.theme.fg("borderMuted", "│")}${truncated}${" ".repeat(padding)}${this.theme.fg("borderMuted", "│")}`;
-	}
-
-	private borderLine(innerWidth: number, edge: "top" | "bottom"): string {
-		const left = edge === "top" ? "┌" : "└";
-		const right = edge === "top" ? "┐" : "┘";
-		return this.theme.fg("borderMuted", `${left}${"─".repeat(innerWidth)}${right}`);
-	}
-
-	private parseMouseScrollDelta(data: string): number {
-		const sgrMouseMatch = /^\x1b\[<(\d+);\d+;\d+([Mm])$/u.exec(data);
-		if (sgrMouseMatch) {
-			const code = Number(sgrMouseMatch[1]);
-			return this.getWheelDeltaFromMouseButtonCode(code);
-		}
-
-		if (data.startsWith("\x1b[M") && data.length >= 6) {
-			const code = data.charCodeAt(3) - 32;
-			return this.getWheelDeltaFromMouseButtonCode(code);
-		}
-
-		return 0;
-	}
-
-	private getWheelDeltaFromMouseButtonCode(code: number): number {
-		if (!Number.isFinite(code) || (code & 64) === 0) {
-			return 0;
-		}
-
-		const wheelDirection = code & 0b11;
-		if (wheelDirection === 0) return 3;
-		if (wheelDirection === 1) return -3;
-		return 0;
-	}
-}
-
-function serializeHandle(handle: SubagentHandle): SerializableHandle {
-	return {
-		id: handle.id,
-		agent: handle.agent.name,
-		source: handle.agent.source,
-		state: handle.state,
-		task: handle.task,
-		statusText: handle.statusText,
-		lastTool: handle.lastTool,
-		resultText: previewResult(handle.resultText, SERIALIZED_RESULT_PREVIEW_MAX),
-		resultPath: handle.resultPath,
-		error: handle.error,
-		stopReason: handle.stopReason,
-		model: handle.model,
-		exitCode: handle.exitCode,
-		startedAt: handle.startedAt,
-		updatedAt: handle.updatedAt,
-		usage: { ...handle.usage },
-	};
-}
-
-async function serializeHandleForReturn(handle: SubagentHandle): Promise<SerializableHandle> {
-	if (handle.resultText) await ensureResultPersisted(handle);
-	return serializeHandle(handle);
-}
-
-async function serializeHandlesForReturn(values: SubagentHandle[]): Promise<SerializableHandle[]> {
-	return Promise.all(values.map((handle) => serializeHandleForReturn(handle)));
-}
-
-function mapWithConcurrencyLimit<TIn, TOut>(
-	items: TIn[],
-	concurrency: number,
-	fn: (item: TIn, index: number) => Promise<TOut>,
-): Promise<TOut[]> {
-	if (items.length === 0) return Promise.resolve([]);
-	const limit = Math.max(1, Math.min(concurrency, items.length));
-	const results: TOut[] = new Array(items.length);
-	let nextIndex = 0;
-	const workers = new Array(limit).fill(null).map(async () => {
-		while (true) {
-			const current = nextIndex++;
-			if (current >= items.length) return;
-			results[current] = await fn(items[current], current);
-		}
-	});
-	return Promise.all(workers).then(() => results);
-}
+const ThinkingSchema = StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"] as const);
 
 const TaskSpecSchema = Type.Object({
 	agent: Type.Optional(Type.String({ description: "Optional predefined subagent name to use as a base" })),
 	name: Type.Optional(Type.String({ description: "Optional display name for an ad hoc subagent" })),
-	task: Type.String({ description: "Focused task to delegate" }),
-	cwd: Type.Optional(Type.String({ description: "Working directory for the subagent process" })),
-	model: Type.Optional(Type.String({ description: "Optional child model override, e.g. openai/gpt-4.1-nano or anthropic/claude-haiku-4-5" })),
-	tools: Type.Optional(Type.Array(Type.String(), { description: "Optional built-in tool override for the child, e.g. [read,grep,find,ls]" })),
-	systemPrompt: Type.Optional(Type.String({ description: "Optional ad hoc subagent prompt or extra instructions. If agent is provided, this is appended to the predefined prompt." })),
-});
-
-const SingleSchema = TaskSpecSchema;
-
-const ParallelSchema = Type.Object({
-	tasks: Type.Array(TaskSpecSchema, { description: "Parallel tasks to run as a small swarm" }),
-});
-
-const ChainSchema = Type.Object({
-	chain: Type.Array(
-		Type.Object({
-			agent: Type.Optional(Type.String({ description: "Optional predefined subagent name to use as a base" })),
-			name: Type.Optional(Type.String({ description: "Optional display name for an ad hoc subagent" })),
-			task: Type.String({ description: "Task for that step. May include {previous} to include the previous step's final answer." }),
-			cwd: Type.Optional(Type.String({ description: "Optional working directory override" })),
-			model: Type.Optional(Type.String({ description: "Optional child model override" })),
-			tools: Type.Optional(Type.Array(Type.String(), { description: "Optional built-in tool override for the child" })),
-			systemPrompt: Type.Optional(Type.String({ description: "Optional ad hoc subagent prompt or extra instructions" })),
-		}),
-		{ description: "Sequential subagent steps" },
-	),
-});
-
-const RunSchema = Type.Object({
-	agent: Type.Optional(Type.String({ description: "Single subagent to run" })),
-	name: Type.Optional(Type.String({ description: "Optional display name for an ad hoc single subagent" })),
-	task: Type.Optional(Type.String({ description: "Single delegated task" })),
-	cwd: Type.Optional(Type.String({ description: "Working directory for single-agent mode" })),
-	model: Type.Optional(Type.String({ description: "Optional child model override for single-agent mode" })),
-	tools: Type.Optional(Type.Array(Type.String(), { description: "Optional built-in tool override for single-agent mode" })),
-	systemPrompt: Type.Optional(Type.String({ description: "Optional ad hoc system prompt override for single-agent mode" })),
-	tasks: Type.Optional(ParallelSchema.properties.tasks),
-	chain: Type.Optional(ChainSchema.properties.chain),
-});
-
-const WaitSchema = Type.Object({
-	id: Type.Optional(Type.String({ description: "Specific subagent id to wait for" })),
-	all: Type.Optional(Type.Boolean({ default: true, description: "When id is omitted, this must be true to wait for all active subagents" })),
-	timeoutMs: Type.Optional(Type.Number({ minimum: 1, description: "Optional timeout in milliseconds" })),
+	task: Type.String({ minLength: 1, description: "Focused task to delegate" }),
+	cwd: Type.Optional(Type.String({ description: "Working directory for the child process" })),
+	model: Type.Optional(Type.String({ description: "Optional child model override in provider/model form" })),
+	thinking: Type.Optional(ThinkingSchema),
+	tools: Type.Optional(Type.Array(Type.String(), { description: "Optional active-tool narrowing for the child" })),
+	systemPrompt: Type.Optional(Type.String({ description: "Optional ad hoc prompt appended to the predefined role" })),
 });
 
 const ListSchema = Type.Object({
-	includeCompleted: Type.Optional(Type.Boolean({ default: true, description: "Include completed, errored, and killed subagents" })),
+	includeFinished: Type.Optional(Type.Boolean({ default: true, description: "Include completed, errored, and killed handles" })),
+});
+
+const StatusSchema = Type.Object({
+	id: Type.String({ description: "Subagent handle ID" }),
+});
+
+const WaitSchema = Type.Object({
+	id: Type.Optional(Type.String({ description: "Specific subagent ID to wait for" })),
+	all: Type.Optional(Type.Boolean({ description: "Wait for the current snapshot of all active subagents" })),
+	timeoutSeconds: Type.Number({ minimum: 1, description: "Required finite timeout in seconds" }),
+});
+
+const SteerSchema = Type.Object({
+	id: Type.String({ description: "Running subagent handle ID" }),
+	message: Type.String({ minLength: 1, description: "Direction to queue through Pi native steering" }),
 });
 
 const KillSchema = Type.Object({
-	id: Type.String({ description: "Subagent id to kill" }),
+	id: Type.String({ description: "Subagent handle ID to terminate" }),
 });
 
 export default function subagentExtension(pi: ExtensionAPI) {
 	const handles = new Map<string, SubagentHandle>();
 	let latestCtx: ExtensionContext | null = null;
 	let widgetVisible = true;
+	let activeInspector: SubagentInspector | undefined;
 
 	function rememberContext(ctx: ExtensionContext): void {
 		latestCtx = ctx;
+	}
+
+	function sortHandles(values: Iterable<SubagentHandle>): SubagentHandle[] {
+		return [...values].sort((a, b) => b.createdAt - a.createdAt || b.id.localeCompare(a.id));
+	}
+
+	function readyHandles(): SubagentHandle[] {
+		return sortHandles(handles.values()).filter((handle) => !!handle.actualModel && !!handle.actualThinking && !!handle.sessionPath);
+	}
+
+	function trimRetainedHandles(): void {
+		if (handles.size <= MAX_RETAINED_HANDLES) return;
+		const terminal = sortHandles(handles.values())
+			.filter(isTerminal)
+			.sort((a, b) => (a.completedAt ?? a.lastActivityAt) - (b.completedAt ?? b.lastActivityAt));
+		while (handles.size > MAX_RETAINED_HANDLES && terminal.length > 0) {
+			const handle = terminal.shift();
+			if (handle) handles.delete(handle.id);
+		}
+	}
+
+	function activityLabel(handle: SubagentHandle): string {
+		if (handle.killRequestedAt) return "killing";
+		if (handle.currentTool) return handle.currentTool;
+		if (handle.isStreaming) return "responding";
+		if (handle.agentEndedAt && !handle.completionSettled) return "finishing";
+		return handle.lastTool || "idle";
+	}
+
+	function refreshUi(): void {
+		activeInspector?.refresh();
+		const ctx = latestCtx;
+		if (!ctx || ctx.mode !== "tui") return;
+		const active = readyHandles().filter(isHandleActive);
+		if (!widgetVisible || active.length === 0) {
+			ctx.ui.setWidget("subagent", undefined);
+			return;
+		}
+		const theme = ctx.ui.theme;
+		const lines = active.slice(0, MAX_WIDGET_ITEMS).map((handle) => {
+			const icon = handle.killRequestedAt ? "◐" : handle.state === "starting" ? "○" : "●";
+			const model = formatActualModel(handle.actualModel!);
+			const elapsedSeconds = Math.max(0, Math.floor((now() - handle.createdAt) / 1000));
+			const elapsed = `${Math.floor(elapsedSeconds / 60)}:${String(elapsedSeconds % 60).padStart(2, "0")}`;
+			return `${theme.fg("warning", icon)} ${handle.id} ${theme.bold(sanitizeTerminalText(handle.agent.name))}  ${elapsed}  ${theme.fg("muted", `${model} · thinking:${handle.actualThinking}`)}  ${sanitizeTerminalText(activityLabel(handle))}`;
+		});
+		if (active.length > MAX_WIDGET_ITEMS) lines.push(theme.fg("dim", `… ${active.length - MAX_WIDGET_ITEMS} more active subagents`));
+		ctx.ui.setWidget("subagent", lines);
+	}
+
+	function updateHandle(handle: SubagentHandle, patch: Partial<SubagentHandle> = {}): void {
+		Object.assign(handle, patch);
+		handle.lastActivityAt = now();
+		trimRetainedHandles();
+		refreshUi();
+	}
+
+	function clearTerminationTimers(handle: SubagentHandle): void {
+		for (const timer of handle.terminationTimers) clearTimeout(timer);
+		handle.terminationTimers.clear();
+	}
+
+	function clearPendingRequest(handle: SubagentHandle, requestId: string): RpcPendingRequest | undefined {
+		const pending = handle.pendingRequests.get(requestId);
+		if (!pending) return undefined;
+		clearTimeout(pending.timer);
+		handle.pendingRequests.delete(requestId);
+		return pending;
+	}
+
+	function rejectPendingRequests(handle: SubagentHandle, error: Error): void {
+		for (const [requestId, pending] of handle.pendingRequests) {
+			clearTimeout(pending.timer);
+			handle.pendingRequests.delete(requestId);
+			pending.reject(error);
+		}
+	}
+
+	function addDiagnostic(handle: SubagentHandle, message: string): void {
+		handle.diagnostics.push(message);
+		if (handle.diagnostics.length > 20) handle.diagnostics.splice(0, handle.diagnostics.length - 20);
+	}
+
+	async function ensureResultPersisted(handle: SubagentHandle): Promise<string | undefined> {
+		if (!handle.resultText) return undefined;
+		const nextHash = hashText(handle.resultText);
+		if (handle.resultPath && handle.persistedResultHash === nextHash) return handle.resultPath;
+		try {
+			const resultPath = join(handle.sessionDir, "result.md");
+			await fs.writeFile(resultPath, handle.resultText, { encoding: "utf8", mode: 0o600 });
+			await fs.chmod(resultPath, 0o600).catch(() => {});
+			handle.resultPath = resultPath;
+			handle.persistedResultHash = nextHash;
+			return resultPath;
+		} catch (error) {
+			const message = `Failed to persist subagent result: ${error instanceof Error ? error.message : String(error)}`;
+			handle.stderr += `${message}\n`;
+			addDiagnostic(handle, message);
+			return undefined;
+		}
+	}
+
+	function settleHandle(handle: SubagentHandle): Promise<SubagentHandle> {
+		if (handle.completionPromise) return handle.completionPromise;
+		handle.completionSettled = true;
+		handle.completedAt ||= now();
+		clearTerminationTimers(handle);
+		rejectPendingRequests(handle, new Error(`Subagent #${handle.id} settled before RPC request completed.`));
+		handle.completionPromise = (async () => {
+			await ensureResultPersisted(handle);
+			for (const resolve of handle.waiters) resolve();
+			handle.waiters.clear();
+			trimRetainedHandles();
+			refreshUi();
+			return handle;
+		})();
+		return handle.completionPromise;
+	}
+
+	function writeRpc(handle: SubagentHandle, payload: Record<string, unknown>): void {
+		if (!handle.process?.stdin.writable) throw new Error(`Subagent #${handle.id} RPC stdin is unavailable.`);
+		handle.process.stdin.write(`${JSON.stringify(payload)}\n`);
+	}
+
+	function requestRpc(handle: SubagentHandle, command: string, payload: Record<string, unknown>, timeoutMs: number): Promise<Record<string, any>> {
+		if (!handle.process || handle.completionSettled) return Promise.reject(new Error(`Subagent #${handle.id} is no longer running.`));
+		const requestId = `${handle.id}:${++handle.requestSequence}`;
+		return new Promise((resolve, reject) => {
+			const timer = setTimeout(() => {
+				const pending = clearPendingRequest(handle, requestId);
+				if (pending) pending.reject(new Error(`Timed out waiting for ${command} acknowledgement from subagent #${handle.id}.`));
+			}, timeoutMs);
+			handle.pendingRequests.set(requestId, { command, resolve, reject, timer });
+			try {
+				writeRpc(handle, { id: requestId, type: command, ...payload });
+			} catch (error) {
+				const pending = clearPendingRequest(handle, requestId);
+				if (pending) pending.reject(error instanceof Error ? error : new Error(String(error)));
+			}
+		});
+	}
+
+	function updateUsage(handle: SubagentHandle, message: Record<string, any>): void {
+		const usage = message.usage || {};
+		handle.usage.input += Number(usage.input) || 0;
+		handle.usage.output += Number(usage.output) || 0;
+		handle.usage.cacheRead += Number(usage.cacheRead) || 0;
+		handle.usage.cacheWrite += Number(usage.cacheWrite) || 0;
+		handle.usage.cost += Number(usage.cost?.total) || 0;
+		handle.usage.turns += 1;
+	}
+
+	function updateCurrentTool(handle: SubagentHandle): void {
+		const latest = [...handle.activeTools.values()].sort((a, b) => b.startedAt - a.startedAt)[0];
+		handle.currentTool = latest?.name;
+		handle.currentToolStartedAt = latest?.startedAt;
+	}
+
+	function handleRpcRecord(handle: SubagentHandle, record: Record<string, any>): void {
+		if (isRpcResponse(record)) {
+			const requestId = typeof record.id === "string" ? record.id : undefined;
+			const pending = requestId ? clearPendingRequest(handle, requestId) : undefined;
+			if (!pending) return;
+			if (record.command !== pending.command) {
+				pending.reject(new Error(`Expected ${pending.command} response, received ${String(record.command)}.`));
+				return;
+			}
+			if (record.success !== true) {
+				pending.reject(new Error(String(record.error || `${pending.command} was rejected by Pi.`)));
+				return;
+			}
+			pending.resolve(record);
+			return;
+		}
+
+		switch (record.type) {
+			case "agent_start":
+				handle.agentStartedAt ||= now();
+				if (handle.state === "starting") handle.state = "running";
+				updateHandle(handle);
+				return;
+			case "tool_execution_start": {
+				const toolCallId = typeof record.toolCallId === "string" ? record.toolCallId : `${now()}:${record.toolName || "tool"}`;
+				const name = typeof record.toolName === "string" ? record.toolName : "tool";
+				handle.activeTools.set(toolCallId, { name, startedAt: now() });
+				updateCurrentTool(handle);
+				if (handle.state === "starting") handle.state = "running";
+				updateHandle(handle);
+				return;
+			}
+			case "tool_execution_end": {
+				if (typeof record.toolCallId === "string") handle.activeTools.delete(record.toolCallId);
+				if (typeof record.toolName === "string") handle.lastTool = record.toolName;
+				updateCurrentTool(handle);
+				updateHandle(handle);
+				return;
+			}
+			case "message_update": {
+				handle.isStreaming = true;
+				const event = record.assistantMessageEvent as { type?: unknown } | undefined;
+				if (event?.type === "done" || event?.type === "error") handle.isStreaming = false;
+				const partial = record.message as Record<string, any> | undefined;
+				if (partial?.role === "assistant") retainAssistantText(handle, extractText(partial.content));
+				updateHandle(handle);
+				return;
+			}
+			case "message_end": {
+				const message = record.message as Record<string, any> | undefined;
+				if (message?.role !== "assistant") return;
+				handle.isStreaming = false;
+				retainAssistantText(handle, extractText(message.content));
+				void transcriptStatus(handle).then(() => refreshUi());
+				updateUsage(handle, message);
+				handle.stopReason = typeof message.stopReason === "string" ? message.stopReason : handle.stopReason;
+				if (typeof message.errorMessage === "string" && message.errorMessage) handle.error = message.errorMessage;
+				if (!handle.killRequestedAt && (message.stopReason === "error" || message.errorMessage)) handle.state = "error";
+				updateHandle(handle);
+				return;
+			}
+			case "agent_end":
+				handle.isStreaming = false;
+				handle.agentEndedAt = now();
+				if (!handle.killRequestedAt && handle.state !== "error") handle.state = "done";
+				updateHandle(handle);
+				// A normal completion retains the established prompt settlement path.
+				// Killed and error handles instead wait for close so late abort output
+				// remains eligible for persistence.
+				if (handle.state === "done") void settleHandle(handle);
+				return;
+			case "extension_error":
+				addDiagnostic(handle, `${String(record.extensionPath || "extension")}: ${String(record.error || "Unknown extension error")}`);
+				handle.stderr += `${handle.diagnostics[handle.diagnostics.length - 1]}\n`;
+				updateHandle(handle);
+				return;
+			default:
+				return;
+		}
+	}
+
+	function attachProcess(handle: SubagentHandle, proc: ChildProcessWithoutNullStreams): void {
+		handle.process = proc;
+		handle.pid = proc.pid;
+		proc.stdout.setEncoding("utf8");
+		proc.stderr.setEncoding("utf8");
+		let stdoutBuffer = "";
+
+		const processLine = (line: string) => {
+			if (!line.trim()) return;
+			try {
+				const parsed = JSON.parse(line);
+				if (!parsed || typeof parsed !== "object") {
+					addDiagnostic(handle, `Ignored non-object RPC record: ${truncate(line, 200)}`);
+					return;
+				}
+				handleRpcRecord(handle, parsed as Record<string, any>);
+			} catch (error) {
+				addDiagnostic(handle, `Malformed RPC JSON: ${error instanceof Error ? error.message : String(error)}: ${truncate(line, 200)}`);
+			}
+		};
+
+		proc.stdout.on("data", (chunk: string) => {
+			stdoutBuffer += chunk;
+			while (true) {
+				const newline = stdoutBuffer.indexOf("\n");
+				if (newline === -1) break;
+				let line = stdoutBuffer.slice(0, newline);
+				stdoutBuffer = stdoutBuffer.slice(newline + 1);
+				if (line.endsWith("\r")) line = line.slice(0, -1);
+				processLine(line);
+			}
+		});
+
+		proc.stderr.on("data", (chunk: string) => {
+			handle.stderr += chunk;
+			updateHandle(handle);
+		});
+
+		proc.on("error", (error) => {
+			handle.process = undefined;
+			if (handle.killRequestedAt) {
+				signalProcess(handle, "SIGKILL");
+				handle.state = "killed";
+			} else {
+				handle.state = "error";
+				handle.error ||= error.message;
+			}
+			// Node emits close after error once stdout/stderr drain. Settling only
+			// there keeps any final buffered assistant output observable.
+			updateHandle(handle);
+		});
+
+		proc.on("close", (code, signal) => {
+			if (stdoutBuffer.trim()) processLine(stdoutBuffer.trim());
+			handle.process = undefined;
+			handle.exitCode = code ?? (signal ? 1 : 0);
+			if (!handle.completionSettled) {
+				if (handle.killRequestedAt) {
+					signalProcess(handle, "SIGKILL");
+					handle.state = "killed";
+					handle.error ||= "Killed";
+				} else if (handle.state === "error" || code !== 0) {
+					handle.state = "error";
+					handle.error ||= signal ? `Exited via signal ${signal}` : `Exited with code ${code ?? 0}`;
+				} else {
+					handle.state = "done";
+				}
+				updateHandle(handle);
+				void settleHandle(handle);
+			}
+		});
+	}
+
+	function signalProcess(handle: SubagentHandle, signal: NodeJS.Signals): void {
+		const pid = handle.pid;
+		if (!pid || pid <= 0) return;
+		if (process.platform !== "win32") {
+			try {
+				process.kill(-pid, signal);
+				return;
+			} catch (error) {
+				addDiagnostic(handle, `Process-group ${signal} failed: ${error instanceof Error ? error.message : String(error)}; falling back to PID.`);
+			}
+		}
+		if (!handle.process) return;
+		try {
+			handle.process.kill(signal);
+		} catch (error) {
+			addDiagnostic(handle, `Process ${signal} failed: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+
+	function scheduleTermination(handle: SubagentHandle, delayMs: number, callback: () => void): void {
+		const timer = setTimeout(() => {
+			handle.terminationTimers.delete(timer);
+			callback();
+		}, delayMs);
+		handle.terminationTimers.add(timer);
+	}
+
+	function terminateHandle(handle: SubagentHandle, reason: string): Promise<SubagentHandle> {
+		if (handle.completionPromise) return handle.completionPromise;
+		if (handle.terminationPromise) return handle.terminationPromise;
+		handle.killRequestedAt = now();
+		handle.error ||= reason;
+		updateHandle(handle);
+
+		requestRpc(handle, "abort", {}, ABORT_ACK_TIMEOUT_MS)
+			.then(() => updateHandle(handle))
+			.catch((error) => addDiagnostic(handle, `Abort acknowledgement: ${error.message}`));
+		scheduleTermination(handle, TERM_DEADLINE_MS, () => signalProcess(handle, "SIGTERM"));
+		scheduleTermination(handle, KILL_DEADLINE_MS, () => signalProcess(handle, "SIGKILL"));
+		scheduleTermination(handle, SETTLEMENT_DEADLINE_MS, () => {
+			if (handle.completionSettled) return;
+			handle.state = "killed";
+			handle.error ||= `${reason} (forced settlement after termination deadline)`;
+			updateHandle(handle);
+			void settleHandle(handle);
+		});
+		handle.terminationPromise = (async () => {
+			if (!handle.completionPromise) {
+				await new Promise<void>((resolve) => handle.waiters.add(resolve));
+			}
+			return (await (handle.completionPromise || Promise.resolve(handle)));
+		})();
+		return handle.terminationPromise;
+	}
+
+	async function killAll(reason: string): Promise<void> {
+		await Promise.allSettled(sortHandles(handles.values()).filter(isHandleActive).map((handle) => terminateHandle(handle, reason)));
+	}
+
+	function transcriptStatus(handle: SubagentHandle): Promise<{ persisted: boolean; note: string }> {
+		if (!handle.sessionPath) return Promise.resolve({ persisted: false, note: "no persisted transcript yet" });
+		return fs
+			.stat(handle.sessionPath)
+			.then((stat) => {
+				handle.transcriptPersisted = stat.isFile();
+				return { persisted: handle.transcriptPersisted, note: handle.transcriptPersisted ? "persisted transcript available" : "no persisted transcript yet" };
+			})
+			.catch(() => {
+				handle.transcriptPersisted = false;
+				return { persisted: false, note: "no persisted transcript yet" };
+			});
+	}
+
+	async function serializeHandle(handle: SubagentHandle): Promise<SerializableHandle> {
+		if (!handle.actualModel || !handle.actualThinking || !handle.sessionPath) {
+			throw new Error(`Subagent #${handle.id} has not completed its required startup handshake.`);
+		}
+		if (handle.resultText) await ensureResultPersisted(handle);
+		const transcript = await transcriptStatus(handle);
+		return {
+			id: handle.id,
+			name: handle.agent.name,
+			agent: handle.agent.name,
+			source: handle.agent.source,
+			sourcePath: handle.agent.filePath,
+			state: handle.state,
+			killing: !!handle.killRequestedAt && !handle.completionSettled,
+			task: handle.task,
+			cwd: handle.cwd,
+			pid: handle.pid,
+			exitCode: handle.exitCode,
+			requestedModel: handle.requestedModel,
+			requestedThinking: handle.requestedThinking,
+			actualModel: { ...handle.actualModel },
+			actualThinking: handle.actualThinking,
+			configuredTools: [...handle.configuredTools],
+			sessionPath: handle.sessionPath,
+			promptPath: handle.promptPath,
+			resultPath: handle.resultPath,
+			resultKind: resultKind(handle),
+			transcriptPersisted: transcript.persisted,
+			transcriptNote: transcript.note,
+			createdAt: handle.createdAt,
+			rpcReadyAt: handle.rpcReadyAt,
+			agentStartedAt: handle.agentStartedAt,
+			lastActivityAt: handle.lastActivityAt,
+			completedAt: handle.completedAt,
+			currentTool: handle.currentTool,
+			currentToolStartedAt: handle.currentToolStartedAt,
+			lastTool: handle.lastTool,
+			isStreaming: handle.isStreaming,
+			usage: { ...handle.usage },
+			stopReason: handle.stopReason,
+			error: handle.error,
+			stderrPreview: truncate(handle.stderr, SERIALIZED_RESULT_PREVIEW_MAX) || undefined,
+			resultPreview: handle.resultText ? previewResult(handle.resultText, SERIALIZED_RESULT_PREVIEW_MAX) : undefined,
+			diagnostics: handle.diagnostics.length > 0 ? [...handle.diagnostics] : undefined,
+		};
+	}
+
+	async function serializeHandles(values: SubagentHandle[]): Promise<SerializableHandle[]> {
+		return Promise.all(values.map((handle) => serializeHandle(handle)));
+	}
+
+	function toInspectorHandle(handle: SubagentHandle): InspectorHandle | undefined {
+		if (!handle.actualModel || !handle.actualThinking || !handle.sessionPath) return undefined;
+		return {
+			id: handle.id,
+			name: handle.agent.name,
+			agent: handle.agent.name,
+			source: handle.agent.source,
+			sourcePath: handle.agent.filePath,
+			state: handle.state,
+			killing: !!handle.killRequestedAt && !handle.completionSettled,
+			task: handle.task,
+			cwd: handle.cwd,
+			pid: handle.pid,
+			exitCode: handle.exitCode,
+			requestedModel: handle.requestedModel,
+			requestedThinking: handle.requestedThinking,
+			actualModel: handle.actualModel,
+			actualThinking: handle.actualThinking,
+			configuredTools: [...handle.configuredTools],
+			sessionPath: handle.sessionPath,
+			promptPath: handle.promptPath,
+			resultPath: handle.resultPath,
+			resultKind: resultKind(handle),
+			transcriptNote: handle.transcriptPersisted ? "persisted transcript available" : "no persisted transcript yet",
+			createdAt: handle.createdAt,
+			rpcReadyAt: handle.rpcReadyAt,
+			agentStartedAt: handle.agentStartedAt,
+			lastActivityAt: handle.lastActivityAt,
+			completedAt: handle.completedAt,
+			currentTool: handle.currentTool,
+			currentToolStartedAt: handle.currentToolStartedAt,
+			lastTool: handle.lastTool,
+			isStreaming: handle.isStreaming,
+			usage: { ...handle.usage },
+			stopReason: handle.stopReason,
+			error: handle.error,
+			stderrPreview: truncate(handle.stderr, SERIALIZED_RESULT_PREVIEW_MAX) || undefined,
+			resultPreview: handle.resultText ? previewResult(handle.resultText, SERIALIZED_RESULT_PREVIEW_MAX) : undefined,
+		};
+	}
+
+
+	async function formatHandleSummary(handle: SubagentHandle): Promise<string> {
+		const serial = await serializeHandle(handle);
+		const duration = Math.max(0, Math.floor(((serial.completedAt || now()) - serial.createdAt) / 1000));
+		const activity = serial.killing ? "killing" : serial.currentTool || serial.lastTool || (serial.isStreaming ? "responding" : "idle");
+		const lines = [
+			`#${serial.id} ${serial.name} ${serial.killing ? "killing" : serial.state} (${Math.floor(duration / 60)}:${String(duration % 60).padStart(2, "0")})`,
+			`  actual ${formatActualModel(serial.actualModel)} · thinking:${serial.actualThinking} · ${activity}`,
+			`  session ${serial.sessionPath} (${serial.transcriptNote})`,
+			`  prompt ${serial.promptPath}`,
+		];
+		if (serial.resultPath) lines.push(`  ${serial.resultKind} result ${serial.resultPath}`);
+		if (serial.error) lines.push(`  error ${truncate(serial.error, 180)}`);
+		if (serial.resultPreview) lines.push(`  ${serial.resultKind} preview ${truncate(serial.resultPreview, 180)}`);
+		return sanitizeTerminalText(lines.join("\n"));
+	}
+
+	async function activeOrRecentSummary(includeFinished: boolean): Promise<string> {
+		const selected = readyHandles().filter((handle) => includeFinished || isHandleActive(handle));
+		if (selected.length === 0) return "No subagents tracked yet.";
+		return (await Promise.all(selected.map((handle) => formatHandleSummary(handle)))).join("\n\n");
 	}
 
 	function getRequestedChildTools(agent: AgentConfig): string[] {
@@ -632,453 +875,55 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		return requested.filter((toolName) => parentActiveTools.has(toolName));
 	}
 
-	function nestedDelegationBlocked(toolName: "subagent_run" | "subagent_start") {
+	function getSubagentDepth(): number {
+		return Math.max(0, Number.parseInt(process.env.PI_SUBAGENT_DEPTH || "0", 10) || 0);
+	}
+
+	function isNestedSubagent(): boolean {
+		return getSubagentDepth() > 0;
+	}
+
+	function nestedDelegationBlocked() {
 		return {
-			content: [{ type: "text", text: `${toolName} is disabled inside delegated subagents. Report any need for further delegation back to the parent agent instead.` }],
+			content: [{ type: "text", text: "subagent_start is disabled inside delegated subagents. Report any need for further delegation back to the parent agent instead." }],
 			details: { nestedDelegationBlocked: true },
 		};
 	}
 
-	function sortHandles(values: SubagentHandle[]): SubagentHandle[] {
-		return [...values].sort((a, b) => b.startedAt - a.startedAt || b.id.localeCompare(a.id));
-	}
-
-	function trimRetainedHandles(): void {
-		const all = [...handles.values()].sort((a, b) => b.updatedAt - a.updatedAt || b.startedAt - a.startedAt || a.id.localeCompare(b.id));
-		for (const handle of all.slice(MAX_RETAINED_HANDLES)) {
-			if (isHandleActive(handle)) continue;
-			handles.delete(handle.id);
-		}
-	}
-
-	function refreshUi(): void {
-		const ctx = latestCtx;
-		if (!ctx || !ctx.hasUI) return;
-
-		const all = sortHandles([...handles.values()]);
-		const running = all.filter((handle) => handle.state === "running" || handle.state === "starting").length;
-		const active = all.filter(isHandleActive).length;
-		const done = all.filter((handle) => handle.state === "done").length;
-		const failed = all.filter((handle) => handle.state === "error").length;
-		const killed = all.filter((handle) => handle.state === "killed").length;
-
-		if (all.length === 0 || active === 0) {
-			ctx.ui.setWidget("subagent", undefined);
-			ctx.ui.setStatus("subagent", undefined);
-			return;
-		}
-
-		const theme = ctx.ui.theme;
-		const lines: string[] = [];
-		lines.push(
-			theme.fg(
-				"accent",
-				`Subagents: ${running} running, ${done} done${failed ? `, ${failed} failed` : ""}${killed ? `, ${killed} killed` : ""}`,
-			),
-		);
-
-		for (const handle of all.slice(0, MAX_WIDGET_ITEMS)) {
-			const icon =
-				handle.state === "running" || handle.state === "starting"
-					? theme.fg("warning", "●")
-					: handle.state === "done"
-						? theme.fg("success", "✓")
-						: handle.state === "killed"
-							? theme.fg("muted", "■")
-							: theme.fg("error", "✗");
-			const header = `${icon} ${theme.fg("accent", handle.id)} ${theme.bold(handle.agent.name)} ${theme.fg("muted", handle.state)} ${theme.fg("dim", truncate(handle.task, 56))}`;
-			lines.push(header);
-			const detail =
-				handle.statusText ||
-				(handle.state === "done" ? truncate(handle.resultText, 88) : "") ||
-				(handle.lastTool ? `tool: ${handle.lastTool}` : "") ||
-				truncate(handle.error, 88);
-			if (detail) lines.push(`  ${theme.fg("muted", truncate(detail, 96))}`);
-		}
-		if (all.length > MAX_WIDGET_ITEMS) {
-			lines.push(theme.fg("dim", `… ${all.length - MAX_WIDGET_ITEMS} more subagents hidden`));
-		}
-
-		ctx.ui.setWidget("subagent", widgetVisible ? lines : undefined);
-		const summary = downstreamSummary(done, failed, killed, theme);
-		ctx.ui.setStatus("subagent", theme.fg("accent", `subagents ${running} running`) + (summary ? ` ${summary}` : ""));
-	}
-
-	function downstreamSummary(done: number, failed: number, killed: number, theme: any): string {
-		const parts: string[] = [];
-		if (done) parts.push(theme.fg("success", `${done} done`));
-		if (failed) parts.push(theme.fg("error", `${failed} failed`));
-		if (killed) parts.push(theme.fg("muted", `${killed} killed`));
-		return parts.join(" ");
-	}
-
-	function updateHandle(handle: SubagentHandle, patch: Partial<SubagentHandle>): void {
-		Object.assign(handle, patch);
-		handle.updatedAt = now();
-		trimRetainedHandles();
-		refreshUi();
-	}
-
-	function settleHandle(handle: SubagentHandle): void {
-		if (handle.completionSettled) return;
-		handle.completionSettled = true;
-		handle.updatedAt = now();
-		const waiters = handle.waiters.splice(0);
-		handle.completionPromise = (async () => {
-			try {
-				if (handle.resultText) await ensureResultPersisted(handle);
-			} finally {
-				for (const waiter of waiters) {
-					if (waiter.timer) clearTimeout(waiter.timer);
-					waiter.resolve(handle);
-				}
-				trimRetainedHandles();
-				refreshUi();
-			}
-			return handle;
-		})();
-	}
-
-	function waitForHandle(handle: SubagentHandle, timeoutMs?: number): Promise<SubagentHandle> {
-		if (handle.completionSettled) return handle.completionPromise || Promise.resolve(handle);
-		return new Promise((resolve) => {
-			const waiter: { resolve: (handle: SubagentHandle) => void; timer?: NodeJS.Timeout } = { resolve };
-			if (timeoutMs && timeoutMs > 0) {
-				waiter.timer = setTimeout(() => {
-					handle.waiters = handle.waiters.filter((value) => value !== waiter);
-					resolve(handle);
-				}, timeoutMs);
-			}
-			handle.waiters.push(waiter);
-		});
-	}
-
-	function waitForHandleOrAbort(handle: SubagentHandle, timeoutMs?: number, signal?: AbortSignal): Promise<SubagentHandle> {
-		if (!signal) return waitForHandle(handle, timeoutMs);
-		if (signal.aborted) return Promise.resolve(handle);
-		if (handle.completionSettled) return handle.completionPromise || Promise.resolve(handle);
-		return new Promise((resolve) => {
-			const waiter: { resolve: (handle: SubagentHandle) => void; timer?: NodeJS.Timeout } = {
-				resolve: (resolvedHandle) => {
-					cleanup();
-					resolve(resolvedHandle);
-				},
-			};
-			const cleanup = () => {
-				if (waiter.timer) clearTimeout(waiter.timer);
-				handle.waiters = handle.waiters.filter((value) => value !== waiter);
-				signal.removeEventListener("abort", onAbort);
-			};
-			const onAbort = () => {
-				cleanup();
-				resolve(handle);
-			};
-			if (timeoutMs && timeoutMs > 0) {
-				waiter.timer = setTimeout(() => {
-					cleanup();
-					resolve(handle);
-				}, timeoutMs);
-			}
-			signal.addEventListener("abort", onAbort, { once: true });
-			handle.waiters.push(waiter);
-		});
-	}
-
-	function sendRpc(proc: ChildProcessWithoutNullStreams, payload: Record<string, unknown>): void {
+	async function validateCwd(cwd: string): Promise<string | undefined> {
 		try {
-			proc.stdin.write(`${JSON.stringify(payload)}\n`);
+			if (!(await fs.stat(cwd)).isDirectory()) return `Subagent cwd is not a directory: ${cwd}`;
+			return undefined;
 		} catch {
-			// ignore broken pipes; close event will follow
+			return `Subagent cwd does not exist or cannot be read: ${cwd}`;
 		}
-	}
-
-	function bindAbort(signal: AbortSignal | undefined, handle: SubagentHandle, reason: string): void {
-		if (!signal) return;
-		const abort = () => void killHandle(handle, reason);
-		if (signal.aborted) {
-			abort();
-			return;
-		}
-		signal.addEventListener("abort", abort, { once: true });
-	}
-
-	function killHandle(handle: SubagentHandle, reason = "Killed by parent"): Promise<SubagentHandle> {
-		if (handle.completionSettled || handle.state === "done" || handle.state === "error") {
-			return Promise.resolve(handle);
-		}
-
-		if (handle.state !== "killed") {
-			updateHandle(handle, { state: "killed", error: reason, statusText: reason });
-			if (handle.process) {
-				sendRpc(handle.process, { type: "abort" });
-				setTimeout(() => {
-					try {
-						handle.process?.kill("SIGTERM");
-					} catch {
-						// ignore
-					}
-				}, 1500);
-				setTimeout(() => {
-					try {
-						handle.process?.kill("SIGKILL");
-					} catch {
-						// ignore
-					}
-				}, 4000);
-			}
-		}
-		return waitForHandle(handle, 5000);
-	}
-
-	async function killAll(reason: string): Promise<void> {
-		const active = [...handles.values()].filter(isHandleActive);
-		await Promise.allSettled(active.map((handle) => killHandle(handle, reason)));
-	}
-
-	async function formatSingleResult(handle: SubagentHandle): Promise<string> {
-		const resultPath = handle.resultText ? await ensureResultPersisted(handle) : undefined;
-		if (handle.state !== "done") {
-			const lines: string[] = [];
-			if (resultPath) {
-				lines.push(`Partial subagent result saved to ${resultPath}. Use read to inspect the exact output captured before completion.`);
-			}
-			if (!handle.resultText) {
-				lines.push(handle.error || handle.statusText || "(no output)");
-				return lines.join("\n\n");
-			}
-			if (handle.resultText.length <= INLINE_RESULT_MAX) {
-				lines.push(handle.resultText);
-				return lines.join("\n\n");
-			}
-			lines.push(`Captured output preview:\n${previewResult(handle.resultText)}`);
-			lines.push(resultPath ? `Preview truncated for transport safety. Use read on ${resultPath} for the full captured output.` : "Preview truncated for transport safety.");
-			return lines.join("\n\n");
-		}
-
-		const lines: string[] = [];
-		if (resultPath) {
-			lines.push(`Full subagent result saved to ${resultPath}. Use read to inspect the exact complete output.`);
-		}
-		if (!handle.resultText) {
-			lines.push("(no output)");
-			return lines.join("\n\n");
-		}
-		if (handle.resultText.length <= INLINE_RESULT_MAX) {
-			lines.push(handle.resultText);
-			return lines.join("\n\n");
-		}
-		lines.push(`Result preview:\n${previewResult(handle.resultText)}`);
-		lines.push(resultPath ? `Preview truncated for transport safety. Use read on ${resultPath} for the full result.` : "Preview truncated for transport safety.");
-		return lines.join("\n\n");
-	}
-
-	async function formatHandleSummary(handle: SubagentHandle): Promise<string> {
-		const base = `#${handle.id} ${handle.agent.name} ${handle.state} - ${truncate(handle.task, 70)}`;
-		const detail = handle.statusText || truncate(handle.resultText, 90) || truncate(handle.error, 90);
-		const usage = formatUsage(handle.usage, handle.model);
-		const resultPath = handle.resultText ? await ensureResultPersisted(handle) : undefined;
-		return [base, detail ? `  ${detail}` : "", resultPath ? `  result ${resultPath}` : "", usage ? `  ${usage}` : ""]
-			.filter(Boolean)
-			.join("\n");
-	}
-
-	async function getActiveOrRecentSummary(includeCompleted = true): Promise<string> {
-		const list = sortHandles([...handles.values()]).filter((handle) => includeCompleted || isHandleActive(handle));
-		if (list.length === 0) return "No subagents tracked yet.";
-		return (await Promise.all(list.map((handle) => formatHandleSummary(handle)))).join("\n\n");
-	}
-
-	function spawnSubagent(agent: AgentConfig, task: string, cwd: string, modelOverride?: string): SubagentHandle {
-		const id = createId();
-		const selectedModel = agent.model || modelOverride;
-		const handle: SubagentHandle = {
-			id,
-			agent,
-			task,
-			cwd,
-			state: "starting",
-			statusText: "Launching…",
-			resultText: "",
-			stderr: "",
-			startedAt: now(),
-			updatedAt: now(),
-			usage: createUsage(),
-			model: selectedModel,
-			waiters: [],
-		};
-		handles.set(handle.id, handle);
-		refreshUi();
-
-		const childActiveTools = getRequestedChildTools(agent);
-		const args = ["--mode", "rpc", "--no-session", "--extension", childExtensionPath];
-		if (selectedModel) args.push("--model", selectedModel);
-
-		const invocation = getPiInvocation(args);
-		const proc = spawn(invocation.command, invocation.args, {
-			cwd,
-			stdio: ["pipe", "pipe", "pipe"],
-			env: {
-				...process.env,
-				PI_SUBAGENT_AGENT_NAME: agent.name,
-				PI_SUBAGENT_SYSTEM_PROMPT: agent.systemPrompt,
-				PI_SUBAGENT_ACTIVE_TOOLS: childActiveTools.join(","),
-				PI_SUBAGENT_DEPTH: String(getSubagentDepth() + 1),
-			},
-			shell: false,
-		});
-		proc.stdout.setEncoding("utf8");
-		proc.stderr.setEncoding("utf8");
-
-		handle.process = proc;
-		if (typeof proc.pid === "number") updateHandle(handle, { statusText: "Starting RPC session…" });
-
-		let stdoutBuffer = "";
-		const processLine = (line: string) => {
-			if (!line.trim()) return;
-			let message: any;
-			try {
-				message = JSON.parse(line);
-			} catch {
-				return;
-			}
-
-			if (message.type === "response") {
-				if (message.command === "prompt" && message.success === false) {
-					updateHandle(handle, { state: "error", error: String(message.error || "Failed to start prompt"), statusText: String(message.error || "Prompt failed") });
-				}
-				return;
-			}
-
-			if (message.type === "agent_start") {
-				updateHandle(handle, { state: "running", statusText: "Working…" });
-				return;
-			}
-
-			if (message.type === "tool_execution_start") {
-				const toolName = String(message.toolName || "");
-				if (toolName === "update_status") {
-					const status = typeof message.args?.message === "string" ? message.args.message : "Working…";
-					updateHandle(handle, { state: "running", statusText: status, lastTool: undefined });
-				} else {
-					updateHandle(handle, { state: "running", lastTool: toolName, statusText: handle.statusText || `Using ${toolName}` });
-				}
-				return;
-			}
-
-			if (message.type === "message_end" && message.message?.role === "assistant") {
-				const assistantText = extractText(message.message.content);
-				const assistantStopReason = message.message.stopReason;
-				const assistantError = message.message.errorMessage;
-				const usage = message.message.usage || {};
-				handle.usage.input += usage.input || 0;
-				handle.usage.output += usage.output || 0;
-				handle.usage.cacheRead += usage.cacheRead || 0;
-				handle.usage.cacheWrite += usage.cacheWrite || 0;
-				handle.usage.cost += usage.cost?.total || 0;
-				handle.usage.turns += 1;
-				const assistantFailed = assistantStopReason === "error" || !!assistantError;
-				updateHandle(handle, {
-					state: assistantFailed && handle.state !== "killed" ? "error" : handle.state,
-					resultText: assistantText || handle.resultText,
-					stopReason: assistantStopReason || handle.stopReason,
-					error: assistantError || handle.error,
-					statusText:
-						assistantFailed && handle.state !== "killed"
-							? truncate(assistantError || assistantText || "Subagent failed", 96)
-							: handle.statusText,
-					model: handle.model || message.message.model,
-				});
-				return;
-			}
-
-			if (message.type === "agent_end") {
-				const finalState: SubagentState = handle.state === "error" ? "error" : handle.state === "killed" ? "killed" : "done";
-				const finalStatus =
-					finalState === "done"
-						? truncate(handle.resultText, 96) || "Done"
-						: finalState === "killed"
-							? handle.error || handle.statusText || "Killed"
-							: truncate(handle.error || handle.statusText, 96) || "Finished";
-				updateHandle(handle, { state: finalState, statusText: finalStatus });
-				settleHandle(handle);
-				setTimeout(() => {
-					try {
-						handle.process?.kill("SIGTERM");
-					} catch {
-						// ignore
-					}
-				}, 50);
-				setTimeout(() => {
-					try {
-						handle.process?.kill("SIGKILL");
-					} catch {
-						// ignore
-					}
-				}, 1500);
-				return;
-			}
-
-			if (message.type === "extension_error") {
-				handle.stderr += `${message.extensionPath || "extension"}: ${message.error || "Unknown extension error"}\n`;
-				updateHandle(handle, { statusText: truncate(String(message.error || "Extension error"), 96) });
-			}
-		};
-
-		proc.stdout.on("data", (chunk: string) => {
-			stdoutBuffer += chunk;
-			while (true) {
-				const newlineIndex = stdoutBuffer.indexOf("\n");
-				if (newlineIndex === -1) break;
-				let line = stdoutBuffer.slice(0, newlineIndex);
-				stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1);
-				if (line.endsWith("\r")) line = line.slice(0, -1);
-				processLine(line);
-			}
-		});
-
-		proc.stderr.on("data", (chunk: string) => {
-			handle.stderr += chunk;
-		});
-
-		proc.on("error", (error) => {
-			updateHandle(handle, { state: "error", error: error.message, statusText: error.message });
-			settleHandle(handle);
-		});
-
-		proc.on("close", (code, signal) => {
-			if (stdoutBuffer.trim()) processLine(stdoutBuffer.trim());
-			handle.process = undefined;
-			handle.exitCode = code ?? (signal ? 1 : 0);
-			if (!handle.completionSettled) {
-				if (handle.state !== "killed") {
-					if (code === 0 && handle.state !== "error") {
-						updateHandle(handle, { state: "done", statusText: truncate(handle.resultText, 96) || "Done" });
-					} else {
-						const exitDetail = signal ? `Exited via signal ${signal}` : `Exited with code ${code ?? 0}`;
-						const errorText = truncate(handle.error || handle.stderr || exitDetail, 120);
-						updateHandle(handle, { state: "error", error: errorText, statusText: errorText });
-					}
-				}
-				settleHandle(handle);
-			}
-		});
-
-		sendRpc(proc, { id: `${id}:prompt`, type: "prompt", message: task });
-		return handle;
 	}
 
 	async function getAgents(ctx: ExtensionContext, cwd = ctx.cwd): Promise<AgentDiscovery> {
 		return discoverAgents(cwd, __dirname);
 	}
 
-	async function materializeAgent(ctx: ExtensionContext, spec: TaskSpec): Promise<{ discovery: AgentDiscovery; agent?: AgentConfig; error?: string }> {
-		const discovery = await getAgents(ctx, spec.cwd || ctx.cwd);
+	function selectedAgentDiagnostic(discovery: AgentDiscovery, agent: AgentConfig): AgentDiscoveryDiagnostic | undefined {
+		return discovery.diagnostics.find((diagnostic) => diagnostic.agent === agent.name && diagnostic.sourcePath === agent.filePath);
+	}
+
+	async function materializeAgent(
+		ctx: ExtensionContext,
+		spec: TaskSpec,
+	): Promise<{ discovery: AgentDiscovery; agent?: AgentConfig; error?: string; diagnostic?: AgentDiscoveryDiagnostic }> {
+		const cwd = spec.cwd || ctx.cwd;
+		const discovery = await getAgents(ctx, cwd);
 		const base = spec.agent ? discovery.agents.find((candidate) => candidate.name === spec.agent) : undefined;
-		if (spec.agent && !base) {
-			return {
-				discovery,
-				error: `Unknown subagent: ${spec.agent}`,
-			};
+		if (spec.agent && !base) return { discovery, error: `Unknown subagent: ${spec.agent}` };
+		if (base) {
+			const diagnostic = selectedAgentDiagnostic(discovery, base);
+			if (diagnostic) {
+				return {
+					discovery,
+					diagnostic,
+					error: `Invalid selected-agent frontmatter: ${JSON.stringify(diagnostic)}`,
+				};
+			}
 		}
 
 		const defaultPrompt = `You are an ad hoc delegated subagent working in an isolated context.
@@ -1086,36 +931,192 @@ export default function subagentExtension(pi: ExtensionAPI) {
 - Be concise and high-signal.
 - Use tools as needed, but avoid unnecessary work.
 - Return a definitive answer useful to the parent agent.
-- Never call subagent_run or subagent_start from within a subagent; report any need for further delegation back to the parent agent.`;
-		const mergedPrompt = [base?.systemPrompt || defaultPrompt, spec.systemPrompt || ""].filter(Boolean).join("\n\n");
-		const agent: AgentConfig = {
-			name: spec.name || base?.name || "adhoc",
-			description: base?.description || "Ad hoc delegated subagent",
-			tools: spec.tools && spec.tools.length > 0 ? spec.tools : base?.tools,
-			model: spec.model || base?.model,
-			systemPrompt: mergedPrompt,
-			source: base?.source || "builtin",
-			filePath: base?.filePath || "(ad hoc)",
+- Never call subagent_start from within a subagent; nested delegation is disabled.`;
+		return {
+			discovery,
+			agent: {
+				name: spec.name || base?.name || "adhoc",
+				description: base?.description || "Ad hoc delegated subagent",
+				tools: spec.tools && spec.tools.length > 0 ? spec.tools : base?.tools,
+				model: spec.model ?? base?.model,
+				thinking: spec.thinking ?? base?.thinking,
+				systemPrompt: [base?.systemPrompt || defaultPrompt, spec.systemPrompt || ""].filter(Boolean).join("\n\n"),
+				source: base?.source || "builtin",
+				filePath: base?.filePath || "(ad hoc)",
+			},
 		};
-		return { discovery, agent };
 	}
 
-	async function materializeValidatedAgent(ctx: ExtensionContext, spec: TaskSpec): Promise<{ discovery: AgentDiscovery; agent?: AgentConfig; error?: string }> {
-		const result = await materializeAgent(ctx, spec);
-		if (!result.agent?.model) return result;
-		const resolvedModel = resolveKnownModel(ctx, result.agent.model);
-		if (!resolvedModel.ref) {
-			return { discovery: result.discovery, error: resolvedModel.error || "Invalid model override" };
+	async function materializeValidatedAgent(
+		ctx: ExtensionContext,
+		spec: TaskSpec,
+	): Promise<{ discovery: AgentDiscovery; agent?: AgentConfig; requestedModel?: string; requestedThinking?: ThinkingLevel; error?: string; diagnostic?: AgentDiscoveryDiagnostic }> {
+		const materialized = await materializeAgent(ctx, spec);
+		if (!materialized.agent) return materialized;
+		const requestedModel = materialized.agent.model || getParentModel(ctx);
+		if (!requestedModel) return { ...materialized, error: "No parent model is selected, and this subagent did not specify model." };
+		const resolvedModel = resolveKnownModel(ctx, requestedModel);
+		if (!resolvedModel.ref) return { ...materialized, error: resolvedModel.error || "Invalid subagent model." };
+		const requestedThinking = materialized.agent.thinking || pi.getThinkingLevel();
+		if (!isThinkingLevel(requestedThinking)) return { ...materialized, error: `Invalid requested thinking level: ${String(requestedThinking)}` };
+		return {
+			...materialized,
+			agent: { ...materialized.agent, model: resolvedModel.ref, thinking: requestedThinking },
+			requestedModel: resolvedModel.ref,
+			requestedThinking,
+		};
+	}
+
+	async function spawnSubagent(agent: AgentConfig, task: string, cwd: string, requestedModel: string, requestedThinking: ThinkingLevel): Promise<SubagentHandle> {
+		const cwdError = await validateCwd(cwd);
+		if (cwdError) throw new Error(cwdError);
+		const id = createId();
+		const sessionDir = join(getAgentDir(), "sessions", "subagents", id);
+		const promptPath = join(sessionDir, "pi-effective-system-prompt.txt");
+		await fs.mkdir(sessionDir, { recursive: true, mode: 0o700 });
+		await fs.chmod(sessionDir, 0o700).catch(() => {});
+
+		const handle: SubagentHandle = {
+			id,
+			agent,
+			task,
+			cwd,
+			state: "starting",
+			requestedModel,
+			requestedThinking,
+			configuredTools: getRequestedChildTools(agent),
+			sessionDir,
+			promptPath,
+			resultText: "",
+			stderr: "",
+			diagnostics: [],
+			createdAt: now(),
+			lastActivityAt: now(),
+			activeTools: new Map(),
+			isStreaming: false,
+			usage: createUsage(),
+			requestSequence: 0,
+			pendingRequests: new Map(),
+			completionSettled: false,
+			waiters: new Set(),
+			terminationTimers: new Set(),
+		};
+		handles.set(id, handle);
+		refreshUi();
+
+		try {
+			const args = [
+				"--mode",
+				"rpc",
+				"--session-dir",
+				sessionDir,
+				"--name",
+				`${safeFileFragment(agent.name)}-${id.slice(0, 6)}`,
+				"--extension",
+				childExtensionPath,
+				"--model",
+				requestedModel,
+				"--thinking",
+				requestedThinking,
+			];
+			const invocation = getPiInvocation(args);
+			const proc = spawn(invocation.command, invocation.args, {
+				cwd,
+				stdio: ["pipe", "pipe", "pipe"],
+				detached: process.platform !== "win32",
+				windowsHide: true,
+				shell: false,
+				env: {
+					...process.env,
+					PI_SUBAGENT_AGENT_NAME: agent.name,
+					PI_SUBAGENT_SYSTEM_PROMPT: agent.systemPrompt,
+					PI_SUBAGENT_ACTIVE_TOOLS: handle.configuredTools.join(","),
+					PI_SUBAGENT_DEPTH: String(getSubagentDepth() + 1),
+					PI_SUBAGENT_PROMPT_PATH: promptPath,
+				},
+			});
+			attachProcess(handle, proc);
+			const stateResponse = await requestRpc(handle, "get_state", {}, STARTUP_TIMEOUT_MS);
+			const state = stateResponse.data as Record<string, unknown> | undefined;
+			const actualModel = asActualModel(state?.model);
+			const actualThinking = state?.thinkingLevel;
+			const sessionPath = state?.sessionFile;
+			if (!actualModel || !isThinkingLevel(actualThinking) || typeof sessionPath !== "string" || !sessionPath) {
+				throw new Error("Child startup failed: Pi get_state did not provide model, thinkingLevel, and sessionFile.");
+			}
+			handle.actualModel = actualModel;
+			handle.actualThinking = actualThinking;
+			handle.sessionPath = sessionPath;
+			handle.rpcReadyAt = now();
+			updateHandle(handle);
+			await requestRpc(handle, "prompt", { message: task }, STARTUP_TIMEOUT_MS);
+			if (handle.state === "starting") handle.state = "running";
+			updateHandle(handle);
+			return handle;
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			handle.error = `Child startup failed: ${message}`;
+			addDiagnostic(handle, handle.error);
+			await terminateHandle(handle, handle.error);
+			handles.delete(handle.id);
+			refreshUi();
+			throw new Error(handle.error);
 		}
-		return { discovery: result.discovery, agent: { ...result.agent, model: resolvedModel.ref } };
 	}
 
-	async function waitForAll(handlesToWait: SubagentHandle[], timeoutMs?: number): Promise<SubagentHandle[]> {
-		return Promise.all(handlesToWait.map((handle) => waitForHandle(handle, timeoutMs)));
+	function waitForTargets(targets: SubagentHandle[], timeoutSeconds: number, signal: AbortSignal | undefined): Promise<"completed" | "timedOut" | "canceled"> {
+		if (targets.every((handle) => handle.completionSettled)) return Promise.resolve("completed");
+		return new Promise((resolve) => {
+			let settled = false;
+			const cleanup = () => {
+				clearTimeout(timer);
+				signal?.removeEventListener("abort", onAbort);
+				for (const [handle, waiter] of waiters) handle.waiters.delete(waiter);
+			};
+			const finish = (outcome: "completed" | "timedOut" | "canceled") => {
+				if (settled) return;
+				settled = true;
+				cleanup();
+				resolve(outcome);
+			};
+			const check = () => {
+				if (targets.every((handle) => handle.completionSettled)) finish("completed");
+			};
+			const waiters = new Map<SubagentHandle, () => void>();
+			for (const handle of targets) {
+				if (handle.completionSettled) continue;
+				const waiter = () => check();
+				waiters.set(handle, waiter);
+				handle.waiters.add(waiter);
+			}
+			const timer = setTimeout(() => finish("timedOut"), timeoutSeconds * 1000);
+			const onAbort = () => finish("canceled");
+			if (signal?.aborted) {
+				finish("canceled");
+				return;
+			}
+			signal?.addEventListener("abort", onAbort, { once: true });
+			check();
+		});
 	}
 
-	async function waitForAllOrAbort(handlesToWait: SubagentHandle[], timeoutMs: number | undefined, signal?: AbortSignal): Promise<SubagentHandle[]> {
-		return Promise.all(handlesToWait.map((handle) => waitForHandleOrAbort(handle, timeoutMs, signal)));
+	async function steerHandle(handle: SubagentHandle, message: string): Promise<string> {
+		if (!isHandleActive(handle)) throw new Error(`Subagent #${handle.id} is already ${handle.state}.`);
+		if (!message.trim()) throw new Error("Steering message must not be empty.");
+		await requestRpc(handle, "steer", { message: message.trim() }, RPC_TIMEOUT_MS);
+		updateHandle(handle);
+		return `Pi accepted steering for #${handle.id} (${handle.agent.name}); it will be applied at Pi's next safe point.`;
+	}
+
+	function clearFinishedHandles(): number {
+		let count = 0;
+		for (const handle of handles.values()) {
+			if (!isTerminal(handle)) continue;
+			handles.delete(handle.id);
+			count++;
+		}
+		refreshUi();
+		return count;
 	}
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -1124,31 +1125,11 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		refreshUi();
 	});
 
-	pi.on("session_switch", async (_event, ctx) => {
+	pi.on("session_shutdown", async (_event, ctx) => {
 		rememberContext(ctx);
-		clearAgentDiscoveryCache();
-		await killAll("Session switched");
-		handles.clear();
-		refreshUi();
-	});
-
-	pi.on("session_fork", async (_event, ctx) => {
-		rememberContext(ctx);
-		clearAgentDiscoveryCache();
-		await killAll("Session forked");
-		handles.clear();
-		refreshUi();
-	});
-
-	pi.on("session_shutdown", async () => {
 		await killAll("Parent session shutting down");
-	});
-
-	pi.on("agent_end", async (event, ctx) => {
-		rememberContext(ctx);
-		const lastAssistant = [...event.messages].reverse().find(isAbortedAssistantMessage);
-		if (!lastAssistant) return;
-		await killAll("Parent agent aborted");
+		if (ctx.mode === "tui") ctx.ui.setWidget("subagent", undefined);
+		latestCtx = null;
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
@@ -1156,169 +1137,104 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		const discovery = await getAgents(ctx);
 		const guidance = isNestedSubagent()
 			? `\n\nSubagent extension is loaded in this delegated child to preserve the parent environment.
-You are already inside a subagent. Never call subagent_run or subagent_start from within a subagent.
+You are already inside a subagent. Never call subagent_start from within a subagent.
 If further delegation seems useful, report that back to the parent agent instead.`
 			: `\n\nSubagent extension is available.
-Do not use subagent_run or subagent_start unless the user explicitly asks you to delegate work to a subagent or spawn one.
-Use subagent_list, subagent_wait, and subagent_kill to inspect or control background subagents when relevant.
-Use list_models to inspect the exact model ids accepted by subagent model overrides in this session.
-A subagent call may either reference a predefined agent via {agent: "name", ...} or be ad hoc by omitting agent and providing task plus optional systemPrompt/tools/model overrides.
-Per-call model overrides are supported via model: "provider/model-id".
+Only use subagent_start when the user explicitly asks to delegate work. It starts in the background after a bounded startup handshake.
+Use subagent_list and subagent_status to inspect children. Use subagent_wait with a required finite timeoutSeconds when waiting; timeout or cancellation never kills a child. Use subagent_steer to redirect running work and subagent_kill only to terminate it.
+Use list_models to inspect exact accepted child model IDs before setting model when needed.
+A subagent call may reference a predefined agent via {agent: "name", ...} or be ad hoc by omitting agent and providing task plus optional systemPrompt/tools/model/thinking overrides.
+Model and thinking precedence is per-call, then predefined agent, then parent session. Nested delegation is blocked.
 Available predefined subagents:\n${formatAgentList(discovery.agents, 20)}`;
 		return { systemPrompt: event.systemPrompt + guidance };
 	});
 
 	pi.registerTool({
-		name: "subagent_run",
-		label: "Subagent Run",
-		description:
-			"Run one focused subagent task, a small parallel swarm, or a sequential chain. Only use this when the user explicitly asks you to delegate work to a subagent or spawn one.",
-		promptSnippet: "Only when the user explicitly asks, delegate work to a specialized subagent or small swarm.",
-		promptGuidelines: [
-			"Do not use subagent_run unless the user explicitly asks for delegation, a subagent, or a swarm.",
-			"Never call subagent_run from within a delegated subagent; nested delegation is disabled.",
-			"Use tasks[] for small independent swarms, and chain[] for stepwise handoffs using {previous}.",
-			"Use list_models before setting a child model override when you are unsure which exact model ids are accepted.",
-			"You can override the child model per call with model: \"provider/model-id\".",
-			"For ad hoc subagents, omit agent and provide task plus optional systemPrompt, tools, and model.",
-		],
-		parameters: RunSchema,
-		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-			rememberContext(ctx);
-			if (isNestedSubagent()) return nestedDelegationBlocked("subagent_run");
-
-			const parentModel = getModelCliArg(ctx);
-
-			if (typeof params.task === "string" && !Array.isArray(params.tasks) && !Array.isArray(params.chain)) {
-				const { discovery, agent, error } = await materializeValidatedAgent(ctx, params as TaskSpec);
-				if (!agent) {
-					return {
-						content: [{ type: "text", text: `${error || "Invalid subagent spec"}\n\nAvailable subagents:\n${formatAgentList(discovery.agents)}` }],
-						details: { availableAgents: discovery.agents.map((value) => value.name) },
-					};
-				}
-
-				const handle = spawnSubagent(agent, params.task, params.cwd || ctx.cwd, parentModel);
-				bindAbort(signal, handle, "Caller aborted subagent_run");
-				const result = await waitForHandle(handle);
-				return {
-					content: [{ type: "text", text: await formatSingleResult(result) }],
-					details: { handles: [await serializeHandleForReturn(result)] },
-				};
-			}
-
-			if (Array.isArray(params.tasks) && params.tasks.length > 0) {
-				if (params.tasks.length > MAX_PARALLEL_TASKS) {
-					return {
-						content: [{ type: "text", text: `Too many parallel tasks (${params.tasks.length}). Max is ${MAX_PARALLEL_TASKS}.` }],
-						details: {},
-					};
-				}
-
-				const discovery = await getAgents(ctx);
-				const materialized = await Promise.all((params.tasks as TaskSpec[]).map((task) => materializeValidatedAgent(ctx, task)));
-				const failures = materialized.filter((value) => !value.agent);
-				if (failures.length > 0) {
-					return {
-						content: [{ type: "text", text: `${failures.map((value) => value.error || "Invalid subagent spec").join("\n")}\n\nAvailable subagents:\n${formatAgentList(discovery.agents)}` }],
-						details: {},
-					};
-				}
-
-				const spawned = await mapWithConcurrencyLimit(params.tasks as TaskSpec[], MAX_CONCURRENCY, async (task, index) => {
-					if (signal?.aborted) throw new Error("Caller aborted subagent swarm");
-					const agent = materialized[index]!.agent!;
-					const handle = spawnSubagent(agent, task.task, task.cwd || ctx.cwd, parentModel);
-					bindAbort(signal, handle, "Caller aborted subagent swarm");
-					return waitForHandle(handle);
-				});
-
-				const summary = (await Promise.all(spawned.map((handle) => formatHandleSummary(handle)))).join("\n\n");
-				return {
-					content: [{ type: "text", text: summary || "Parallel swarm finished." }],
-					details: { handles: await serializeHandlesForReturn(spawned) },
-				};
-			}
-
-			const discovery = await getAgents(ctx);
-			const chain = Array.isArray(params.chain) ? (params.chain as TaskSpec[]) : [];
-			if (chain.length === 0) {
-				return {
-					content: [{ type: "text", text: `Invalid subagent_run call. Provide either {agent, task}, {tasks:[...]}, or {chain:[...]}.\n\nAvailable subagents:\n${formatAgentList(discovery.agents)}` }],
-					details: {},
-				};
-			}
-			const results: SubagentHandle[] = [];
-			let previous = "";
-			for (let i = 0; i < chain.length; i++) {
-				const step = chain[i]!;
-				const { discovery: currentDiscovery, agent, error } = await materializeValidatedAgent(ctx, step);
-				if (!agent) {
-					return {
-						content: [{ type: "text", text: `${error || `Invalid chain step ${i + 1}`}\n\nAvailable subagents:\n${formatAgentList(currentDiscovery.agents)}` }],
-						details: { handles: await serializeHandlesForReturn(results) },
-					};
-				}
-				const task = step.task.replace(/\{previous\}/g, () => previous);
-				const handle = spawnSubagent(agent, task, step.cwd || ctx.cwd, parentModel);
-				bindAbort(signal, handle, "Caller aborted subagent chain");
-				const result = await waitForHandle(handle);
-				results.push(result);
-				if (result.state !== "done") {
-					return {
-						content: [{ type: "text", text: `Chain stopped at step ${i + 1} (${step.agent || result.agent.name}):\n\n${await formatSingleResult(result)}` }],
-						details: { handles: await serializeHandlesForReturn(results) },
-					};
-				}
-				previous = result.resultText;
-			}
-
-			return {
-				content: [{ type: "text", text: results.length > 0 ? await formatSingleResult(results[results.length - 1]!) : "Chain finished." }],
-				details: { handles: await serializeHandlesForReturn(results) },
-			};
-		},
-	});
-
-	pi.registerTool({
 		name: "subagent_start",
 		label: "Subagent Start",
-		description: "Start a background subagent and return immediately with its id. Only use this when the user explicitly asks you to spawn a background subagent.",
-		promptSnippet: "Only when the user explicitly asks, start a background subagent and return its id.",
+		description: "Start one isolated background subagent after a bounded Pi RPC startup handshake. Returns actual runtime model/thinking and the authoritative allocated session path.",
+		promptSnippet: "Start an explicitly requested background subagent and receive its ID, actual runtime metadata, and session path.",
 		promptGuidelines: [
-			"Do not use subagent_start unless the user explicitly asks for a background subagent.",
+			"Use subagent_start only when the user explicitly asks for delegation or a subagent.",
 			"Never call subagent_start from within a delegated subagent; nested delegation is disabled.",
+			"Inspect background work with subagent_status or subagent_list, wait only with finite timeoutSeconds, steer with subagent_steer, and terminate only with subagent_kill.",
 		],
-		parameters: SingleSchema,
+		parameters: TaskSpecSchema,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			rememberContext(ctx);
-			if (isNestedSubagent()) return nestedDelegationBlocked("subagent_start");
-			const { discovery, agent, error } = await materializeValidatedAgent(ctx, params as TaskSpec);
-			if (!agent) {
+			if (isNestedSubagent()) return nestedDelegationBlocked();
+			const spec = params as TaskSpec;
+			const materialized = await materializeValidatedAgent(ctx, spec);
+			if (!materialized.agent || !materialized.requestedModel || !materialized.requestedThinking) {
 				return {
-					content: [{ type: "text", text: `${error || "Invalid subagent spec"}\n\nAvailable subagents:\n${formatAgentList(discovery.agents)}` }],
-					details: {},
+					content: [{ type: "text", text: `${materialized.error || "Invalid subagent spec"}\n\nAvailable subagents:\n${formatAgentList(materialized.discovery.agents)}` }],
+					details: { diagnostic: materialized.diagnostic },
 				};
 			}
-			const handle = spawnSubagent(agent, params.task, params.cwd || ctx.cwd, getModelCliArg(ctx));
-			return {
-				content: [{ type: "text", text: `Started subagent #${handle.id} (${agent.name}).` }],
-				details: { handle: await serializeHandleForReturn(handle) },
-			};
+			try {
+				const handle = await spawnSubagent(
+					materialized.agent,
+					spec.task,
+					spec.cwd || ctx.cwd,
+					materialized.requestedModel,
+					materialized.requestedThinking,
+				);
+				const serial = await serializeHandle(handle);
+				return {
+					content: [{ type: "text", text: sanitizeTerminalText(`Started subagent #${serial.id} (${serial.name}) in the background. Actual ${formatActualModel(serial.actualModel)} · thinking:${serial.actualThinking}. Session: ${serial.sessionPath} (${serial.transcriptNote}). Use subagent_status, subagent_wait with timeoutSeconds, subagent_steer, or subagent_kill to control it.`) }],
+					details: { handle: serial },
+				};
+			} catch (error) {
+				return { content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }], details: {} };
+			}
 		},
 	});
 
 	pi.registerTool({
 		name: "subagent_list",
 		label: "Subagent List",
-		description: "List tracked subagents and their current status.",
+		description: "List current and retained subagent handles with actual model/thinking and artifact paths.",
 		parameters: ListSchema,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			rememberContext(ctx);
-			const summary = await getActiveOrRecentSummary(params.includeCompleted ?? true);
+			const selected = readyHandles().filter((handle) => (params.includeFinished ?? true) || isHandleActive(handle));
 			return {
-				content: [{ type: "text", text: summary }],
-				details: { handles: await serializeHandlesForReturn(sortHandles([...handles.values()])) },
+				content: [{ type: "text", text: await activeOrRecentSummary(params.includeFinished ?? true) }],
+				details: { handles: await serializeHandles(selected) },
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "subagent_status",
+		label: "Subagent Status",
+		description: "Return detailed machine-facing lifecycle, activity, usage, actual runtime metadata, and artifact paths for one subagent.",
+		parameters: StatusSchema,
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			rememberContext(ctx);
+			const handle = handles.get(params.id);
+			if (!handle || !handle.actualModel || !handle.actualThinking || !handle.sessionPath) {
+				return { content: [{ type: "text", text: `Unknown subagent id: ${params.id}` }], details: {} };
+			}
+			const serial = await serializeHandle(handle);
+			return {
+				content: [{ type: "text", text: await formatHandleSummary(handle) }],
+				details: {
+					...serial,
+					timestamps: {
+						createdAt: serial.createdAt,
+						rpcReadyAt: serial.rpcReadyAt,
+						agentStartedAt: serial.agentStartedAt,
+						lastActivityAt: serial.lastActivityAt,
+						completedAt: serial.completedAt,
+					},
+					activity: {
+						currentTool: serial.currentTool,
+						currentToolStartedAt: serial.currentToolStartedAt,
+						lastTool: serial.lastTool,
+						streaming: serial.isStreaming,
+					},
+				},
 			};
 		},
 	});
@@ -1326,115 +1242,146 @@ Available predefined subagents:\n${formatAgentList(discovery.agents, 20)}`;
 	pi.registerTool({
 		name: "subagent_wait",
 		label: "Subagent Wait",
-		description: "Wait for a background subagent, or all active subagents, to finish.",
+		description: "Wait for one handle or a snapshot of all active handles. timeoutSeconds is required and never terminates a child.",
 		parameters: WaitSchema,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			rememberContext(ctx);
-			let targets: SubagentHandle[] = [];
-			if (params.id) {
-				const handle = handles.get(params.id);
-				if (!handle) {
-					return { content: [{ type: "text", text: `Unknown subagent id: ${params.id}` }], details: {} };
+			if (!Number.isFinite(params.timeoutSeconds) || params.timeoutSeconds < 1) {
+				return { content: [{ type: "text", text: "timeoutSeconds must be a finite number of at least 1." }], details: { outcome: "completed", handles: [] } };
+			}
+			const hasId = typeof params.id === "string" && params.id.length > 0;
+			const hasAll = params.all === true;
+			if (hasId === hasAll) {
+				return { content: [{ type: "text", text: "Provide exactly one target: {id, timeoutSeconds} or {all:true, timeoutSeconds}." }], details: { outcome: "completed", handles: [] } };
+			}
+			let targets: SubagentHandle[];
+			if (hasId) {
+				const handle = handles.get(params.id!);
+				if (!handle || !handle.actualModel || !handle.actualThinking || !handle.sessionPath) {
+					return { content: [{ type: "text", text: `Unknown subagent id: ${params.id}` }], details: { outcome: "completed", handles: [] } };
 				}
 				targets = [handle];
 			} else {
-				if (params.all === false) {
-					return {
-						content: [{ type: "text", text: "Invalid subagent_wait call. Provide {id} to wait for one subagent, or omit id / set {all:true} to wait for all active subagents." }],
-						details: { handles: await serializeHandlesForReturn(sortHandles([...handles.values()])) },
-					};
-				}
-				targets = [...handles.values()].filter(isHandleActive);
-				if (targets.length === 0) {
-					return {
-						content: [{ type: "text", text: "No active subagents to wait for." }],
-						details: { handles: await serializeHandlesForReturn(sortHandles([...handles.values()])) },
-					};
-				}
+				targets = readyHandles().filter(isHandleActive);
 			}
-			const results = await waitForAllOrAbort(targets, params.timeoutMs, signal);
+			const outcome = await waitForTargets(targets, params.timeoutSeconds, signal);
+			const serial = await serializeHandles(targets);
+			const summary = targets.length === 0 ? "No active subagents were present in this wait snapshot." : (await Promise.all(targets.map((handle) => formatHandleSummary(handle)))).join("\n\n");
+			const hint = outcome === "completed" ? "" : " Use subagent_status, another bounded subagent_wait, subagent_steer, or subagent_kill; the child was not terminated.";
 			return {
-				content: [{ type: "text", text: (await Promise.all(results.map((handle) => formatHandleSummary(handle)))).join("\n\n") }],
-				details: { handles: await serializeHandlesForReturn(results) },
+				content: [{ type: "text", text: `${outcome === "completed" ? "Wait completed." : outcome === "timedOut" ? "Wait timed out." : "Wait canceled."}${hint}\n\n${summary}` }],
+				details: { outcome, handles: serial },
 			};
+		},
+	});
+
+	pi.registerTool({
+		name: "subagent_steer",
+		label: "Subagent Steer",
+		description: "Queue a correlated Pi native steering message for a running subagent without waiting for completion.",
+		parameters: SteerSchema,
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			rememberContext(ctx);
+			const handle = handles.get(params.id);
+			if (!handle) return { content: [{ type: "text", text: `Unknown subagent id: ${params.id}` }], details: {} };
+			try {
+				const acknowledgement = await steerHandle(handle, params.message);
+				return { content: [{ type: "text", text: acknowledgement }], details: { handle: await serializeHandle(handle), accepted: true } };
+			} catch (error) {
+				return { content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }], details: { handle: handle.actualModel ? await serializeHandle(handle) : undefined, accepted: false } };
+			}
 		},
 	});
 
 	pi.registerTool({
 		name: "subagent_kill",
 		label: "Subagent Kill",
-		description: "Abort a running background subagent.",
+		description: "Idempotently terminate a child with Pi abort, POSIX process-group TERM/KILL escalation, and forced settlement deadlines.",
 		parameters: KillSchema,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			rememberContext(ctx);
 			const handle = handles.get(params.id);
-			if (!handle) {
-				return { content: [{ type: "text", text: `Unknown subagent id: ${params.id}` }], details: {} };
-			}
+			if (!handle) return { content: [{ type: "text", text: `Unknown subagent id: ${params.id}` }], details: {} };
 			if (!isHandleActive(handle)) {
-				const stateText =
-					handle.state === "done"
-						? "already completed"
-						: handle.state === "error"
-							? "already failed"
-							: handle.state === "killed"
-								? "already killed"
-								: `already ${handle.state}`;
-				return {
-					content: [{ type: "text", text: `Subagent #${handle.id} (${handle.agent.name}) is ${stateText}.` }],
-					details: { handle: await serializeHandleForReturn(handle) },
-				};
+				return { content: [{ type: "text", text: `Subagent #${handle.id} (${handle.agent.name}) is already ${handle.state}.` }], details: { handle: handle.actualModel ? await serializeHandle(handle) : undefined } };
 			}
-			const result = await killHandle(handle, "Killed via subagent_kill");
+			const result = await terminateHandle(handle, "Killed via subagent_kill");
 			return {
-				content: [{ type: "text", text: `Killed subagent #${result.id} (${result.agent.name}).\n\n${await formatSingleResult(result)}` }],
-				details: { handle: await serializeHandleForReturn(result) },
+				content: [{ type: "text", text: sanitizeTerminalText(`Terminated subagent #${result.id} (${result.agent.name}); ${resultKind(result) === "partial" ? "partial result was preserved" : "no assistant result was captured"}.\n\n${await formatHandleSummary(result)}`) }],
+				details: { handle: await serializeHandle(result) },
 			};
 		},
 	});
 
 	pi.registerCommand("subagents", {
-		description: "Open a scrollable subagent view",
+		description: "Inspect tracked subagents, prompts, transcripts, and controls",
 		handler: async (_args, ctx) => {
 			rememberContext(ctx);
-			if (!ctx.hasUI) {
-				console.log(await getActiveOrRecentSummary(true));
+			if (ctx.mode !== "tui") {
+				console.log(await activeOrRecentSummary(true));
 				return;
 			}
-			await ctx.ui.custom<void>(
-				(tui, theme, keybindings, done) =>
-					new SubagentOverlay(tui, theme, keybindings, () => sortHandles([...handles.values()]), () => done(undefined)),
-				{
-					overlay: true,
-					overlayOptions: {
-						anchor: "right-center",
-						width: "55%",
-						minWidth: 64,
-						maxWidth: 110,
-						maxHeight: "85%",
-						margin: 1,
+			try {
+				await ctx.ui.custom<void>(
+					(tui, theme, keybindings, done) => {
+						const inspector = new SubagentInspector(tui, theme, keybindings, {
+						getHandles: () =>
+							readyHandles()
+								.map(toInspectorHandle)
+								.filter((handle): handle is InspectorHandle => !!handle),
+						steer: async (id) => {
+							const handle = handles.get(id);
+							if (!handle || !isHandleActive(handle)) return `Steering unavailable: #${id} is not active.`;
+							const message = await ctx.ui.editor(`Steer #${id}`, "");
+							if (!message?.trim()) return "Steering canceled.";
+							return steerHandle(handle, message);
+						},
+						kill: async (id) => {
+							const handle = handles.get(id);
+							if (!handle || !isHandleActive(handle)) return `Kill unavailable: #${id} is not active.`;
+							const confirmed = await ctx.ui.confirm("Kill subagent?", sanitizeTerminalText(`Abort and force-terminate #${id} (${handle.agent.name}) if needed. Persisted artifacts are kept.`));
+							if (!confirmed) return "Kill canceled.";
+							await terminateHandle(handle, "Killed from /subagents");
+							return `Killed #${id}; artifacts were kept.`;
+						},
+						clearFinished: clearFinishedHandles,
+						onClose: () => {
+							inspector.dispose();
+							activeInspector = undefined;
+							done(undefined);
+						},
+						});
+						activeInspector = inspector;
+						return inspector;
 					},
-				},
-			);
+					{
+						overlay: true,
+						overlayOptions: { anchor: "right-center", width: "70%", minWidth: 72, maxWidth: 130, maxHeight: "85%", margin: 1 },
+					},
+				);
+			} finally {
+				activeInspector?.dispose();
+				activeInspector = undefined;
+			}
 		},
 	});
 
 	pi.registerCommand("subagents-toggle", {
-		description: "Toggle the subagent widget",
+		description: "Toggle the compact active-subagent widget",
 		handler: async (_args, ctx) => {
 			rememberContext(ctx);
 			widgetVisible = !widgetVisible;
 			refreshUi();
-			ctx.ui.notify(`Subagent widget ${widgetVisible ? "enabled for active subagents" : "disabled"}.`, "info");
+			if (ctx.mode === "tui") ctx.ui.notify(`Subagent widget ${widgetVisible ? "enabled" : "disabled"}.`, "info");
 		},
 	});
 
 	pi.registerCommand("subagents-kill-all", {
-		description: "Kill all running subagents",
+		description: "Kill all active subagents",
 		handler: async (_args, ctx) => {
 			rememberContext(ctx);
 			await killAll("Killed via /subagents-kill-all");
-			ctx.ui.notify("Killed all running subagents.", "warning");
+			if (ctx.mode === "tui") ctx.ui.notify("Killed all active subagents; artifacts were kept.", "warning");
 		},
 	});
 }

@@ -1,8 +1,10 @@
+import * as fs from "node:fs/promises";
+import { dirname } from "node:path";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
 
 const agentName = process.env.PI_SUBAGENT_AGENT_NAME || "subagent";
 const delegatedPrompt = process.env.PI_SUBAGENT_SYSTEM_PROMPT || "";
+const promptPath = process.env.PI_SUBAGENT_PROMPT_PATH;
 const hasInheritedActiveTools = process.env.PI_SUBAGENT_ACTIVE_TOOLS !== undefined;
 const inheritedActiveTools = (process.env.PI_SUBAGENT_ACTIVE_TOOLS || "")
 	.split(",")
@@ -10,28 +12,23 @@ const inheritedActiveTools = (process.env.PI_SUBAGENT_ACTIVE_TOOLS || "")
 	.filter(Boolean);
 const subagentDepth = Math.max(1, Number.parseInt(process.env.PI_SUBAGENT_DEPTH || "1", 10) || 1);
 
+async function captureEffectivePrompt(prompt: string): Promise<void> {
+	if (!promptPath) return;
+	try {
+		await fs.mkdir(dirname(promptPath), { recursive: true, mode: 0o700 });
+		await fs.chmod(dirname(promptPath), 0o700).catch(() => {});
+		await fs.writeFile(promptPath, prompt, { encoding: "utf8", mode: 0o600 });
+		await fs.chmod(promptPath, 0o600).catch(() => {});
+	} catch (error) {
+		process.stderr.write(`Failed to capture Pi effective system prompt: ${error instanceof Error ? error.message : String(error)}\n`);
+	}
+}
+
 export default function childSubagentExtension(pi: ExtensionAPI) {
 	const applyInheritedActiveTools = () => {
 		if (!hasInheritedActiveTools) return;
-		pi.setActiveTools(Array.from(new Set([...inheritedActiveTools, "update_status"])));
+		pi.setActiveTools(Array.from(new Set(inheritedActiveTools)));
 	};
-
-	pi.registerTool({
-		name: "update_status",
-		label: "Update Status",
-		description:
-			"Report a short progress update to the parent agent. Call this regularly when you start a new phase, switch approach, begin a tool-heavy step, discover an important finding, or are about to finish. Keep it brief and concrete.",
-		promptSnippet: "Report concise progress updates back to the parent agent.",
-		parameters: Type.Object({
-			message: Type.String({ description: "A short description of what you are currently doing" }),
-		}),
-		async execute(_toolCallId, params) {
-			return {
-				content: [{ type: "text", text: `Status updated: ${params.message}` }],
-				details: { message: params.message },
-			};
-		},
-	});
 
 	pi.on("session_start", async () => {
 		applyInheritedActiveTools();
@@ -48,12 +45,14 @@ export default function childSubagentExtension(pi: ExtensionAPI) {
 - You are a subagent, not the top-level agent.
 - Stay tightly scoped to the assigned task and return a definitive result.
 - Prefer concise, high-signal findings over long narration.
-- Never call subagent_run or subagent_start from within a subagent. Nested delegation is disabled. If further delegation seems necessary, tell the parent agent instead.
-- Call update_status({message}) regularly with short, concrete progress updates.
-- Before your final answer, call update_status with a near-final summary of what you concluded.
+- Never call subagent_start from within a subagent. Nested delegation is disabled. If further delegation seems necessary, tell the parent agent instead.
 - Your final answer should be useful to another agent that did not watch your full work.
 - Current delegated depth: ${subagentDepth}`);
 		return { systemPrompt: sections.filter(Boolean).join("\n\n") };
+	});
+
+	pi.on("agent_start", async (_event, ctx) => {
+		await captureEffectivePrompt(ctx.getSystemPrompt());
 	});
 
 	pi.on("agent_end", async (_event, ctx) => {

@@ -28,7 +28,6 @@ Guidelines:
 - Report docs / README / prompt contract mismatches only if those materials are in scope or the mismatch materially affects runtime behavior or user expectations.
 - If something looks suspicious but you cannot verify it from the code, put it in `Uncertain leads` instead of the main findings.
 - Avoid style-only nits unless they have a clear impact on correctness, readability, maintainability, or risk.
-- Call `update_status({message})` at the start, after scoping, when you have a final shortlist, and right before your final answer.
 
 Output format:
 
