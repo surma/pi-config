@@ -40,6 +40,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 // always fire; mobile mode adds a second `noti mobile` notification.
 type NotiTarget = "local" | "mobile";
 const NOTI_MESSAGE = "Agent is done";
+const STATUS_KEY = "agent-done-noti";
 
 // How long the agent must stay idle after agent_end / compaction before we
 // consider it done. Must comfortably exceed the gap between goal
@@ -67,6 +68,10 @@ export default function agentDoneNoti(pi: ExtensionAPI) {
 	// resume watching for idle once compaction finishes (vs. a manual /compact
 	// while idle, which should not produce a notification).
 	let rearmAfterCompact = false;
+
+	function updateStatus(ctx: ExtensionContext): void {
+		ctx.ui.setStatus(STATUS_KEY, mobileEnabled ? "noti:on" : "noti:off");
+	}
 
 	function cancel(): void {
 		if (timer === undefined) return;
@@ -107,18 +112,24 @@ export default function agentDoneNoti(pi: ExtensionAPI) {
 
 			if (trimmed === "mobile enable") {
 				mobileEnabled = true;
+				updateStatus(ctx);
 				ctx.ui.notify("Agent-done notifications will use `noti local` and `noti mobile`.", "info");
 				return;
 			}
 
 			if (trimmed === "mobile disable") {
 				mobileEnabled = false;
+				updateStatus(ctx);
 				ctx.ui.notify("Agent-done notifications will use `noti local` only.", "info");
 				return;
 			}
 
 			ctx.ui.notify(`Unknown /noti command.\n\n${formatStatus(mobileEnabled)}`, "warning");
 		},
+	});
+
+	pi.on("session_start", async (_event, ctx) => {
+		updateStatus(ctx);
 	});
 
 	pi.on("agent_end", async (_event, ctx) => {
@@ -145,7 +156,8 @@ export default function agentDoneNoti(pi: ExtensionAPI) {
 		arm(ctx);
 	});
 
-	pi.on("session_shutdown", async () => {
+	pi.on("session_shutdown", async (_event, ctx) => {
 		cancel();
+		ctx.ui.setStatus(STATUS_KEY, undefined);
 	});
 }

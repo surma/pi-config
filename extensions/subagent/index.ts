@@ -311,13 +311,13 @@ function isRpcResponse(value: unknown): value is Record<string, any> {
 const ThinkingSchema = StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"] as const);
 
 const TaskSpecSchema = Type.Object({
-	name: Type.Optional(Type.String({ description: "Optional display name for the child" })),
-	task: Type.String({ minLength: 1, description: "Focused task to delegate" }),
-	cwd: Type.Optional(Type.String({ description: "Working directory for the child process" })),
-	model: Type.Optional(Type.String({ description: "Optional child model override in provider/model form" })),
+	name: Type.Optional(Type.String({ description: "Optional display label for the delegated subagent" })),
+	task: Type.String({ minLength: 1, description: "Concrete, self-contained assignment for the delegated subagent" }),
+	cwd: Type.Optional(Type.String({ description: "Working directory for the subagent" })),
+	model: Type.Optional(Type.String({ description: "Optional model selection override in provider/model form" })),
 	thinking: Type.Optional(ThinkingSchema),
-	tools: Type.Optional(Type.Array(Type.String(), { description: "Optional active-tool narrowing for the child" })),
-	systemPrompt: Type.Optional(Type.String({ description: "Optional direct delegated guidance for the child" })),
+	tools: Type.Optional(Type.Array(Type.String(), { description: "Optional active-tool narrowing for the subagent" })),
+	systemPrompt: Type.Optional(Type.String({ description: "Optional additional guidance for the subagent" })),
 });
 
 const ListSchema = Type.Object({
@@ -336,7 +336,7 @@ const WaitSchema = Type.Object({
 
 const SteerSchema = Type.Object({
 	id: Type.String({ description: "Running subagent handle ID" }),
-	message: Type.String({ minLength: 1, description: "Direction to queue through Pi native steering" }),
+	message: Type.String({ minLength: 1, description: "Guidance to deliver to the running subagent at its next safe point" }),
 });
 
 const KillSchema = Type.Object({
@@ -1070,12 +1070,12 @@ A subagent call requires task. Its optional name is only a display label; cwd, s
 	pi.registerTool({
 		name: "subagent_start",
 		label: "Subagent Start",
-		description: "Start one isolated background subagent after a bounded Pi RPC startup handshake. Returns actual runtime model/thinking and the authoritative allocated session path.",
+		description: "Start one isolated background subagent after a bounded startup handshake. Returns its actual runtime configuration and authoritative session artifact path.",
 		promptSnippet: "Start an explicitly requested background subagent and receive its ID, actual runtime metadata, and session path.",
 		promptGuidelines: [
 			"Use subagent_start only when the user explicitly asks for delegation or a subagent.",
 			"Never call subagent_start from within a delegated subagent; nested delegation is disabled.",
-			"Inspect background work with subagent_status or subagent_list, wait only with finite timeoutSeconds, steer with subagent_steer, and terminate only with subagent_kill.",
+			"Inspect active work with subagent_status or subagent_list, wait only with finite timeoutSeconds, steer a running subagent with subagent_steer, and use subagent_kill only to terminate it.",
 		],
 		parameters: TaskSpecSchema,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -1152,7 +1152,7 @@ A subagent call requires task. Its optional name is only a display label; cwd, s
 	pi.registerTool({
 		name: "subagent_wait",
 		label: "Subagent Wait",
-		description: "Wait for one handle or a snapshot of all active handles. timeoutSeconds is required and never terminates a child.",
+		description: "Wait for one subagent or a snapshot of all active subagents. timeoutSeconds is required; a timeout or cancellation never terminates a subagent.",
 		parameters: WaitSchema,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			rememberContext(ctx);
@@ -1188,7 +1188,7 @@ A subagent call requires task. Its optional name is only a display label; cwd, s
 	pi.registerTool({
 		name: "subagent_steer",
 		label: "Subagent Steer",
-		description: "Queue a correlated Pi native steering message for a running subagent without waiting for completion.",
+		description: "Deliver correlated guidance to a running subagent without waiting for task completion; it is applied at the next safe point.",
 		parameters: SteerSchema,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			rememberContext(ctx);
@@ -1206,7 +1206,7 @@ A subagent call requires task. Its optional name is only a display label; cwd, s
 	pi.registerTool({
 		name: "subagent_kill",
 		label: "Subagent Kill",
-		description: "Idempotently terminate a child with Pi abort, POSIX process-group TERM/KILL escalation, and forced settlement deadlines.",
+		description: "Idempotently terminate a subagent, preserving any partial result and artifacts after bounded graceful and forced shutdown attempts.",
 		parameters: KillSchema,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			rememberContext(ctx);

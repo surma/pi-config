@@ -101,6 +101,15 @@ function escapeXml(input: string): string {
 	return input.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+function sanitizeTerminalText(value: string): string {
+	return value
+		.replace(/\r\n?/gu, "\n")
+		.replace(/[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/gu, (character) => {
+			const codePoint = character.codePointAt(0)!;
+			return `\\u${codePoint.toString(16).toUpperCase().padStart(4, "0")}`;
+		});
+}
+
 /**
  * Rendered before every auto-continuation turn as a hidden message in the
  * LLM context. Ported from codex-rs/core/templates/goals/continuation.md.
@@ -286,6 +295,7 @@ function countToolCalls(messages: unknown): number {
 
 export default function goalExtension(pi: ExtensionAPI) {
 	let currentGoal: Goal | null = null;
+	let latestCtx: ExtensionContext | null = null;
 
 	// Auto-continuation tracking.
 	// nextTurnIsContinuation: set when we schedule a continuation via
@@ -327,6 +337,18 @@ export default function goalExtension(pi: ExtensionAPI) {
 		);
 		return box;
 	});
+
+	function refreshGoalWidget(): void {
+		const ctx = latestCtx;
+		if (!ctx || ctx.mode !== "tui") return;
+		if (!currentGoal || currentGoal.status !== "active") {
+			ctx.ui.setWidget("goal", undefined);
+			return;
+		}
+		const objective = currentGoal.objective.replace(/\s+/gu, " ").trim();
+		const summary = objective.length > 160 ? `${objective.slice(0, 159)}…` : objective;
+		ctx.ui.setWidget("goal", [`${ctx.ui.theme.fg("accent", "◆ Goal")} ${sanitizeTerminalText(summary)}`]);
+	}
 
 	function cancelContinuationTimer(): void {
 		if (continuationTimer === undefined) return;
@@ -399,6 +421,7 @@ export default function goalExtension(pi: ExtensionAPI) {
 		}
 		currentGoal = goal;
 		pendingCostLimitUsd = pendingLimit;
+		refreshGoalWidget();
 		// Transient runtime flags don't persist across reload / branch nav.
 		nextTurnIsContinuation = false;
 		continuationSuppressed = false;
@@ -438,6 +461,7 @@ export default function goalExtension(pi: ExtensionAPI) {
 		continuationSuppressed = false;
 		goalCompactionInProgress = false;
 		resetCostLimitStopNotification();
+		refreshGoalWidget();
 		return currentGoal;
 	}
 
@@ -454,6 +478,7 @@ export default function goalExtension(pi: ExtensionAPI) {
 			resetCostLimitStopNotification();
 			cancelContinuationTimer();
 		}
+		refreshGoalWidget();
 		return currentGoal;
 	}
 
@@ -758,6 +783,7 @@ export default function goalExtension(pi: ExtensionAPI) {
 		goalCompactionInProgress = false;
 		resetCostLimitStopNotification();
 		cancelContinuationTimer();
+		refreshGoalWidget();
 		return true;
 	}
 
@@ -1078,12 +1104,16 @@ You cannot use this tool to pause or resume a goal; those status changes are con
 	// session switch). session_tree fires for branch navigation. Together
 	// they cover all the cases where we need to re-derive currentGoal.
 	pi.on("session_start", async (_event, ctx) => {
+		latestCtx = ctx;
 		rebuildFromBranch(ctx);
 	});
 	pi.on("session_tree", async (_event, ctx) => {
+		latestCtx = ctx;
 		rebuildFromBranch(ctx);
 	});
 	pi.on("session_shutdown", async () => {
 		cancelContinuationTimer();
+		if (latestCtx?.mode === "tui") latestCtx.ui.setWidget("goal", undefined);
+		latestCtx = null;
 	});
 }
