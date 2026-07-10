@@ -2,10 +2,10 @@
  * Long-horizon goal mode for pi.
  *
  * Port of OpenAI Codex's `/goal` feature (codex-rs v0.128.0). After every
- * agent loop, if a goal is still active, the extension auto-fires the next
- * loop with the Codex audit-before-completion harness injected as a hidden
- * developer-style message. The model can declare completion via
- * `update_goal {status:"complete"}`. The user can pause/resume/clear via
+ * settled session-level run, if a goal is still active, the extension
+ * auto-fires the next run with the Codex audit-before-completion harness
+ * injected as a hidden developer-style message. The model can declare
+ * completion via `update_goal {status:"complete"}`. The user can pause/resume/clear via
  * `/goal`.
  *
  * Differences from Codex:
@@ -27,7 +27,17 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { dlog } from "./escape-debug/log.js";
-import { readReserveTokens } from "./lib/compaction-settings.js";
+import {
+	clearContinuationSuppression,
+	createContinuationState,
+	onAgentEnd,
+	onOrdinaryInput,
+	requestContinuation,
+	resetContinuationState,
+	settleContinuation,
+	stopContinuation,
+	type ContinuationRequestDisposition,
+} from "./lib/goal-continuation.js";
 
 // ---------- Types & constants ----------
 
@@ -297,30 +307,13 @@ export default function goalExtension(pi: ExtensionAPI) {
 	let currentGoal: Goal | null = null;
 	let latestCtx: ExtensionContext | null = null;
 
-	// Auto-continuation tracking.
-	// nextTurnIsContinuation: set when we schedule a continuation via
-	//   sendMessage; consumed by before_agent_start (to skip system prompt
-	//   addendum) and agent_end (for anti-spin classification).
-	// continuationSuppressed: latched true when an auto-continuation loop
-	//   ends with zero tool calls. Reset by any productive turn (>=1 tool
-	//   call) or by genuine user input.
-	// continuationTimer: pending idle-boundary kick-off. agent_end fires before
-	//   pi has flipped to idle, so triggerTurn would otherwise be queued as a
-	//   stranded steering message and only run after the next user input.
-	let nextTurnIsContinuation = false;
-	let continuationSuppressed = false;
-	let continuationTimer: ReturnType<typeof setTimeout> | undefined = undefined;
-	let goalCompactionInProgress = false;
+	// Transient continuation policy. Pending intent is produced by agent_end
+	// and consumed only after Pi reports the session-level settlement boundary.
+	// The origin marker spans every low-level retry in that session-level run.
+	let continuationState = createContinuationState();
 	let sessionCostUsd = 0;
 	let pendingCostLimitUsd: number | null = null;
 	let lastCostLimitStopNotificationKey: string | null = null;
-
-	// pi auto-compacts when contextTokens > contextWindow - reserveTokens. The
-	// continuation uses the identical formula (compactionImminent) to hold off so
-	// it never starts a turn that races pi's compaction. Read from pi's global
-	// settings (fail-safe default) and refreshed on every branch rebuild so it
-	// always matches pi's actual threshold without a hand-synced constant.
-	let reserveTokens = readReserveTokens();
 
 	pi.registerMessageRenderer("goal-continuation", (message, _options, theme) => {
 		const details = message.details as { objective?: unknown } | undefined;
@@ -350,18 +343,11 @@ export default function goalExtension(pi: ExtensionAPI) {
 		ctx.ui.setWidget("goal", [`${ctx.ui.theme.fg("accent", "◆ Goal")} ${sanitizeTerminalText(summary)}`]);
 	}
 
-	function cancelContinuationTimer(): void {
-		if (continuationTimer === undefined) return;
-		clearTimeout(continuationTimer);
-		continuationTimer = undefined;
-	}
-
 	function resetCostLimitStopNotification(): void {
 		lastCostLimitStopNotificationKey = null;
 	}
 
 	function rebuildFromBranch(ctx: ExtensionContext): void {
-		reserveTokens = readReserveTokens();
 		sessionCostUsd = computeSessionCost(ctx);
 		let goal: Goal | null = null;
 		let pendingLimit: number | null = null;
@@ -422,16 +408,12 @@ export default function goalExtension(pi: ExtensionAPI) {
 		currentGoal = goal;
 		pendingCostLimitUsd = pendingLimit;
 		refreshGoalWidget();
-		// Transient runtime flags don't persist across reload / branch nav.
-		nextTurnIsContinuation = false;
-		continuationSuppressed = false;
-		goalCompactionInProgress = false;
+		// Transient runtime flags don't persist across reload / branch navigation.
+		continuationState = resetContinuationState();
 		resetCostLimitStopNotification();
-		cancelContinuationTimer();
 	}
 
 	function setNewGoal(objective: string, tokenBudget: number | null): Goal {
-		cancelContinuationTimer();
 		const now = Date.now();
 		const id = newGoalId();
 		const entry: GoalSetEntry = { id, objective, tokenBudget, createdAt: now };
@@ -457,9 +439,7 @@ export default function goalExtension(pi: ExtensionAPI) {
 			currentGoal = { ...currentGoal, costLimitUsd: pendingCostLimitUsd };
 			pendingCostLimitUsd = null;
 		}
-		nextTurnIsContinuation = false;
-		continuationSuppressed = false;
-		goalCompactionInProgress = false;
+		continuationState = resetContinuationState();
 		resetCostLimitStopNotification();
 		refreshGoalWidget();
 		return currentGoal;
@@ -472,11 +452,8 @@ export default function goalExtension(pi: ExtensionAPI) {
 		pi.appendEntry<GoalStatusEntry>(ENTRY_GOAL_STATUS, entry);
 		currentGoal = { ...currentGoal, status, updatedAt: now };
 		if (status !== "active") {
-			nextTurnIsContinuation = false;
-			continuationSuppressed = false;
-			goalCompactionInProgress = false;
+			continuationState = stopContinuation();
 			resetCostLimitStopNotification();
-			cancelContinuationTimer();
 		}
 		refreshGoalWidget();
 		return currentGoal;
@@ -487,7 +464,7 @@ export default function goalExtension(pi: ExtensionAPI) {
 		const now = Date.now();
 		const roundedLimitUsd = roundCostUsd(costLimitUsd);
 		resetCostLimitStopNotification();
-		continuationSuppressed = false;
+		continuationState = clearContinuationSuppression(continuationState);
 
 		if (currentGoal.costLimitUsd === roundedLimitUsd) {
 			return currentGoal;
@@ -521,7 +498,7 @@ export default function goalExtension(pi: ExtensionAPI) {
 		pi.appendEntry<GoalCostLimitClearEntry>(ENTRY_GOAL_COST_LIMIT_CLEAR, entry);
 		currentGoal = { ...currentGoal, costLimitUsd: null, updatedAt: now };
 		resetCostLimitStopNotification();
-		continuationSuppressed = false;
+		continuationState = clearContinuationSuppression(continuationState);
 		return true;
 	}
 
@@ -593,7 +570,7 @@ export default function goalExtension(pi: ExtensionAPI) {
 				`Goal cost limit cleared. Current session cost is ${formatCurrency(sessionCostUsd)}.`,
 				"info",
 			);
-			scheduleContinuation(ctx);
+			requestGoalContinuation(ctx);
 			return;
 		}
 
@@ -622,7 +599,7 @@ export default function goalExtension(pi: ExtensionAPI) {
 					`Goal cost limit set to ${formatCurrency(costLimitUsd)} (${formatCurrency(additionalCostUsd)} from current session cost ${formatCurrency(baseCostUsd)}).`,
 					"info",
 				);
-				scheduleContinuation(ctx);
+				requestGoalContinuation(ctx);
 			} else {
 				setPendingCostLimit(costLimitUsd);
 				ctx.ui.notify(
@@ -645,132 +622,53 @@ export default function goalExtension(pi: ExtensionAPI) {
 		if (currentGoal) {
 			setCostLimit(costLimitUsd);
 			ctx.ui.notify(`Goal cost limit set to ${formatCurrency(costLimitUsd)}.`, "info");
-			if (!stopForCostLimitIfNeeded(ctx)) {
-				scheduleContinuation(ctx);
-			}
+			requestGoalContinuation(ctx);
 		} else {
 			setPendingCostLimit(costLimitUsd);
 			ctx.ui.notify(`Next-goal cost limit set to ${formatCurrency(costLimitUsd)}.`, "info");
 		}
 	}
 
-	// True when pi is at or over its auto-compaction threshold and will compact on
-	// this idle boundary. Mirrors pi's shouldCompact():
-	//   contextTokens > contextWindow - reserveTokens
-	// so the continuation holds off exactly when (and only when) pi compacts.
-	// `tokens` is null right after a compaction (no usage yet) — treated as "not
-	// imminent" so the post-compaction continuation proceeds.
-	function compactionImminent(ctx: ExtensionContext): boolean {
-		const usage = ctx.getContextUsage();
-		if (!usage || usage.tokens === null) return false;
-		return usage.tokens > usage.contextWindow - reserveTokens;
+	function sendContinuation(): void {
+		if (!currentGoal || currentGoal.status !== "active") return;
+		dlog("GOAL", "send_calling_pi_sendMessage", {
+			objectivePreview: currentGoal.objective.slice(0, 80),
+		});
+		pi.sendMessage(
+			{
+				customType: "goal-continuation",
+				content: renderContinuationPrompt(currentGoal),
+				display: true,
+				details: { objective: currentGoal.objective },
+			},
+			{ triggerTurn: true },
+		);
 	}
 
-	/**
-	 * Schedule an auto-continuation if the goal is active and not
-	 * suppressed. When called from agent_end, wait for Pi's idle boundary
-	 * before using triggerTurn; otherwise Pi still considers the agent
-	 * streaming and queues the message as steering that won't be drained until
-	 * a later user turn.
-	 */
-	function scheduleContinuation(ctx?: ExtensionContext): void {
-		dlog("GOAL", "scheduleContinuation_enter", {
-			haveGoal: !!currentGoal,
-			goalStatus: currentGoal?.status,
-			continuationSuppressed,
-			goalCompactionInProgress,
-			continuationTimerPending: continuationTimer !== undefined,
-			haveCtx: !!ctx,
-			ctxIsIdle: ctx?.isIdle?.(),
-			ctxSignalAborted: ctx?.signal?.aborted ?? null,
+	function requestGoalContinuation(
+		ctx: ExtensionContext,
+		clearSuppression = false,
+	): ContinuationRequestDisposition {
+		const active = currentGoal?.status === "active";
+		const costAllowed = active && !stopForCostLimitIfNeeded(ctx);
+		const request = requestContinuation(continuationState, {
+			active,
+			costAllowed,
+			idle: ctx.isIdle(),
+			clearSuppression,
 		});
-		if (!currentGoal || currentGoal.status !== "active") return;
-		if (continuationSuppressed) return;
-		if (goalCompactionInProgress) return;
-		// Hold off while pi is at/over its auto-compaction threshold: starting a turn
-		// now would run concurrently with compaction, which corrupts Escape handling
-		// (sendCustomMessage(triggerTurn) has no compaction guard). pi's auto-compaction
-		// emits session_compact, which reschedules this.
-		if (ctx && compactionImminent(ctx)) return;
-		if (continuationTimer !== undefined) return;
-
-		const send = () => {
-			dlog("GOAL", "send_enter", {
-				haveGoal: !!currentGoal,
-				goalStatus: currentGoal?.status,
-				continuationSuppressed,
-				goalCompactionInProgress,
-				ctxSignalAborted: ctx?.signal?.aborted ?? null,
-			});
-			if (!currentGoal || currentGoal.status !== "active") return;
-			if (continuationSuppressed) return;
-			if (goalCompactionInProgress) return;
-
-			nextTurnIsContinuation = true;
-			dlog("GOAL", "send_calling_pi_sendMessage", {
-				objectivePreview:
-					typeof currentGoal.objective === "string" ? currentGoal.objective.slice(0, 80) : null,
-			});
-			pi.sendMessage(
-				{
-					customType: "goal-continuation",
-					content: renderContinuationPrompt(currentGoal),
-					display: true,
-					details: { objective: currentGoal.objective },
-				},
-				{ triggerTurn: true },
-			);
-		};
-
-		try {
-			if (!ctx || ctx.isIdle()) {
-				dlog("GOAL", "scheduleContinuation_send_immediate", {});
-				send();
-				return;
-			}
-		} catch (err) {
-			dlog("GOAL", "scheduleContinuation_isIdle_threw", {
-				error: (err as Error)?.message ?? String(err),
-			});
-			return;
-		}
-
-		const attempt = () => {
-			continuationTimer = undefined;
-			dlog("GOAL", "attempt_fire", {
-				haveGoal: !!currentGoal,
-				goalStatus: currentGoal?.status,
-				continuationSuppressed,
-				goalCompactionInProgress,
-				ctxIsIdle: ctx?.isIdle?.(),
-				ctxSignalAborted: ctx?.signal?.aborted ?? null,
-			});
-
-			if (!currentGoal || currentGoal.status !== "active") return;
-			if (continuationSuppressed) return;
-			if (goalCompactionInProgress) return;
-			if (compactionImminent(ctx)) return;
-
-			try {
-				if (!ctx.isIdle()) {
-					continuationTimer = setTimeout(attempt, 25);
-					dlog("GOAL", "attempt_repoll", {});
-					return;
-				}
-
-				dlog("GOAL", "attempt_send", {});
-				send();
-			} catch (err) {
-				dlog("GOAL", "attempt_threw", {
-					error: (err as Error)?.message ?? String(err),
-				});
-				// The runtime may have been reloaded or replaced while a timer was
-				// pending. In that case this stale continuation should be dropped.
-			}
-		};
-
-		continuationTimer = setTimeout(attempt, 0);
-		dlog("GOAL", "scheduleContinuation_timer_set", {});
+		continuationState = request.state;
+		const { disposition } = request;
+		dlog("GOAL", "continuation_requested", {
+			disposition,
+			active,
+			costAllowed,
+			pending: continuationState.pending,
+			runIsGoalContinuation: continuationState.runIsGoalContinuation,
+			suppressed: continuationState.suppressed,
+		});
+		if (disposition === "started") sendContinuation();
+		return disposition;
 	}
 
 	function clearGoal(): boolean {
@@ -778,29 +676,11 @@ export default function goalExtension(pi: ExtensionAPI) {
 		const entry: GoalClearEntry = { clearedAt: Date.now() };
 		pi.appendEntry<GoalClearEntry>(ENTRY_GOAL_CLEAR, entry);
 		currentGoal = null;
-		nextTurnIsContinuation = false;
-		continuationSuppressed = false;
-		goalCompactionInProgress = false;
+		continuationState = stopContinuation();
 		resetCostLimitStopNotification();
-		cancelContinuationTimer();
 		refreshGoalWidget();
 		return true;
 	}
-
-	// ---------- Compaction ----------
-	//
-	// goal.ts deliberately does NOT initiate compaction: it only stays out of its
-	// way (compactionImminent holds off continuation) and re-kicks the loop
-	// afterwards.
-
-	// After pi auto-compacts, resume the goal loop. The continuation gate
-	// (compactionImminent) makes agent_end hold off while context is over the
-	// threshold; this re-kicks the loop once compaction has freed the window.
-	pi.on("session_compact", async (_event, ctx) => {
-		if (!currentGoal || currentGoal.status !== "active") return;
-		if (continuationSuppressed) return;
-		scheduleContinuation(ctx);
-	});
 
 	// ---------- /goal slash command ----------
 
@@ -849,16 +729,12 @@ export default function goalExtension(pi: ExtensionAPI) {
 					ctx.ui.notify("Goal is complete. Use /goal <new objective> to start a new one.", "warning");
 					return;
 				}
-				continuationSuppressed = false;
-				nextTurnIsContinuation = false;
-				if (currentGoal.status === "active") {
-					ctx.ui.notify("Goal is active; queued continuation.", "info");
-				} else {
-					setStatus("active");
-					ctx.ui.notify("Goal resumed.", "info");
-				}
-				if (!stopForCostLimitIfNeeded(ctx)) {
-					scheduleContinuation(ctx);
+				if (currentGoal.status !== "active") setStatus("active");
+				const disposition = requestGoalContinuation(ctx, true);
+				if (disposition === "started") {
+					ctx.ui.notify("Goal continuation started.", "info");
+				} else if (disposition === "deferred") {
+					ctx.ui.notify("Goal continuation will start when current work settles.", "info");
 				}
 				return;
 			}
@@ -890,9 +766,7 @@ export default function goalExtension(pi: ExtensionAPI) {
 
 			const goal = setNewGoal(objective, null);
 			ctx.ui.notify(`Goal set: ${goal.objective}`, "info");
-			if (!stopForCostLimitIfNeeded(ctx)) {
-				scheduleContinuation(ctx);
-			}
+			requestGoalContinuation(ctx);
 		},
 	});
 
@@ -1029,13 +903,10 @@ You cannot use this tool to pause or resume a goal; those status changes are con
 
 	// ---------- Event handlers ----------
 
-	// Real user activity clears the anti-spin suppression latch so a
-	// previously-spinning goal can resume after the user nudges it.
+	// Genuine user activity starts an ordinary run and clears stale transient
+	// continuation policy. Extension-originated messages preserve goal origin.
 	pi.on("input", async (event, _ctx) => {
-		if (event.source !== "extension") {
-			continuationSuppressed = false;
-			nextTurnIsContinuation = false;
-		}
+		if (event.source !== "extension") continuationState = onOrdinaryInput();
 		return { action: "continue" };
 	});
 
@@ -1044,59 +915,55 @@ You cannot use this tool to pause or resume a goal; those status changes are con
 	// full prompt injected via sendMessage.
 	pi.on("before_agent_start", async (event, _ctx) => {
 		if (!currentGoal || currentGoal.status !== "active") return undefined;
-
-		if (nextTurnIsContinuation) return undefined;
+		if (continuationState.runIsGoalContinuation) return undefined;
 
 		return {
 			systemPrompt: `${event.systemPrompt}\n\n${renderSystemPromptAddendum(currentGoal)}`,
 		};
 	});
 
-	// Anti-spin classification + auto-continuation trigger.
+	// Each low-level agent_end updates policy intent only. Pi may still retry,
+	// compact, or drain queued work before the session-level settlement.
 	pi.on("agent_end", async (event, ctx) => {
 		const messages = (event as { messages?: unknown }).messages;
 		sessionCostUsd = roundCostUsd(sessionCostUsd + getAssistantMessagesCost(messages));
 
-		const wasAutoContinuation = nextTurnIsContinuation;
-		nextTurnIsContinuation = false;
-
-		dlog("GOAL", "agent_end", {
-			haveGoal: !!currentGoal,
-			goalStatus: currentGoal?.status,
-			wasAutoContinuation,
-			ctxSignalAborted: ctx.signal?.aborted ?? null,
-			ctxIsIdle: ctx.isIdle?.(),
-			continuationTimerPending: continuationTimer !== undefined,
-			continuationSuppressed,
-			goalCompactionInProgress,
-		});
-
-		if (!currentGoal || currentGoal.status !== "active") return;
-
-		// If the user pressed Escape (abort), stop the loop.
-		if (ctx.signal?.aborted) {
-			dlog("GOAL", "agent_end_aborted_early_return", {
-				continuationTimerPending: continuationTimer !== undefined,
-			});
-			return;
-		}
-
+		const active = currentGoal?.status === "active";
+		const aborted = ctx.signal?.aborted ?? false;
 		const toolCalls = countToolCalls(messages);
+		const costAllowed = active && !aborted && !stopForCostLimitIfNeeded(ctx);
+		continuationState = onAgentEnd(continuationState, { active, aborted, toolCalls, costAllowed });
 
-		if (toolCalls > 0) {
-			// Productive turn (auto or not) — clear any prior suppression.
-			continuationSuppressed = false;
-		} else if (wasAutoContinuation) {
-			// Codex's anti-spin rule: an auto-continuation that produced no
-			// tool calls is the model talking to itself. Latch suppression
-			// until real user activity resets it.
-			continuationSuppressed = true;
-		}
+		dlog("GOAL", "agent_end_policy", {
+			active,
+			aborted,
+			toolCalls,
+			costAllowed,
+			pending: continuationState.pending,
+			runIsGoalContinuation: continuationState.runIsGoalContinuation,
+			suppressed: continuationState.suppressed,
+		});
+	});
 
-		if (continuationSuppressed) return;
-		if (stopForCostLimitIfNeeded(ctx)) return;
-
-		scheduleContinuation(ctx);
+	// This is the sole automatic dispatch boundary. If an earlier settlement
+	// handler already started work, pending intent remains for the next boundary.
+	pi.on("agent_settled", async (_event, ctx) => {
+		const active = currentGoal?.status === "active";
+		const costAllowed = active && !stopForCostLimitIfNeeded(ctx);
+		const idle = ctx.isIdle();
+		const settlement = settleContinuation(continuationState, { active, costAllowed, idle });
+		continuationState = settlement.state;
+		const { shouldDispatch } = settlement;
+		dlog("GOAL", "agent_settled_policy", {
+			active,
+			costAllowed,
+			idle,
+			shouldDispatch,
+			pending: continuationState.pending,
+			runIsGoalContinuation: continuationState.runIsGoalContinuation,
+			suppressed: continuationState.suppressed,
+		});
+		if (shouldDispatch) sendContinuation();
 	});
 
 	// Restore from session history on every load / branch nav.
@@ -1112,7 +979,7 @@ You cannot use this tool to pause or resume a goal; those status changes are con
 		rebuildFromBranch(ctx);
 	});
 	pi.on("session_shutdown", async () => {
-		cancelContinuationTimer();
+		continuationState = resetContinuationState();
 		if (latestCtx?.mode === "tui") latestCtx.ui.setWidget("goal", undefined);
 		latestCtx = null;
 	});

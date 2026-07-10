@@ -6,6 +6,17 @@ import { fileURLToPath } from "node:url";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "@sinclair/typebox";
+import {
+	createLifecycleState,
+	isLifecycleTerminal,
+	lifecycleActivity,
+	requestKill,
+	settleLifecycle,
+	type SessionLifecycle,
+	type SubagentRun,
+} from "./lifecycle.js";
+import type { AssistantLiveState, ToolActivity } from "./live-state.js";
+import { attachSubagentRpcProcess } from "./rpc-dispatcher.js";
 import { SubagentInspector, sanitizeTerminalText, type InspectorHandle } from "./ui.js";
 
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
@@ -27,6 +38,11 @@ const KILL_DEADLINE_MS = 4_000;
 const SETTLEMENT_DEADLINE_MS = 6_000;
 const RESULT_PREVIEW_MAX = 1_200;
 const SERIALIZED_RESULT_PREVIEW_MAX = 240;
+const ASSISTANT_DISPLAY_MAX = 64 * 1024;
+const TOOL_OUTPUT_TAIL_MAX = 16 * 1024;
+const MAX_RECENT_TOOLS = 8;
+const STDERR_TAIL_MAX = 64 * 1024;
+const DIAGNOSTIC_MAX = 2 * 1024;
 
 type SubagentState = "starting" | "running" | "done" | "error" | "killed";
 type ResultKind = "none" | "final" | "partial";
@@ -59,6 +75,12 @@ interface SubagentHandle {
 	task: string;
 	cwd: string;
 	state: SubagentState;
+	lifecycle: SessionLifecycle;
+	runSequence: number;
+	runs: SubagentRun[];
+	tentativeError?: string;
+	finalError?: string;
+	settledAt?: number;
 	requestedModel: string;
 	requestedThinking: ThinkingLevel;
 	configuredTools: string[];
@@ -69,6 +91,21 @@ interface SubagentHandle {
 	sessionPath?: string;
 	transcriptPersisted?: boolean;
 	resultText: string;
+	currentAssistantText: string;
+	latestAssistantText: string;
+	assistantMessageGeneration: number;
+	finalizedAssistantIdentities: AssistantLiveState["finalizedAssistantIdentities"];
+	assistantMessageActive?: boolean;
+	assistantMessageKey?: string;
+	assistantMessageFallbackKey?: string;
+	assistantMessageResponseId?: string;
+	assistantMessageTimestamp?: number;
+	finalizedAssistantMessageGeneration?: number;
+	finalizedAssistantMessageKey?: string;
+	finalizedAssistantFallbackKey?: string;
+	finalizedAssistantResponseId?: string;
+	finalizedAssistantTimestamp?: number;
+	assistantTextTruncated: boolean;
 	resultPath?: string;
 	persistedResultHash?: string;
 	stderr: string;
@@ -85,7 +122,9 @@ interface SubagentHandle {
 	currentTool?: string;
 	currentToolStartedAt?: number;
 	lastTool?: string;
-	activeTools: Map<string, { name: string; startedAt: number }>;
+	activeTools: Map<string, ToolActivity>;
+	recentTools: ToolActivity[];
+	knownToolCallIds: string[];
 	isStreaming: boolean;
 	usage: UsageStats;
 	process?: ChildProcessWithoutNullStreams;
@@ -98,12 +137,15 @@ interface SubagentHandle {
 	terminationPromise?: Promise<SubagentHandle>;
 	terminationTimers: Set<NodeJS.Timeout>;
 	agentEndedAt?: number;
+	streamRefreshTimer?: NodeJS.Timeout;
+	lastStreamRefreshAt?: number;
 }
 
 interface SerializableHandle {
 	id: string;
 	name?: string;
 	state: SubagentState;
+	lifecycle: SessionLifecycle;
 	killing: boolean;
 	task: string;
 	cwd: string;
@@ -134,6 +176,13 @@ interface SerializableHandle {
 	error?: string;
 	stderrPreview?: string;
 	resultPreview?: string;
+	currentAssistantText?: string;
+	latestAssistantText?: string;
+	activeTools: ToolActivity[];
+	recentTools: ToolActivity[];
+	tentativeError?: string;
+	finalError?: string;
+	settledAt?: number;
 	diagnostics?: string[];
 }
 
@@ -194,27 +243,8 @@ function previewResult(text: string, max = RESULT_PREVIEW_MAX): string {
 	return `${text.slice(0, max).trimEnd()}\n…`;
 }
 
-function extractText(content: unknown): string {
-	if (typeof content === "string") return content;
-	if (!Array.isArray(content)) return "";
-	return content
-		.map((part) => {
-			if (!part || typeof part !== "object") return "";
-			const block = part as Record<string, unknown>;
-			return block.type === "text" && typeof block.text === "string" ? block.text : "";
-		})
-		.filter(Boolean)
-		.join("\n");
-}
-
-/**
- * RPC message updates are snapshots. Keep the longest non-empty snapshot so a
- * late empty or stale-shorter update cannot erase already captured output.
- */
-function retainAssistantText(handle: SubagentHandle, candidate: string): void {
-	if (!candidate || candidate.length < handle.resultText.length) return;
-	if (candidate.length === handle.resultText.length && candidate === handle.resultText) return;
-	handle.resultText = candidate;
+function cloneToolActivity(tool: ToolActivity): ToolActivity {
+	return { ...tool };
 }
 
 function isHandleActive(handle: SubagentHandle): boolean {
@@ -222,7 +252,7 @@ function isHandleActive(handle: SubagentHandle): boolean {
 }
 
 function isTerminal(handle: SubagentHandle): boolean {
-	return handle.state === "done" || handle.state === "error" || handle.state === "killed";
+	return isLifecycleTerminal(handle);
 }
 
 function resultKind(handle: SubagentHandle): ResultKind {
@@ -304,10 +334,6 @@ function asActualModel(value: unknown): ActualModel | undefined {
 	return { provider: model.provider, id: model.id, name: typeof model.name === "string" ? model.name : undefined };
 }
 
-function isRpcResponse(value: unknown): value is Record<string, any> {
-	return !!value && typeof value === "object" && (value as { type?: unknown }).type === "response";
-}
-
 const ThinkingSchema = StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"] as const);
 
 const TaskSpecSchema = Type.Object({
@@ -373,11 +399,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	}
 
 	function activityLabel(handle: SubagentHandle): string {
-		if (handle.killRequestedAt) return "killing";
-		if (handle.currentTool) return handle.currentTool;
-		if (handle.isStreaming) return "responding";
-		if (handle.agentEndedAt && !handle.completionSettled) return "finishing";
-		return handle.lastTool || "idle";
+		return lifecycleActivity(handle, handle);
 	}
 
 	function refreshUi(): void {
@@ -402,11 +424,30 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		ctx.ui.setWidget("subagent", lines);
 	}
 
-	function updateHandle(handle: SubagentHandle, patch: Partial<SubagentHandle> = {}): void {
+	function updateHandle(handle: SubagentHandle, patch: Partial<SubagentHandle> = {}, streaming = false): void {
 		Object.assign(handle, patch);
 		handle.lastActivityAt = now();
 		trimRetainedHandles();
-		refreshUi();
+		if (!streaming) {
+			if (handle.streamRefreshTimer) clearTimeout(handle.streamRefreshTimer);
+			handle.streamRefreshTimer = undefined;
+			handle.lastStreamRefreshAt = now();
+			refreshUi();
+			return;
+		}
+		const elapsed = now() - (handle.lastStreamRefreshAt ?? 0);
+		if (elapsed >= 100) {
+			handle.lastStreamRefreshAt = now();
+			refreshUi();
+			return;
+		}
+		if (handle.streamRefreshTimer) return;
+		handle.streamRefreshTimer = setTimeout(() => {
+			handle.streamRefreshTimer = undefined;
+			if (handle.completionSettled) return;
+			handle.lastStreamRefreshAt = now();
+			refreshUi();
+		}, 100 - elapsed);
 	}
 
 	function clearTerminationTimers(handle: SubagentHandle): void {
@@ -431,8 +472,12 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	}
 
 	function addDiagnostic(handle: SubagentHandle, message: string): void {
-		handle.diagnostics.push(message);
+		handle.diagnostics.push(message.length > DIAGNOSTIC_MAX ? `${message.slice(0, DIAGNOSTIC_MAX)}…` : message);
 		if (handle.diagnostics.length > 20) handle.diagnostics.splice(0, handle.diagnostics.length - 20);
+	}
+
+	function appendStderr(handle: SubagentHandle, text: string): void {
+		handle.stderr = `${handle.stderr}${text}`.slice(-STDERR_TAIL_MAX);
 	}
 
 	async function ensureResultPersisted(handle: SubagentHandle): Promise<string | undefined> {
@@ -448,7 +493,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			return resultPath;
 		} catch (error) {
 			const message = `Failed to persist subagent result: ${error instanceof Error ? error.message : String(error)}`;
-			handle.stderr += `${message}\n`;
+			appendStderr(handle, `${message}\n`);
 			addDiagnostic(handle, message);
 			return undefined;
 		}
@@ -457,7 +502,10 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	function settleHandle(handle: SubagentHandle): Promise<SubagentHandle> {
 		if (handle.completionPromise) return handle.completionPromise;
 		handle.completionSettled = true;
-		handle.completedAt ||= now();
+		handle.completedAt ||= handle.settledAt || now();
+		handle.error = handle.finalError || handle.error;
+		if (handle.streamRefreshTimer) clearTimeout(handle.streamRefreshTimer);
+		handle.streamRefreshTimer = undefined;
 		clearTerminationTimers(handle);
 		rejectPendingRequests(handle, new Error(`Subagent #${handle.id} settled before RPC request completed.`));
 		handle.completionPromise = (async () => {
@@ -494,173 +542,34 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		});
 	}
 
-	function updateUsage(handle: SubagentHandle, message: Record<string, any>): void {
-		const usage = message.usage || {};
-		handle.usage.input += Number(usage.input) || 0;
-		handle.usage.output += Number(usage.output) || 0;
-		handle.usage.cacheRead += Number(usage.cacheRead) || 0;
-		handle.usage.cacheWrite += Number(usage.cacheWrite) || 0;
-		handle.usage.cost += Number(usage.cost?.total) || 0;
-		handle.usage.turns += 1;
-	}
-
-	function updateCurrentTool(handle: SubagentHandle): void {
-		const latest = [...handle.activeTools.values()].sort((a, b) => b.startedAt - a.startedAt)[0];
-		handle.currentTool = latest?.name;
-		handle.currentToolStartedAt = latest?.startedAt;
-	}
-
-	function handleRpcRecord(handle: SubagentHandle, record: Record<string, any>): void {
-		if (isRpcResponse(record)) {
-			const requestId = typeof record.id === "string" ? record.id : undefined;
-			const pending = requestId ? clearPendingRequest(handle, requestId) : undefined;
-			if (!pending) return;
-			if (record.command !== pending.command) {
-				pending.reject(new Error(`Expected ${pending.command} response, received ${String(record.command)}.`));
-				return;
-			}
-			if (record.success !== true) {
-				pending.reject(new Error(String(record.error || `${pending.command} was rejected by Pi.`)));
-				return;
-			}
-			pending.resolve(record);
+	function handleRpcResponse(handle: SubagentHandle, record: Record<string, any>): void {
+		const requestId = typeof record.id === "string" ? record.id : undefined;
+		const pending = requestId ? clearPendingRequest(handle, requestId) : undefined;
+		if (!pending) return;
+		if (record.command !== pending.command) {
+			pending.reject(new Error(`Expected ${pending.command} response, received ${String(record.command)}.`));
 			return;
 		}
-
-		switch (record.type) {
-			case "agent_start":
-				handle.agentStartedAt ||= now();
-				if (handle.state === "starting") handle.state = "running";
-				updateHandle(handle);
-				return;
-			case "tool_execution_start": {
-				const toolCallId = typeof record.toolCallId === "string" ? record.toolCallId : `${now()}:${record.toolName || "tool"}`;
-				const name = typeof record.toolName === "string" ? record.toolName : "tool";
-				handle.activeTools.set(toolCallId, { name, startedAt: now() });
-				updateCurrentTool(handle);
-				if (handle.state === "starting") handle.state = "running";
-				updateHandle(handle);
-				return;
-			}
-			case "tool_execution_end": {
-				if (typeof record.toolCallId === "string") handle.activeTools.delete(record.toolCallId);
-				if (typeof record.toolName === "string") handle.lastTool = record.toolName;
-				updateCurrentTool(handle);
-				updateHandle(handle);
-				return;
-			}
-			case "message_update": {
-				handle.isStreaming = true;
-				const event = record.assistantMessageEvent as { type?: unknown } | undefined;
-				if (event?.type === "done" || event?.type === "error") handle.isStreaming = false;
-				const partial = record.message as Record<string, any> | undefined;
-				if (partial?.role === "assistant") retainAssistantText(handle, extractText(partial.content));
-				updateHandle(handle);
-				return;
-			}
-			case "message_end": {
-				const message = record.message as Record<string, any> | undefined;
-				if (message?.role !== "assistant") return;
-				handle.isStreaming = false;
-				retainAssistantText(handle, extractText(message.content));
-				void transcriptStatus(handle).then(() => refreshUi());
-				updateUsage(handle, message);
-				handle.stopReason = typeof message.stopReason === "string" ? message.stopReason : handle.stopReason;
-				if (typeof message.errorMessage === "string" && message.errorMessage) handle.error = message.errorMessage;
-				if (!handle.killRequestedAt && (message.stopReason === "error" || message.errorMessage)) handle.state = "error";
-				updateHandle(handle);
-				return;
-			}
-			case "agent_end":
-				handle.isStreaming = false;
-				handle.agentEndedAt = now();
-				if (!handle.killRequestedAt && handle.state !== "error") handle.state = "done";
-				updateHandle(handle);
-				// A normal completion retains the established prompt settlement path.
-				// Killed and error handles instead wait for close so late abort output
-				// remains eligible for persistence.
-				if (handle.state === "done") void settleHandle(handle);
-				return;
-			case "extension_error":
-				addDiagnostic(handle, `${String(record.extensionPath || "extension")}: ${String(record.error || "Unknown extension error")}`);
-				handle.stderr += `${handle.diagnostics[handle.diagnostics.length - 1]}\n`;
-				updateHandle(handle);
-				return;
-			default:
-				return;
+		if (record.success !== true) {
+			pending.reject(new Error(String(record.error || `${pending.command} was rejected by Pi.`)));
+			return;
 		}
+		pending.resolve(record);
 	}
 
 	function attachProcess(handle: SubagentHandle, proc: ChildProcessWithoutNullStreams): void {
-		handle.process = proc;
-		handle.pid = proc.pid;
-		proc.stdout.setEncoding("utf8");
-		proc.stderr.setEncoding("utf8");
-		let stdoutBuffer = "";
-
-		const processLine = (line: string) => {
-			if (!line.trim()) return;
-			try {
-				const parsed = JSON.parse(line);
-				if (!parsed || typeof parsed !== "object") {
-					addDiagnostic(handle, `Ignored non-object RPC record: ${truncate(line, 200)}`);
-					return;
-				}
-				handleRpcRecord(handle, parsed as Record<string, any>);
-			} catch (error) {
-				addDiagnostic(handle, `Malformed RPC JSON: ${error instanceof Error ? error.message : String(error)}: ${truncate(line, 200)}`);
-			}
-		};
-
-		proc.stdout.on("data", (chunk: string) => {
-			stdoutBuffer += chunk;
-			while (true) {
-				const newline = stdoutBuffer.indexOf("\n");
-				if (newline === -1) break;
-				let line = stdoutBuffer.slice(0, newline);
-				stdoutBuffer = stdoutBuffer.slice(newline + 1);
-				if (line.endsWith("\r")) line = line.slice(0, -1);
-				processLine(line);
-			}
-		});
-
-		proc.stderr.on("data", (chunk: string) => {
-			handle.stderr += chunk;
-			updateHandle(handle);
-		});
-
-		proc.on("error", (error) => {
-			handle.process = undefined;
-			if (handle.killRequestedAt) {
-				signalProcess(handle, "SIGKILL");
-				handle.state = "killed";
-			} else {
-				handle.state = "error";
-				handle.error ||= error.message;
-			}
-			// Node emits close after error once stdout/stderr drain. Settling only
-			// there keeps any final buffered assistant output observable.
-			updateHandle(handle);
-		});
-
-		proc.on("close", (code, signal) => {
-			if (stdoutBuffer.trim()) processLine(stdoutBuffer.trim());
-			handle.process = undefined;
-			handle.exitCode = code ?? (signal ? 1 : 0);
-			if (!handle.completionSettled) {
-				if (handle.killRequestedAt) {
-					signalProcess(handle, "SIGKILL");
-					handle.state = "killed";
-					handle.error ||= "Killed";
-				} else if (handle.state === "error" || code !== 0) {
-					handle.state = "error";
-					handle.error ||= signal ? `Exited via signal ${signal}` : `Exited with code ${code ?? 0}`;
-				} else {
-					handle.state = "done";
-				}
-				updateHandle(handle);
-				void settleHandle(handle);
-			}
+		attachSubagentRpcProcess(handle, proc, {
+			now,
+			assistantDisplayMax: ASSISTANT_DISPLAY_MAX,
+			toolOutputTailMax: TOOL_OUTPUT_TAIL_MAX,
+			maxRecentTools: MAX_RECENT_TOOLS,
+			update: (streaming = false) => updateHandle(handle, {}, streaming),
+			diagnostic: (message) => addDiagnostic(handle, message),
+			onAssistantFinalized: () => void transcriptStatus(handle).then(() => refreshUi()),
+			onSettled: () => void settleHandle(handle),
+			onResponse: (record) => handleRpcResponse(handle, record),
+			appendStderr: (text) => appendStderr(handle, text),
+			signalProcess: (signal) => signalProcess(handle, signal),
 		});
 	}
 
@@ -694,7 +603,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	function terminateHandle(handle: SubagentHandle, reason: string): Promise<SubagentHandle> {
 		if (handle.completionPromise) return handle.completionPromise;
 		if (handle.terminationPromise) return handle.terminationPromise;
-		handle.killRequestedAt = now();
+		requestKill(handle, now());
 		handle.error ||= reason;
 		updateHandle(handle);
 
@@ -705,8 +614,9 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		scheduleTermination(handle, KILL_DEADLINE_MS, () => signalProcess(handle, "SIGKILL"));
 		scheduleTermination(handle, SETTLEMENT_DEADLINE_MS, () => {
 			if (handle.completionSettled) return;
-			handle.state = "killed";
-			handle.error ||= `${reason} (forced settlement after termination deadline)`;
+			settleLifecycle(handle, now());
+			handle.finalError = handle.error || `${reason} (forced settlement after termination deadline)`;
+			handle.error = handle.finalError;
 			updateHandle(handle);
 			void settleHandle(handle);
 		});
@@ -747,7 +657,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			id: handle.id,
 			name: handle.name,
 			state: handle.state,
-			killing: !!handle.killRequestedAt && !handle.completionSettled,
+			lifecycle: handle.lifecycle,
+			killing: handle.lifecycle === "killing",
 			task: handle.task,
 			cwd: handle.cwd,
 			pid: handle.pid,
@@ -777,6 +688,13 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			error: handle.error,
 			stderrPreview: truncate(handle.stderr, SERIALIZED_RESULT_PREVIEW_MAX) || undefined,
 			resultPreview: handle.resultText ? previewResult(handle.resultText, SERIALIZED_RESULT_PREVIEW_MAX) : undefined,
+			currentAssistantText: handle.currentAssistantText || undefined,
+			latestAssistantText: handle.latestAssistantText || undefined,
+			activeTools: [...handle.activeTools.values()].map(cloneToolActivity),
+			recentTools: handle.recentTools.map(cloneToolActivity),
+			tentativeError: handle.tentativeError,
+			finalError: handle.finalError,
+			settledAt: handle.settledAt,
 			diagnostics: handle.diagnostics.length > 0 ? [...handle.diagnostics] : undefined,
 		};
 	}
@@ -791,7 +709,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			id: handle.id,
 			name: handle.name,
 			state: handle.state,
-			killing: !!handle.killRequestedAt && !handle.completionSettled,
+			lifecycle: handle.lifecycle,
+			killing: handle.lifecycle === "killing",
 			task: handle.task,
 			cwd: handle.cwd,
 			pid: handle.pid,
@@ -818,16 +737,22 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			usage: { ...handle.usage },
 			stopReason: handle.stopReason,
 			error: handle.error,
+			tentativeError: handle.tentativeError,
+			finalError: handle.finalError,
+			settledAt: handle.settledAt,
 			stderrPreview: truncate(handle.stderr, SERIALIZED_RESULT_PREVIEW_MAX) || undefined,
 			resultPreview: handle.resultText ? previewResult(handle.resultText, SERIALIZED_RESULT_PREVIEW_MAX) : undefined,
+			currentAssistantText: handle.currentAssistantText || undefined,
+			latestAssistantText: handle.latestAssistantText || undefined,
+			activeTools: [...handle.activeTools.values()].map(cloneToolActivity),
+			recentTools: handle.recentTools.map(cloneToolActivity),
 		};
 	}
-
 
 	async function formatHandleSummary(handle: SubagentHandle): Promise<string> {
 		const serial = await serializeHandle(handle);
 		const duration = Math.max(0, Math.floor(((serial.completedAt || now()) - serial.createdAt) / 1000));
-		const activity = serial.killing ? "killing" : serial.currentTool || serial.lastTool || (serial.isStreaming ? "responding" : "idle");
+		const activity = lifecycleActivity(handle, handle);
 		const label = serial.name ? ` ${serial.name}` : "";
 		const lines = [
 			`#${serial.id}${label} ${serial.killing ? "killing" : serial.state} (${Math.floor(duration / 60)}:${String(duration % 60).padStart(2, "0")})`,
@@ -863,7 +788,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 
 	function nestedDelegationBlocked() {
 		return {
-			content: [{ type: "text", text: "subagent_start is disabled inside delegated subagents. Report any need for further delegation back to the parent agent instead." }],
+			content: [{ type: "text" as const, text: "subagent_start is disabled inside delegated subagents. Report any need for further delegation back to the parent agent instead." }],
 			details: { nestedDelegationBlocked: true },
 		};
 	}
@@ -899,23 +824,31 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		await fs.mkdir(sessionDir, { recursive: true, mode: 0o700 });
 		await fs.chmod(sessionDir, 0o700).catch(() => {});
 
+		const lifecycle = createLifecycleState();
 		const handle: SubagentHandle = {
 			id,
 			name: spec.name?.trim() || undefined,
 			task: spec.task,
 			cwd,
-			state: "starting",
+			...lifecycle,
 			requestedModel,
 			requestedThinking,
 			configuredTools: getRequestedChildTools(spec.tools),
 			sessionDir,
 			promptPath,
 			resultText: "",
+			currentAssistantText: "",
+			latestAssistantText: "",
+			assistantMessageGeneration: 0,
+			finalizedAssistantIdentities: [],
+			assistantTextTruncated: false,
 			stderr: "",
 			diagnostics: [],
 			createdAt: now(),
 			lastActivityAt: now(),
 			activeTools: new Map(),
+			recentTools: [],
+			knownToolCallIds: [],
 			isStreaming: false,
 			usage: createUsage(),
 			requestSequence: 0,
@@ -971,7 +904,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			handle.rpcReadyAt = now();
 			updateHandle(handle);
 			await requestRpc(handle, "prompt", { message: spec.task }, STARTUP_TIMEOUT_MS);
-			if (handle.state === "starting") handle.state = "running";
 			updateHandle(handle);
 			return handle;
 		} catch (error) {
@@ -1263,13 +1195,13 @@ A subagent call requires task. Its optional name is only a display label; cwd, s
 							activeInspector = undefined;
 							done(undefined);
 						},
-						});
-						activeInspector = inspector;
-						return inspector;
-					},
-					{
+					});
+					activeInspector = inspector;
+					return inspector;
+				},
+				{
 						overlay: true,
-						overlayOptions: { anchor: "right-center", width: "70%", minWidth: 72, maxWidth: 130, maxHeight: "85%", margin: 1 },
+						overlayOptions: { anchor: "center", width: "100%", maxHeight: "100%", margin: 0 },
 					},
 				);
 			} finally {

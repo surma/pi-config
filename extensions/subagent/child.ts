@@ -24,6 +24,7 @@ async function captureEffectivePrompt(prompt: string): Promise<void> {
 }
 
 export default function childSubagentExtension(pi: ExtensionAPI) {
+	let shutdownRequested = false;
 	const applyInheritedActiveTools = () => {
 		if (!hasInheritedActiveTools) return;
 		pi.setActiveTools(Array.from(new Set(inheritedActiveTools)));
@@ -54,7 +55,9 @@ export default function childSubagentExtension(pi: ExtensionAPI) {
 		await captureEffectivePrompt(ctx.getSystemPrompt());
 	});
 
-	pi.on("agent_end", async (_event, ctx) => {
+	pi.on("agent_settled", async (_event, ctx) => {
+		if (shutdownRequested) return;
+		shutdownRequested = true;
 		ctx.shutdown();
 	});
 }

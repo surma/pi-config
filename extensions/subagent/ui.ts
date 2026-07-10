@@ -1,10 +1,33 @@
 import * as fs from "node:fs/promises";
-import { Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Focusable, type KeybindingsManager, type TUI } from "@mariozechner/pi-tui";
+import {
+	Key,
+	matchesKey,
+	truncateToWidth,
+	visibleWidth,
+	wrapTextWithAnsi,
+	type Focusable,
+	type KeybindingsManager,
+	type TUI,
+} from "@mariozechner/pi-tui";
+import type { SessionLifecycle } from "./lifecycle.js";
+
+export interface InspectorToolActivity {
+	toolCallId: string;
+	name: string;
+	startedAt: number;
+	updatedAt: number;
+	endedAt?: number;
+	output: string;
+	outputTruncated: boolean;
+	progress?: number;
+	isError?: boolean;
+}
 
 export interface InspectorHandle {
 	id: string;
 	name?: string;
 	state: "starting" | "running" | "done" | "error" | "killed";
+	lifecycle: SessionLifecycle;
 	killing: boolean;
 	task: string;
 	cwd: string;
@@ -32,8 +55,15 @@ export interface InspectorHandle {
 	usage: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number; turns: number };
 	stopReason?: string;
 	error?: string;
+	tentativeError?: string;
+	finalError?: string;
+	settledAt?: number;
 	stderrPreview?: string;
 	resultPreview?: string;
+	currentAssistantText?: string;
+	latestAssistantText?: string;
+	activeTools: InspectorToolActivity[];
+	recentTools: InspectorToolActivity[];
 }
 
 export interface SubagentInspectorCallbacks {
@@ -44,7 +74,18 @@ export interface SubagentInspectorCallbacks {
 	onClose(): void;
 }
 
-type InspectorView = "list" | "overview" | "prompt" | "transcript";
+type InspectorView = "list" | "status" | "task" | "live";
+type DetailView = Exclude<InspectorView, "list">;
+type ThemeColor = "text" | "accent" | "muted" | "dim" | "borderMuted" | "success" | "warning" | "error";
+type InspectorTheme = {
+	fg(color: ThemeColor, text: string): string;
+	bg(color: "selectedBg", text: string): string;
+	bold(text: string): string;
+};
+type InspectorFiles = Pick<typeof fs, "readFile" | "stat">;
+
+const MAX_TRANSCRIPT_LINES = 400;
+const MAX_TRANSCRIPT_CHARS = 256 * 1024;
 
 /** Render untrusted text literally without allowing it to issue terminal controls. */
 export function sanitizeTerminalText(value: unknown): string {
@@ -63,6 +104,37 @@ function elapsed(from: number, until = Date.now()): string {
 	return `${minutes}:${String(seconds % 60).padStart(2, "0")}`;
 }
 
+function freshness(at: number, now = Date.now()): string {
+	const seconds = Math.max(0, Math.floor((now - at) / 1000));
+	if (seconds < 1) return "<1s ago";
+	if (seconds < 60) return `${seconds}s ago`;
+	return `${Math.floor(seconds / 60)}m ago`;
+}
+
+function stateText(handle: InspectorHandle): string {
+	return `[${handle.lifecycle.toUpperCase()}]`;
+}
+
+function activityText(handle: InspectorHandle): string {
+	if (handle.lifecycle === "killing") return "killing";
+	if (handle.currentTool) return `tool: ${handle.currentTool}`;
+	if (handle.isStreaming) return "responding";
+	if (handle.lifecycle === "retrying") return "retrying";
+	if (handle.lifecycle === "finishing") return "finishing";
+	if (handle.lastTool) return `tool: ${handle.lastTool}`;
+	if (handle.state === "done") return "final response";
+	if (handle.state === "error") return "error";
+	if (handle.state === "killed") return "killed";
+	return "idle";
+}
+
+function stateColor(handle: InspectorHandle): ThemeColor {
+	if (handle.state === "done") return "success";
+	if (handle.state === "error") return "error";
+	if (handle.state === "killed" || handle.lifecycle === "retrying" || handle.lifecycle === "killing") return "warning";
+	return "accent";
+}
+
 function textFromContent(content: unknown): string {
 	if (typeof content === "string") return content;
 	if (!Array.isArray(content)) return "";
@@ -79,9 +151,30 @@ function textFromContent(content: unknown): string {
 		.join("\n");
 }
 
+function boundTranscript(lines: string[]): string[] {
+	const bounded: string[] = [];
+	let remaining = MAX_TRANSCRIPT_CHARS;
+	for (let index = lines.length - 1; index >= 0 && bounded.length < MAX_TRANSCRIPT_LINES && remaining > 0; index--) {
+		const line = lines[index]!;
+		const value = line.length > remaining ? `… [record truncated] …${line.slice(-remaining)}` : line;
+		bounded.unshift(value);
+		remaining -= value.length;
+	}
+	if (bounded.length < lines.length) bounded.unshift(`… ${lines.length - bounded.length} earlier transcript records omitted …`);
+	return bounded;
+}
+
 function transcriptLine(entry: unknown): string {
 	if (!entry || typeof entry !== "object") return String(entry);
-	const value = entry as { type?: unknown; message?: { role?: unknown; content?: unknown; toolName?: unknown }; provider?: unknown; modelId?: unknown; thinkingLevel?: unknown; name?: unknown; summary?: unknown };
+	const value = entry as {
+		type?: unknown;
+		message?: { role?: unknown; content?: unknown; toolName?: unknown };
+		provider?: unknown;
+		modelId?: unknown;
+		thinkingLevel?: unknown;
+		name?: unknown;
+		summary?: unknown;
+	};
 	switch (value.type) {
 		case "session":
 			return "[session]";
@@ -113,24 +206,41 @@ export class SubagentInspector implements Focusable {
 
 	private view: InspectorView = "list";
 	private selectedId?: string;
-	private scrollOffset = 0;
+	private readonly offsets: Record<InspectorView, number> = { list: 0, status: 0, task: 0, live: 0 };
 	private viewHeight = 1;
 	private totalLines = 0;
 	private flash = "";
 	private promptContent?: string[];
 	private transcriptContent?: string[];
 	private transcriptCache?: { path: string; size: number; mtimeMs: number; lines: string[] };
-	private transcriptRefreshTimer?: NodeJS.Timeout;
+	private heartbeat?: NodeJS.Timeout;
+	private disposed = false;
+	private requestGeneration = 0;
+	private transcriptReadActive = false;
+	private transcriptReadPending = false;
+	private transcriptDelay?: NodeJS.Timeout;
+	private readonly transcriptLastReadAt = new Map<string, number>();
+	private followingLive = true;
 
 	constructor(
 		private readonly tui: TUI,
-		private readonly theme: { fg(color: any, text: string): string; bold(text: string): string },
+		private readonly theme: InspectorTheme,
 		private readonly keybindings: KeybindingsManager,
 		private readonly callbacks: SubagentInspectorCallbacks,
-	) {}
+		private readonly files: InspectorFiles = fs,
+	) {
+		this.reconcileHeartbeat();
+	}
 
 	dispose(): void {
-		this.stopTranscriptRefresh();
+		if (this.disposed) return;
+		this.disposed = true;
+		this.requestGeneration += 1;
+		if (this.heartbeat) clearInterval(this.heartbeat);
+		this.heartbeat = undefined;
+		if (this.transcriptDelay) clearTimeout(this.transcriptDelay);
+		this.transcriptDelay = undefined;
+		this.transcriptReadPending = false;
 	}
 
 	handleInput(data: string): void {
@@ -142,13 +252,13 @@ export class SubagentInspector implements Focusable {
 
 		const wheelDelta = this.parseMouseScrollDelta(data);
 		if (wheelDelta !== 0) {
-			this.scrollBy(wheelDelta);
+			this.scrollBy(wheelDelta, wheelDelta < 0);
 			return;
 		}
 
 		if (this.keybindings.matches(data, "tui.select.up") || matchesKey(data, Key.up)) {
 			if (this.view === "list") this.moveSelection(-1);
-			else this.scrollBy(-1);
+			else this.scrollBy(-1, true);
 			return;
 		}
 		if (this.keybindings.matches(data, "tui.select.down") || matchesKey(data, Key.down)) {
@@ -157,35 +267,38 @@ export class SubagentInspector implements Focusable {
 			return;
 		}
 		if (this.keybindings.matches(data, "tui.select.pageUp") || matchesKey(data, Key.pageUp)) {
-			this.scrollBy(-(this.viewHeight || 1));
+			this.scrollBy(-this.viewHeight, true);
 			return;
 		}
 		if (this.keybindings.matches(data, "tui.select.pageDown") || matchesKey(data, Key.pageDown)) {
-			this.scrollBy(this.viewHeight || 1);
+			this.scrollBy(this.viewHeight);
 			return;
 		}
 		if (matchesKey(data, Key.home)) {
-			this.setScroll(0);
+			this.setScroll(0, true);
 			return;
 		}
 		if (matchesKey(data, Key.end)) {
-			this.setScroll(Math.max(0, this.totalLines - this.viewHeight));
+			this.resumeFollow();
 			return;
 		}
 		if (this.keybindings.matches(data, "tui.select.confirm") || matchesKey(data, Key.enter)) {
-			if (this.view === "list") this.showOverview();
+			if (this.view === "list") this.showDetail("status");
 			return;
 		}
 
 		switch (data) {
 			case "o":
-				this.showOverview();
+				this.showDetail("status");
 				return;
 			case "p":
-				this.showPrompt();
+				this.showDetail("task");
 				return;
-			case "t":
-				this.showTranscript();
+			case "r":
+				this.showDetail("live");
+				return;
+			case "f":
+				if (this.view === "live") this.resumeFollow();
 				return;
 			case "s":
 				this.runAction("steer", () => this.callbacks.steer(this.selected()?.id || ""));
@@ -205,27 +318,31 @@ export class SubagentInspector implements Focusable {
 
 	render(width: number): string[] {
 		this.ensureSelection();
-		const innerWidth = Math.max(36, width - 2);
+		this.reconcileHeartbeat();
+		const innerWidth = Math.max(1, width - 2);
 		const rows = this.tui.terminal.rows || 24;
-		const panelHeight = Math.min(Math.max(12, rows - 2), Math.max(12, Math.floor(rows * 0.85)));
-		const chromeLines = 6;
+		const panelHeight = Math.max(9, Math.min(rows, Math.floor(rows * 0.95)));
+		const chromeLines = 7;
 		const contentHeight = Math.max(1, panelHeight - chromeLines);
 		const content = this.contentLines(innerWidth);
 		this.totalLines = content.length;
 		this.viewHeight = contentHeight;
 		if (this.view === "list") this.ensureListSelectionVisible();
-		this.scrollOffset = Math.max(0, Math.min(this.scrollOffset, Math.max(0, content.length - contentHeight)));
-		const visible = content.slice(this.scrollOffset, this.scrollOffset + contentHeight);
+		if (this.view === "live" && this.followingLive) this.offsets.live = Math.max(0, content.length - contentHeight);
+		const maxOffset = Math.max(0, content.length - contentHeight);
+		this.offsets[this.view] = Math.max(0, Math.min(this.offsets[this.view], maxOffset));
+		const offset = this.offsets[this.view];
+		const visible = content.slice(offset, offset + contentHeight);
 		const padding = Math.max(0, contentHeight - visible.length);
-		const start = content.length === 0 ? 0 : this.scrollOffset + 1;
-		const end = Math.min(content.length, this.scrollOffset + visible.length);
+		const start = content.length === 0 ? 0 : offset + 1;
+		const end = Math.min(content.length, offset + visible.length);
 		const scrollInfo = content.length > contentHeight ? `${start}-${end}/${content.length}` : `${content.length}/${content.length}`;
-		const title = this.view === "list" ? " Subagents " : ` Subagent ${sanitizeTerminalText(this.selected()?.id || "")} · ${this.view} `;
+		const title = this.view === "list" ? " Subagents " : ` #${sanitizeTerminalText(this.selected()?.id || "")} · ${this.viewTitle()} `;
 
 		const lines = [
 			this.borderLine(innerWidth, "top"),
 			this.frameLine(this.theme.fg("accent", this.theme.bold(title)), innerWidth),
-			this.frameLine(this.theme.fg("dim", this.helpText(scrollInfo)), innerWidth),
+			this.frameLine(this.theme.fg("dim", sanitizeTerminalText(this.helpText(scrollInfo))), innerWidth),
 			this.theme.fg("borderMuted", `├${"─".repeat(innerWidth)}┤`),
 			...visible.map((line) => this.frameLine(line, innerWidth)),
 		];
@@ -233,20 +350,23 @@ export class SubagentInspector implements Focusable {
 		lines.push(this.theme.fg("borderMuted", `├${"─".repeat(innerWidth)}┤`));
 		lines.push(this.frameLine(this.theme.fg("dim", sanitizeTerminalText(this.flash || this.footerText())), innerWidth));
 		lines.push(this.borderLine(innerWidth, "bottom"));
-		return lines.map((line) => truncateToWidth(line, width, ""));
+		return lines.map((line) => truncateToWidth(line, Math.max(1, width), ""));
 	}
 
 	invalidate(): void {}
 
 	refresh(): void {
+		if (this.disposed) return;
+		this.ensureSelection();
+		this.reconcileHeartbeat();
 		this.requestRender();
 	}
 
 	private contentLines(width: number): string[] {
 		if (this.view === "list") return this.listLines(width);
-		if (this.view === "overview") return this.overviewLines(width);
-		if (this.view === "prompt") return this.promptLines(width);
-		return this.transcriptLines(width);
+		if (this.view === "status") return this.statusLines(width);
+		if (this.view === "task") return this.taskLines(width);
+		return this.liveLines(width);
 	}
 
 	private listLines(width: number): string[] {
@@ -254,89 +374,171 @@ export class SubagentInspector implements Focusable {
 		if (handles.length === 0) return [this.theme.fg("dim", "No subagents tracked yet.")];
 		return handles.map((handle) => {
 			const selected = handle.id === this.selectedId;
-			const icon = handle.killing ? "◐" : handle.state === "done" ? "✓" : handle.state === "error" ? "✗" : handle.state === "killed" ? "■" : "●";
-			const activity = handle.currentTool || handle.lastTool || (handle.isStreaming ? "responding" : "idle");
-			const model = `${handle.actualModel.provider}/${handle.actualModel.id}`;
-			const state = handle.killing ? "killing" : handle.state;
-			const result = handle.resultKind === "partial" ? " · partial result" : handle.resultKind === "final" ? " · final result" : "";
-			const label = handle.name ? ` ${handle.name}` : "";
-			const row = sanitizeTerminalText(`${icon} ${handle.id}${label} ${state} ${elapsed(handle.createdAt, handle.completedAt)} ${model} · thinking:${handle.actualThinking} · ${activity}${result}`);
-			const rendered = truncateToWidth(row, width, "…");
-			return selected ? this.theme.fg("accent", `› ${rendered}`) : `  ${rendered}`;
+			const state = this.theme.fg(stateColor(handle), stateText(handle));
+			const id = this.theme.fg("accent", sanitizeTerminalText(`#${handle.id}`));
+			const activity = this.theme.fg("text", sanitizeTerminalText(activityText(handle)));
+			const time = this.theme.fg("dim", elapsed(handle.createdAt, handle.completedAt));
+			let row: string;
+			if (width < 52) {
+				row = `${state} ${id} ${activity} ${time}`;
+			} else {
+				const label = sanitizeTerminalText(handle.name || "(unnamed)");
+				row = `${state} ${id} ${this.theme.fg("text", label)}  ${activity}  ${time}`;
+				if (width >= 80) {
+					row += this.theme.fg(
+						"dim",
+						`  ${sanitizeTerminalText(`${handle.actualModel.provider}/${handle.actualModel.id} · thinking:${handle.actualThinking}`)}`,
+					);
+				}
+			}
+			const prefix = selected ? this.theme.fg("accent", "› ") : "  ";
+			const rendered = truncateToWidth(`${prefix}${row}`, width, "…");
+			if (!selected) return rendered;
+			const padded = `${rendered}${" ".repeat(Math.max(0, width - visibleWidth(rendered)))}`;
+			return this.theme.bg("selectedBg", padded);
 		});
 	}
 
-	private overviewLines(width: number): string[] {
+	private statusLines(width: number): string[] {
 		const handle = this.selected();
-		if (!handle) return ["Selected handle no longer exists."];
-		const rows = [
-			`Display name: ${handle.name || "(none)"}`,
-			`State: ${handle.killing ? "killing" : handle.state}`,
-			`Task: ${handle.task}`,
-			`Cwd: ${handle.cwd}`,
-			`PID / exit: ${handle.pid ?? "-"} / ${handle.exitCode ?? "-"}`,
-			`Requested model/thinking: ${handle.requestedModel} · ${handle.requestedThinking}`,
-			`Actual model/thinking: ${handle.actualModel.provider}/${handle.actualModel.id} · ${handle.actualThinking}`,
-			`Tools: ${handle.configuredTools.join(", ") || "(none)"}`,
-			`Created / RPC ready / agent start: ${this.time(handle.createdAt)} / ${this.time(handle.rpcReadyAt)} / ${this.time(handle.agentStartedAt)}`,
-			`Last activity / completed: ${this.time(handle.lastActivityAt)} / ${this.time(handle.completedAt)}`,
-			`Activity: ${handle.currentTool ? `${handle.currentTool} since ${this.time(handle.currentToolStartedAt)}` : handle.lastTool || (handle.isStreaming ? "responding" : "idle")}`,
-			`Usage: ${handle.usage.turns} turns, ↑${handle.usage.input} ↓${handle.usage.output} R${handle.usage.cacheRead} W${handle.usage.cacheWrite} $${handle.usage.cost.toFixed(4)}`,
-			`Session: ${handle.sessionPath}`,
-			`Transcript: ${handle.transcriptNote}`,
-			`Prompt: ${handle.promptPath}`,
-			`Result: ${handle.resultKind === "none" ? "no assistant result captured" : `${handle.resultKind} result ${handle.resultPath || "(no result Markdown yet)"}`}`,
-		];
-		if (handle.stopReason) rows.push(`Stop reason: ${handle.stopReason}`);
-		if (handle.error) rows.push(`Error: ${handle.error}`);
-		if (handle.stderrPreview) rows.push(`Stderr: ${handle.stderrPreview}`);
-		if (handle.resultPreview) rows.push(`${handle.resultKind === "partial" ? "Partial result preview" : "Final result preview"}: ${handle.resultPreview}`);
-		return this.wrapRows(rows, width);
+		if (!handle) return [this.theme.fg("warning", "Selected handle no longer exists.")];
+		const lines: string[] = [];
+		this.pushHeading(lines, "IDENTITY", width);
+		this.pushField(lines, "Name", handle.name || "(none)", width);
+		this.pushField(lines, "ID", handle.id, width);
+		this.pushField(lines, "Model", `${handle.actualModel.provider}/${handle.actualModel.id} · thinking:${handle.actualThinking}`, width);
+		if (width >= 80) this.pushField(lines, "Requested", `${handle.requestedModel} · thinking:${handle.requestedThinking}`, width);
+
+		this.pushHeading(lines, "LIFECYCLE", width, true);
+		this.pushField(lines, "State", `${stateText(handle)} ${activityText(handle)}`, width, stateColor(handle));
+		this.pushField(lines, "Elapsed", elapsed(handle.createdAt, handle.completedAt), width);
+		this.pushField(lines, "Last update", freshness(handle.lastActivityAt), width);
+		if (width >= 52) this.pushField(lines, "Started", new Date(handle.createdAt).toISOString(), width);
+		if (handle.tentativeError) this.pushField(lines, "Retry diagnostic", handle.tentativeError, width, "warning");
+
+		this.pushHeading(lines, "EXECUTION", width, true);
+		this.pushField(lines, "Current tool", handle.currentTool || "(none)", width);
+		this.pushField(lines, "Last tool", handle.lastTool || "(none)", width);
+		this.pushField(lines, "Process", `PID ${handle.pid ?? "-"} · exit ${handle.exitCode ?? "-"}`, width);
+		this.pushField(
+			lines,
+			"Usage",
+			`${handle.usage.turns} turns · ↑${handle.usage.input} ↓${handle.usage.output} · cache R${handle.usage.cacheRead} W${handle.usage.cacheWrite} · $${handle.usage.cost.toFixed(4)}`,
+			width,
+		);
+		if (width >= 52) this.pushField(lines, "Tools", handle.configuredTools.join(", ") || "(none)", width);
+
+		this.pushHeading(lines, "OUTCOME", width, true);
+		this.pushField(lines, "Response", handle.resultKind === "none" ? "none captured" : handle.resultKind, width);
+		this.pushField(lines, "Stop reason", handle.stopReason || "(none)", width);
+		if (handle.finalError || handle.error) this.pushField(lines, "Error", handle.finalError || handle.error || "", width, "error");
+		if (handle.stderrPreview) this.pushField(lines, "Stderr", handle.stderrPreview, width, "warning");
+
+		this.pushHeading(lines, "ARTIFACTS", width, true);
+		this.pushField(lines, "Session", handle.sessionPath, width);
+		this.pushField(lines, "Transcript", handle.transcriptNote, width);
+		this.pushField(lines, "Prompt", handle.promptPath, width);
+		this.pushField(lines, "Result", handle.resultPath || "(none)", width);
+		if (width >= 80) this.pushField(lines, "Cwd", handle.cwd, width);
+		return lines;
 	}
 
-	private promptLines(width: number): string[] {
+	private taskLines(width: number): string[] {
 		const handle = this.selected();
-		if (!handle) return ["Selected handle no longer exists."];
-		const header = [
-			"Pi effective system prompt",
-			`Display name: ${handle.name || "(none)"}`,
-			"",
-			"Delegated task",
-			handle.task,
-			"",
-			"Prompt capture:",
-		];
-		const body = this.promptContent || ["Loading prompt sidecar…"];
-		return this.wrapRows([...header, ...body], width);
+		if (!handle) return [this.theme.fg("warning", "Selected handle no longer exists.")];
+		const lines: string[] = [];
+		this.pushHeading(lines, "ORIGINAL DELEGATED TASK", width);
+		lines.push(...this.wrapRaw(handle.task, width, "text"));
+		lines.push("");
+		lines.push(this.theme.fg("borderMuted", "─".repeat(width)));
+		lines.push("");
+		this.pushHeading(lines, "CAPTURED PI EFFECTIVE SYSTEM PROMPT (read-only)", width);
+		const body = this.promptContent || ["Loading captured prompt…"];
+		for (const row of body) lines.push(...this.wrapRaw(row, width, "muted"));
+		return lines;
 	}
 
-	private transcriptLines(width: number): string[] {
+	private liveLines(width: number): string[] {
 		const handle = this.selected();
-		if (!handle) return ["Selected handle no longer exists."];
-		const body = this.transcriptContent || [handle.transcriptNote, "Loading transcript…"];
-		return this.wrapRows([`Read-only transcript: ${handle.sessionPath}`, "", ...body], width);
-	}
-
-	private wrapRows(rows: string[], width: number): string[] {
-		const result: string[] = [];
-		for (const row of rows) {
-			if (!row) {
-				result.push("");
-				continue;
-			}
-			result.push(...wrapTextWithAnsi(sanitizeTerminalText(row), Math.max(1, width)));
+		if (!handle) return [this.theme.fg("warning", "Selected handle no longer exists.")];
+		const lines: string[] = [];
+		const strip = `${stateText(handle)} ${activityText(handle).toUpperCase()} · updated ${freshness(handle.lastActivityAt)}`;
+		lines.push(...this.wrapRaw(strip, width, stateColor(handle), true));
+		lines.push("");
+		this.pushHeading(lines, "CURRENT RESPONSE", width);
+		const response = handle.isStreaming ? handle.currentAssistantText : handle.currentAssistantText || handle.latestAssistantText;
+		if (response) {
+			for (const row of response.split("\n")) lines.push(...this.wrapRaw(row, width, "text"));
+		} else {
+			const none = handle.state === "killed" ? "No assistant text was captured before the child was killed." : handle.state === "error" ? "No assistant text was captured before the error." : "Waiting for assistant text…";
+			lines.push(...this.wrapRaw(none, width, "dim"));
 		}
-		return result;
+		lines.push("");
+		this.pushHeading(lines, "RECENT ACTIVITY / TRANSCRIPT", width);
+		for (const tool of handle.activeTools) this.pushTool(lines, tool, width, true);
+		for (const tool of handle.recentTools.slice(-4)) this.pushTool(lines, tool, width, false);
+		const body = this.transcriptContent || [handle.transcriptNote, "Loading persisted transcript history…"];
+		if (handle.activeTools.length > 0 || handle.recentTools.length > 0) lines.push("");
+		for (const row of body) lines.push(...this.wrapRaw(row, width, "muted"));
+		return lines;
+	}
+
+	private pushTool(lines: string[], tool: InspectorToolActivity, width: number, active: boolean): void {
+		const duration = elapsed(tool.startedAt, tool.endedAt);
+		const progress = typeof tool.progress === "number" ? ` · ${tool.progress}%` : "";
+		const status = active ? "running" : tool.isError ? "error" : "done";
+		lines.push(...this.wrapRaw(`[tool] ${tool.name} · ${status} · ${duration}${progress}`, width, tool.isError ? "error" : active ? "warning" : "dim"));
+		if (tool.output) {
+			for (const row of tool.output.split("\n")) lines.push(...this.wrapRaw(`  ${row}`, width, "dim"));
+		}
+	}
+
+	private pushHeading(lines: string[], heading: string, width: number, gap = false): void {
+		if (gap) lines.push("");
+		lines.push(...this.wrapRaw(heading, width, "accent", true));
+	}
+
+	private pushField(lines: string[], label: string, value: unknown, width: number, color: ThemeColor = "text"): void {
+		const safeLabel = sanitizeTerminalText(label);
+		const safeValue = sanitizeTerminalText(value);
+		if (width < 52) {
+			lines.push(this.theme.fg("muted", this.theme.bold(safeLabel.toUpperCase())));
+			for (const row of safeValue.split("\n")) lines.push(...this.wrapRaw(row, width, color));
+			return;
+		}
+		const prefix = `${safeLabel}: `;
+		const available = Math.max(1, width - visibleWidth(prefix));
+		const wrapped = safeValue
+			.split("\n")
+			.flatMap((row) => wrapTextWithAnsi(row, available));
+		if (wrapped.length === 0) wrapped.push("");
+		lines.push(this.theme.fg("muted", prefix) + this.theme.fg(color, wrapped[0]!));
+		const indent = " ".repeat(visibleWidth(prefix));
+		for (const row of wrapped.slice(1)) lines.push(`${indent}${this.theme.fg(color, row)}`);
+	}
+
+	private wrapRaw(value: unknown, width: number, color: ThemeColor, bold = false): string[] {
+		const safe = sanitizeTerminalText(value);
+		const wrapped = wrapTextWithAnsi(safe, Math.max(1, width));
+		return wrapped.map((row) => this.theme.fg(color, bold ? this.theme.bold(row) : row));
 	}
 
 	private helpText(scrollInfo: string): string {
-		if (this.view === "list") return `Enter overview · ↑↓ select · s steer · x kill · c clear finished · Esc close · ${scrollInfo}`;
-		return `o overview · p prompt · t transcript · s steer · x kill · c clear finished · ↑↓ scroll · Esc back · ${scrollInfo}`;
+		if (this.view === "list") return `Enter status · ↑↓ select · r live · s steer · x kill · c clear · Esc close · ${scrollInfo}`;
+		return `o status · p task · r live · f follow · ↑↓ scroll · End latest · s steer · x kill · Esc back · ${scrollInfo}`;
 	}
 
 	private footerText(): string {
-		if (this.view === "list") return "Selection stays attached to the subagent ID while records refresh.";
-		return "Prompt and transcript are read-only; transcript refreshes while this view is open.";
+		if (this.view === "live") return this.followingLive ? "FOLLOWING LIVE OUTPUT · ↑ pauses" : "PAUSED — End/f resumes latest";
+		if (this.view === "list") return "Selection stays attached to the subagent ID while lifecycle records refresh.";
+		if (this.view === "task") return "Original task and captured effective system prompt are read-only.";
+		return "Status metadata intentionally excludes task and assistant response bodies.";
+	}
+
+	private viewTitle(): string {
+		if (this.view === "status") return "Status";
+		if (this.view === "task") return "Original task";
+		return "Live output";
 	}
 
 	private selected(): InspectorHandle | undefined {
@@ -345,7 +547,16 @@ export class SubagentInspector implements Focusable {
 
 	private ensureSelection(): void {
 		const handles = this.callbacks.getHandles();
-		if (!handles.some((handle) => handle.id === this.selectedId)) this.selectedId = handles[0]?.id;
+		if (handles.some((handle) => handle.id === this.selectedId)) return;
+		const previous = this.selectedId;
+		this.selectedId = handles[0]?.id;
+		if (previous !== this.selectedId) {
+			this.offsets.status = 0;
+			this.offsets.task = 0;
+			this.offsets.live = 0;
+			this.invalidateReads();
+		}
+		if (!this.selectedId && this.view !== "list") this.view = "list";
 	}
 
 	private moveSelection(delta: number): void {
@@ -353,7 +564,13 @@ export class SubagentInspector implements Focusable {
 		if (handles.length === 0) return;
 		const current = Math.max(0, handles.findIndex((handle) => handle.id === this.selectedId));
 		const next = Math.max(0, Math.min(handles.length - 1, current + delta));
-		this.selectedId = handles[next]?.id;
+		const nextId = handles[next]?.id;
+		if (nextId === this.selectedId) return;
+		this.selectedId = nextId;
+		this.offsets.status = 0;
+		this.offsets.task = 0;
+		this.offsets.live = 0;
+		this.invalidateReads();
 		this.ensureListSelectionVisible();
 		this.flash = "";
 		this.requestRender();
@@ -362,129 +579,158 @@ export class SubagentInspector implements Focusable {
 	private ensureListSelectionVisible(): void {
 		const selectedIndex = this.callbacks.getHandles().findIndex((handle) => handle.id === this.selectedId);
 		if (selectedIndex < 0) return;
-		if (selectedIndex < this.scrollOffset) this.scrollOffset = selectedIndex;
-		else if (selectedIndex >= this.scrollOffset + this.viewHeight) this.scrollOffset = selectedIndex - this.viewHeight + 1;
+		if (selectedIndex < this.offsets.list) this.offsets.list = selectedIndex;
+		else if (selectedIndex >= this.offsets.list + this.viewHeight) this.offsets.list = selectedIndex - this.viewHeight + 1;
 	}
 
 	private showList(): void {
 		this.view = "list";
-		this.scrollOffset = 0;
 		this.flash = "";
-		this.stopTranscriptRefresh();
+		this.invalidateReads();
 		this.requestRender();
 	}
 
-	private showOverview(): void {
-		if (!this.selected()) return;
-		this.view = "overview";
-		this.scrollOffset = 0;
-		this.flash = "";
-		this.stopTranscriptRefresh();
-		this.requestRender();
-	}
-
-	private showPrompt(): void {
+	private showDetail(view: DetailView): void {
 		const handle = this.selected();
 		if (!handle) return;
-		this.view = "prompt";
-		this.scrollOffset = 0;
+		this.view = view;
 		this.flash = "";
-		this.stopTranscriptRefresh();
-		void this.loadPrompt(handle.promptPath);
+		this.invalidateReads();
+		if (view === "task") void this.loadPrompt(handle.promptPath, this.requestGeneration);
+		if (view === "live") {
+			this.followingLive = true;
+			void this.refreshTranscript(handle, this.requestGeneration);
+		}
 		this.requestRender();
 	}
 
-	private showTranscript(): void {
-		const handle = this.selected();
-		if (!handle) return;
-		this.view = "transcript";
-		this.scrollOffset = 0;
-		this.flash = "";
-		void this.refreshTranscript(handle);
-		this.startTranscriptRefresh();
-		this.requestRender();
+	private invalidateReads(): void {
+		this.requestGeneration += 1;
+		this.promptContent = undefined;
+		this.transcriptContent = undefined;
+		this.transcriptReadPending = false;
 	}
 
-	private async loadPrompt(path: string): Promise<void> {
+	private async loadPrompt(path: string, generation: number): Promise<void> {
+		let content: string[];
 		try {
-			this.promptContent = (await fs.readFile(path, "utf8")).split("\n");
+			content = (await this.files.readFile(path, "utf8")).split("\n");
 		} catch (error) {
-			this.promptContent = [`No captured Pi effective system prompt yet (${error instanceof Error ? error.message : String(error)}).`];
+			content = [`No captured Pi effective system prompt yet (${error instanceof Error ? error.message : String(error)}).`];
 		}
+		if (this.disposed || generation !== this.requestGeneration || this.view !== "task" || this.selected()?.promptPath !== path) return;
+		this.promptContent = content;
 		this.requestRender();
 	}
 
-	private async refreshTranscript(handle: InspectorHandle): Promise<void> {
+	private async refreshTranscript(handle: InspectorHandle, generation: number): Promise<void> {
+		const path = handle.sessionPath;
+		const sinceLastRead = Date.now() - (this.transcriptLastReadAt.get(path) ?? 0);
+		if (sinceLastRead < 1_000) {
+			if (!this.transcriptDelay) {
+				this.transcriptDelay = setTimeout(() => {
+					this.transcriptDelay = undefined;
+					const selected = this.view === "live" ? this.selected() : undefined;
+					if (selected) void this.refreshTranscript(selected, this.requestGeneration);
+				}, 1_000 - sinceLastRead);
+			}
+			return;
+		}
+		if (this.transcriptReadActive) {
+			this.transcriptReadPending = true;
+			return;
+		}
+		this.transcriptReadActive = true;
+		this.transcriptLastReadAt.set(path, Date.now());
+		let content: string[];
 		try {
-			const stat = await fs.stat(handle.sessionPath);
-			if (
-				this.transcriptCache?.path === handle.sessionPath &&
-				this.transcriptCache.size === stat.size &&
-				this.transcriptCache.mtimeMs === stat.mtimeMs
-			) {
-				this.transcriptContent = this.transcriptCache.lines;
-				return;
-			}
-			const raw = await fs.readFile(handle.sessionPath, "utf8");
-			const records = raw.split("\n");
-			const partial = records.pop();
-			const lines: string[] = [];
-			for (const record of records) {
-				if (!record) continue;
-				try {
-					lines.push(transcriptLine(JSON.parse(record)));
-				} catch (error) {
-					lines.push(`[malformed JSONL record] ${error instanceof Error ? error.message : String(error)}: ${record}`);
+			const stat = await this.files.stat(path);
+			if (this.transcriptCache?.path === path && this.transcriptCache.size === stat.size && this.transcriptCache.mtimeMs === stat.mtimeMs) {
+				content = this.transcriptCache.lines;
+			} else {
+				const raw = await this.files.readFile(path, "utf8");
+				const records = raw.split("\n");
+				const partial = records.pop();
+				const lines: string[] = [];
+				for (const record of records) {
+					if (!record) continue;
+					try {
+						lines.push(transcriptLine(JSON.parse(record)));
+					} catch (error) {
+						lines.push(`[malformed JSONL record] ${error instanceof Error ? error.message : String(error)}: ${record}`);
+					}
 				}
+				if (partial) lines.push(`[partial JSONL record while Pi writes] ${partial}`);
+				const bounded = boundTranscript(lines);
+				content = bounded.length > 0 ? bounded : ["No persisted transcript yet."];
+				this.transcriptCache = { path, size: stat.size, mtimeMs: stat.mtimeMs, lines: content };
 			}
-			if (partial) lines.push(`[partial JSONL record while Pi writes] ${partial}`);
-			this.transcriptCache = { path: handle.sessionPath, size: stat.size, mtimeMs: stat.mtimeMs, lines };
-			this.transcriptContent = lines.length > 0 ? lines : ["No persisted transcript yet."];
-		} catch {
-			this.transcriptCache = undefined;
-			this.transcriptContent = ["No persisted transcript yet."];
+		} catch (error) {
+			content = [`No persisted transcript yet (${error instanceof Error ? error.message : String(error)}).`];
 		}
-		this.requestRender();
+		this.transcriptReadActive = false;
+		if (!this.disposed && generation === this.requestGeneration && this.view === "live" && this.selected()?.sessionPath === path) {
+			this.transcriptContent = content;
+			this.requestRender();
+		}
+		if (this.transcriptReadPending && !this.disposed) {
+			this.transcriptReadPending = false;
+			const selected = this.view === "live" ? this.selected() : undefined;
+			if (selected) void this.refreshTranscript(selected, this.requestGeneration);
+		}
 	}
 
-	private startTranscriptRefresh(): void {
-		this.stopTranscriptRefresh();
-		this.transcriptRefreshTimer = setInterval(() => {
-			const handle = this.view === "transcript" ? this.selected() : undefined;
-			if (handle) void this.refreshTranscript(handle);
-		}, 1000);
-	}
-
-	private stopTranscriptRefresh(): void {
-		if (this.transcriptRefreshTimer) clearInterval(this.transcriptRefreshTimer);
-		this.transcriptRefreshTimer = undefined;
+	private reconcileHeartbeat(): void {
+		if (this.disposed) return;
+		const active = this.callbacks.getHandles().some((handle) => handle.state === "starting" || handle.state === "running");
+		if (active && !this.heartbeat) {
+			this.heartbeat = setInterval(() => {
+				if (this.disposed) return;
+				const selected = this.view === "live" ? this.selected() : undefined;
+				if (selected) void this.refreshTranscript(selected, this.requestGeneration);
+				this.requestRender();
+			}, 1000);
+		} else if (!active && this.heartbeat) {
+			clearInterval(this.heartbeat);
+			this.heartbeat = undefined;
+		}
 	}
 
 	private runAction(name: string, action: () => Promise<string>): void {
 		if (!this.selected()) return;
 		void action()
 			.then((message) => {
+				if (this.disposed) return;
 				this.flash = message;
 				this.requestRender();
 			})
 			.catch((error) => {
+				if (this.disposed) return;
 				this.flash = `${name} failed: ${error instanceof Error ? error.message : String(error)}`;
 				this.requestRender();
 			});
 	}
 
-	private time(value: number | undefined): string {
-		return value ? new Date(value).toISOString().slice(11, 19) : "-";
+	private scrollBy(delta: number, pauseFollow = false): void {
+		this.setScroll(this.offsets[this.view] + delta, pauseFollow);
 	}
 
-	private scrollBy(delta: number): void {
-		this.setScroll(this.scrollOffset + delta);
+	private setScroll(next: number, pauseFollow = false): void {
+		if (this.view === "live" && pauseFollow) this.followingLive = false;
+		const max = Math.max(0, this.totalLines - this.viewHeight);
+		const clamped = Math.max(0, Math.min(next, max));
+		if (this.view === "live" && !pauseFollow && clamped >= max) this.followingLive = true;
+		if (clamped === this.offsets[this.view]) {
+			this.requestRender();
+			return;
+		}
+		this.offsets[this.view] = clamped;
+		this.requestRender();
 	}
 
-	private setScroll(next: number): void {
-		const clamped = Math.max(0, Math.min(next, Math.max(0, this.totalLines - this.viewHeight)));
-		if (clamped === this.scrollOffset) return;
-		this.scrollOffset = clamped;
+	private resumeFollow(): void {
+		if (this.view === "live") this.followingLive = true;
+		this.offsets[this.view] = Math.max(0, this.totalLines - this.viewHeight);
 		this.requestRender();
 	}
 
@@ -498,7 +744,7 @@ export class SubagentInspector implements Focusable {
 	}
 
 	private requestRender(): void {
-		this.tui.requestRender();
+		if (!this.disposed) this.tui.requestRender();
 	}
 
 	private parseMouseScrollDelta(data: string): number {
@@ -510,8 +756,8 @@ export class SubagentInspector implements Focusable {
 
 	private wheelDelta(code: number): number {
 		if (!Number.isFinite(code) || (code & 64) === 0) return 0;
-		if ((code & 3) === 0) return 3;
-		if ((code & 3) === 1) return -3;
+		if ((code & 3) === 0) return -3;
+		if ((code & 3) === 1) return 3;
 		return 0;
 	}
 }

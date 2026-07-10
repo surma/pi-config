@@ -8,6 +8,7 @@ A Pi extension for isolated, background-first delegated work.
 - returns from `subagent_start` after a bounded startup handshake, not after the task finishes
 - exposes the child’s authoritative Pi session path, captured **Pi effective system prompt** path, and result Markdown path when a result exists
 - reports actual model and thinking from child RPC `get_state`, rather than claiming the requested values were used
+- streams the current assistant response and correlated, bounded tool activity into the inspector
 - labels non-empty results as `final` only for successful completion and as `partial` for killed/error children
 - supports detailed inspection, bounded waiting, native Pi steering, and deadline-driven termination
 - keeps only a bounded in-memory handle list; clearing handles never deletes session, prompt, or result artifacts
@@ -56,16 +57,18 @@ A child inherits the parent’s active tools by default. A per-call `tools` list
 
 ## Lifecycle
 
-Children survive parent-turn abort, canceled waits, and wait timeouts. They end only when they complete, receive `subagent_kill` or `/subagents-kill-all`, or Pi emits the extension’s single `session_shutdown` lifecycle event (`quit`, `reload`, `new`, `resume`, or `fork`). There is no foreground run, swarm, or chain API: start sibling children independently, then explicitly inspect or bounded-wait before starting dependent work.
+Children survive parent-turn abort, canceled waits, and wait timeouts. They end only when they settle, receive `subagent_kill` or `/subagents-kill-all`, or Pi emits the extension’s single `session_shutdown` lifecycle event (`quit`, `reload`, `new`, `resume`, or `fork`). `agent_end` is shown as retrying or finishing; terminal done/error classification happens at payload-free `agent_settled` from the retained final low-level run. A failed run followed by a successful retry is done without a terminal error. Duplicate or late run boundaries are diagnosed and ignored. Assistant streams prefer the documented provider `responseId`; before it is available they use `timestamp` plus `api`/provider/model, rejecting ambiguous or older generations rather than overwriting finalized output. Process close is only the deterministic crash/kill fallback. There is no foreground run, swarm, or chain API: start sibling children independently, then explicitly inspect or bounded-wait before starting dependent work.
 
 The child extension has no `update_status` tool and no progress-reporting prompt requirement. Activity comes from RPC/process events: current and last tool, streaming state, message output, usage, timestamps, errors, and exit state.
 
 ## Commands
 
 - `/subagents` opens a TUI-only selectable inspector:
-  - overview with the optional display name, metadata, and paths
-  - complete captured **Pi effective system prompt** and delegated task
-  - read-only, live JSONL transcript that tolerates a partial final record
+  - `Enter` or `o` opens **Status**, with grouped identity, lifecycle, execution, outcome, and artifact metadata
+  - `p` opens **Original task**, with the exact delegated task before the captured **Pi effective system prompt**
+  - `r` opens **Live output**, with incremental assistant text, bounded tool progress, and read-only JSONL history
+  - Live output follows the newest text by default; Up/PageUp/Home/wheel-up pauses, and `End` or `f` resumes
+  - `Esc` returns from a detail view to the list, then closes the inspector
   - `s` opens steering input for active children
   - `x` confirms kill for active children
   - `c` clears only terminal handles and keeps all artifacts
