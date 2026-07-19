@@ -52,7 +52,7 @@ function getKnownModels(ctx: ExtensionContext): ModelInfo[] {
 const ListModelsSchema = Type.Object({
 	includeUnavailable: Type.Optional(
 		Type.Boolean({
-			default: true,
+			default: false,
 			description: "Include known but unavailable models in the listing",
 		}),
 	),
@@ -68,12 +68,12 @@ export default function listModelsExtension(pi: ExtensionAPI) {
 		name: "list_models",
 		label: "List Models",
 		description:
-			"List the exact model ids accepted by this session, and whether they are available here.",
+			"List available model ids accepted by this session, or all known ids when includeUnavailable is true.",
 		promptSnippet:
 			"List available model ids accepted by this session.",
 		parameters: ListModelsSchema,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const includeUnavailable = params.includeUnavailable ?? true;
+			const includeUnavailable = params.includeUnavailable ?? false;
 			const search = params.search?.trim().toLowerCase();
 			let models = getKnownModels(ctx).filter((model) => includeUnavailable || model.available);
 			if (search) {
