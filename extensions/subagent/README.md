@@ -1,82 +1,232 @@
 # subagent
 
-A Pi extension for isolated, background-first delegated work.
+This extension gives a parent Pi persistent, visible child Pi sessions inside Zellij.
 
-## What it does
+## Requirements
 
-- starts delegated work in persistent `pi --mode rpc` child processes
-- returns from `subagent_start` after a bounded startup handshake, not after the task finishes
-- exposes the child’s authoritative Pi session path, captured **Pi effective system prompt** path, and result Markdown path when a result exists
-- reports actual model and thinking from child RPC `get_state`, rather than claiming the requested values were used
-- streams the current assistant response and correlated, bounded tool activity into the inspector
-- labels non-empty results as `final` only for successful completion and as `partial` for killed/error children
-- supports detailed inspection, bounded waiting, native Pi steering, and deadline-driven termination
-- keeps only a bounded in-memory handle list; clearing handles never deletes session, prompt, or result artifacts
+The parent Pi must run inside Zellij. The extension does not create or select a detached Zellij session.
 
-Each child runs in a private directory below Pi agent data (`<agent-dir>/sessions/subagents/<id>/`, permissions `0700`). Prompt and result sidecars use `0600` permissions. The session path returned by `get_state.sessionFile` is authoritative even before its JSONL exists. Pi may create that file only after it persists the first assistant message, so an early failure or kill can legitimately leave **no persisted transcript yet**.
+If Zellij is unavailable, `subagent_start` returns this error:
 
-Children receive `PI_SUBAGENT_CHILD=1`. This disables the `agent-done-noti` extension in the child while leaving its parent behavior unchanged.
+```text
+Subagent delegation requires running inside a Zellij session. Start pi inside zellij first.
+```
+
+The validated runtime versions are Zellij 0.44.3 and Pi 0.82.0. Revalidate lifecycle behavior and action flags after an upgrade.
+
+## Child launch
+
+`subagent_start` opens a tab in the current Zellij session. The tab runs a normal interactive Pi TUI.
+
+The extension uses `devx pi` when an executable `devx` exists. Otherwise, it uses the current Pi executable.
+
+Every child starts with `--offline`. The command loads `child.ts` through `-e`, so other extensions and provider proxies remain available.
+
+The parent creates the listener before it opens the tab. The child connects to that listener and sends a fenced `hello` frame.
+
+The initial task and later messages use IPC. The extension does not type prompts into a terminal or scrape the screen.
+
+Nested children cannot start another delegated child.
+
+## Authority and ownership
+
+The extension separates durable ownership from live control.
+
+- The canonical parent session file identifies the durable owner.
+- The parent session ID validates that session file.
+- A random process-wide controller ID identifies one live controller process.
+- An exclusive renewable lease grants live control.
+- The child ID identifies one logical child.
+- A random incarnation identifies one child process.
+- The saved child session file is the durable resume target.
+
+The process-wide controller ID survives a real `/reload`. A fresh process gets a different controller ID.
+
+Canonicalization resolves the nearest existing ancestor. Owner identity stays stable before and after the parent session file appears.
+
+The lease expires after 30 seconds. Another controller can reclaim it only after an additional 5-second grace period.
+
+The lease records a PID for diagnostics only. The extension never uses PID state as takeover authority.
+
+A non-holder does not load children, bind sockets, poll panes, write the owner registry, or perform destructive actions.
+
+A replacement holder can recover live children for the same owner. It preserves each pane's original launch-controller marker during validation.
+
+## Storage
+
+The extension derives `owner-key` from the canonical parent session file.
+
+```text
+<agent-dir>/sessions/subagents/controllers/<owner-key>/
+  lease.json
+  registry.json
+  children/<child-id>/<incarnation>/bridge.sock
+```
+
+Per-child artifacts remain at this path:
+
+```text
+<agent-dir>/sessions/subagents/<child-id>/
+```
+
+These artifacts include the prompt, child event log, saved Pi session, and `result.md`.
+
+The extension creates private directories with mode `0700`. It creates lease, registry, prompt, result, and socket files with restrictive permissions.
+
+Long socket paths use a private incarnation-specific directory below `/tmp`. The extension never changes permissions on the shared temporary directory.
+
+The legacy global registry remains untouched:
+
+```text
+<agent-dir>/sessions/subagents/registry.json
+```
+
+The extension never reads, writes, deletes, or automatically adopts entries from that file. Old unfenced children remain orphaned for safety.
+
+## IPC fences
+
+Every child frame carries these values:
+
+- the canonical owner session file
+- the owner session ID
+- the launch-controller ID
+- the child ID
+- the child incarnation
+- the connection ID
+
+Parent frames carry the same owner and incarnation identity. The child validates them before it accepts a parent action.
+
+The parent validates frame identity before each state change. It also checks the current lease on disk before an authorized mutation.
+
+Each child handle serializes its IPC mutations. This queue preserves wire order across asynchronous lease checks.
+
+A new connection cannot change its identity after `hello`. Delayed frames from an old incarnation cannot mutate a resumed child.
+
+Pane markers contain the full identity and socket path. Every targeted Zellij action revalidates the tab, pane, command, and markers.
+
+## Results and waits
+
+The child streams structured lifecycle events to the parent. Existing assistant events provide the final response.
+
+A successful settled `subagent_wait` returns the exact final response in both locations:
+
+```text
+content[0].text
+details.result
+```
+
+The extension also saves that response in `result.md`. The parent does not need to read the child JSONL to obtain it.
+
+`subagent_wait` uses settlement cursors. An explicit `afterRunId` requires a later settled run.
+
+Without a cursor, an existing successful result returns immediately. Otherwise, the wait starts from the current settlement cursor.
+
+A completed wait does not terminate the child. The child remains available for later turns.
+
+## Resume
+
+`subagent_resume` applies only to a stopped child with a nonempty saved Pi session file.
+
+The extension launches Pi with this exact saved file:
+
+```text
+--session <absolute-child-session-file>
+```
+
+Resume keeps the logical child ID. It creates a new incarnation, socket, tab, pane, process, and connection.
+
+The resumed child starts its run counter from the prior parent cursor. Run and settlement IDs therefore remain monotonic.
+
+Resume clears the prior kill fence and stale settlement state. It preserves the monotonic run and settlement cursors.
+
+The full owner and incarnation fence makes logical ID reuse safe. Old frames and old pane identities cannot affect the new incarnation.
+
+## Liveness
+
+The extension uses one controller-wide timer while an owned child remains alive.
+
+Each tick requests one `zellij action list-panes --json -a` snapshot. The controller reconciles every live child against that snapshot.
+
+A successful snapshot can prove that a matching pane disappeared or exited. The controller then marks the child stopped.
+
+An IPC close requests the same probe immediately. The IPC close alone does not prove process death.
+
+If the Zellij probe fails, the controller preserves the current state. A later successful probe can reconcile it.
+
+Stopped children leave the active widget. Their metadata, history, and artifacts remain available until retention or explicit cleanup removes them.
+
+## Parent lifecycle
+
+The extension treats parent lifecycle events as follows:
+
+| Event | Behavior |
+| --- | --- |
+| `/reload` | The same process keeps its controller ID and lease, then reattaches live children. |
+| `/new` | The new owner does not adopt the prior owner's children. |
+| `/resume` | The new owner does not adopt the prior owner's children. |
+| `/fork` or `/clone` | The new owner does not adopt the prior owner's children. |
+| Normal quit | The controller closes only owned, identity-matching child tabs. |
+| Hard parent crash | The lease expires, then a same-owner controller can recover after the grace period. |
+
+A settled child remains alive and interactive. Settlement never calls `ctx.shutdown()`.
 
 ## Tools
 
-- `subagent_start`
-  - only use when the user explicitly asks to delegate work
-  - starts one background child with `{ task, name?, cwd?, model?, thinking?, tools?, systemPrompt? }`
-  - `task` is required; all other fields are direct per-call configuration
-  - `name` is an optional display label only
-  - `systemPrompt` is optional direct delegated guidance
-  - returns the ID, PID, actual model/thinking, allocated session path, prompt path, and timestamps after startup succeeds
-  - nested delegation is blocked
-- `subagent_list`
-  - accepts `{ includeFinished?: boolean }`, defaulting to `true`
-  - returns compact retained handles with actual model/thinking and artifact paths
-- `subagent_status`
-  - accepts `{ id }`
-  - returns detailed lifecycle, requested versus actual model/thinking, activity, usage, errors, artifact paths, and `resultKind` (`none`, `final`, or `partial`)
-- `subagent_wait`
-  - accepts exactly one target: `{ id, timeoutSeconds }` or `{ all: true, timeoutSeconds }`
-  - `timeoutSeconds` is required, finite, and at least one second
-  - always returns `{ outcome: "completed" | "timedOut" | "canceled", handles }`
-  - timeouts and cancellation only stop waiting; they never kill children
-  - `all:true` snapshots active handles when called
-- `subagent_steer`
-  - accepts `{ id, message }`
-  - waits for Pi’s correlated RPC acknowledgement, not task completion
-- `subagent_kill`
-  - accepts `{ id }`
-  - idempotently requests Pi abort, then escalates by deadline to process-group TERM/KILL on POSIX (with immediate-PID fallback)
-  - preserves partial session, prompt, and result artifacts whenever they already exist
+The extension registers nine tools.
 
-Use the shared `list_models` tool to discover exact accepted model IDs. There is no subagent-specific model-discovery tool.
-
-## Model, thinking, and tools
-
-For model and thinking, direct per-call values override the current parent session. The extension resolves and validates the selected model before spawning. It passes model and thinking separately to the child, then exposes the child’s actual `get_state.model` and `get_state.thinkingLevel` in every successful start/list/status record. An unavailable model or a startup `get_state` response without model or session path fails launch and cleans up the child.
-
-A child inherits the parent’s active tools by default. A per-call `tools` list can narrow that set to tools active in the parent.
-
-## Lifecycle
-
-Children survive parent-turn abort, canceled waits, and wait timeouts. They end only when they settle, receive `subagent_kill` or `/subagents-kill-all`, or Pi emits the extension’s single `session_shutdown` lifecycle event (`quit`, `reload`, `new`, `resume`, or `fork`). `agent_end` is shown as retrying or finishing; terminal done/error classification happens at payload-free `agent_settled` from the retained final low-level run. A failed run followed by a successful retry is done without a terminal error. Duplicate or late run boundaries are diagnosed and ignored. Assistant streams prefer the documented provider `responseId`; before it is available they use `timestamp` plus `api`/provider/model, rejecting ambiguous or older generations rather than overwriting finalized output. Process close is only the deterministic crash/kill fallback. There is no foreground run, swarm, or chain API: start sibling children independently, then explicitly inspect or bounded-wait before starting dependent work.
-
-The child extension has no `update_status` tool and no progress-reporting prompt requirement. Activity comes from RPC/process events: current and last tool, streaming state, message output, usage, timestamps, errors, and exit state.
+- `subagent_start {task, model, thinking, name?, cwd?, tools?, systemPrompt?}`
+  - The model and thinking level are mandatory.
+  - The tool starts a visible child and waits for a bounded IPC handshake.
+- `subagent_list {includeFinished?}`
+  - The tool lists current and retained children for the active owner.
+- `subagent_status {id}`
+  - The tool returns lifecycle, activity, identity, usage, diagnostics, and artifact paths.
+- `subagent_wait {id?|all?, timeoutSeconds, afterRunId?}`
+  - The tool waits for a settlement cursor or a stopped process.
+- `subagent_steer {id, message}`
+  - The tool sends guidance during the current child turn.
+- `subagent_follow_up {id, message}`
+  - The tool sends another child turn.
+- `subagent_interrupt {id}`
+  - The tool sends `Esc` to a revalidated pane and keeps the child process alive.
+- `subagent_kill {id}`
+  - The tool interrupts, escalates, and closes only the revalidated child tab.
+- `subagent_resume {id, task?}`
+  - The tool reopens the exact saved child conversation in a new process incarnation.
 
 ## Commands
 
-- `/subagents` opens a TUI-only selectable inspector:
-  - `Enter` or `o` opens **Status**, with grouped identity, lifecycle, execution, outcome, and artifact metadata
-  - `p` opens **Original task**, with the exact delegated task before the captured **Pi effective system prompt**
-  - `r` opens **Live output**, with incremental assistant text, bounded tool progress, and read-only JSONL history
-  - Live output follows the newest text by default; Up/PageUp/Home/wheel-up pauses, and `End` or `f` resumes
-  - `Esc` returns from a detail view to the list, then closes the inspector
-  - `s` opens steering input for active children
-  - `x` confirms kill for active children
-  - `c` clears only terminal handles and keeps all artifacts
-- `/subagents-toggle` enables or disables the compact active-child widget
-- `/subagents-kill-all` terminates all active children while retaining artifacts
+- `/subagents` opens the interactive inspector.
+- `/subagents-toggle` toggles the compact active-child widget.
+- `/subagents-kill-all` terminates all live children that this controller owns.
 
-When `ctx.mode !== "tui"`, `/subagents` prints a useful compact list with actual model/thinking and session paths. It never switches the parent session to inspect a child.
+## State authorities
 
-## Prompt-capture accuracy
+The extension uses separate authorities for separate facts.
 
-The prompt sidecar is labeled **Pi effective system prompt** and is captured in the child at `agent_start` using `ctx.getSystemPrompt()`, after composed `before_agent_start` rules. A later `before_provider_request` hook can theoretically alter provider wire payloads, so the sidecar is not represented as an exact provider-wire capture.
+- Companion IPC events and snapshots define live run state, output, tools, usage, and errors.
+- A successful Zellij snapshot defines process liveness.
+- The owner lease defines control authority.
+- The Pi session JSONL defines durable conversation history.
+- `child-events.log` and `dump-screen` provide diagnostics only.
+
+## Verification
+
+Run the deterministic suite from this directory:
+
+```sh
+PI_TEST_PACKAGE_DIR=/path/to/pi-0.82.0 ./test.sh
+```
+
+The suite covers result visibility, owner isolation, lease races, authority loss, full frame fences, resume, parent lifecycle, liveness, and UI behavior.
+
+A separate disposable integration gate must use a real Pi and a real Zellij session. It must set a disposable `PI_CODING_AGENT_DIR`.
+
+The integration gate must not use a normal user registry, session, socket, process, tab, or pane.
+
+## Residual risks
+
+- Pi lifecycle and Zellij action behavior remain version-specific.
+- A hard crash can bypass shutdown callbacks. Lease expiry and reconciliation provide recovery.
+- A small same-user race remains between pane revalidation and the following Zellij action.
+- IPC assumes same-user local trust. Multi-user control requires authentication and a different protocol.

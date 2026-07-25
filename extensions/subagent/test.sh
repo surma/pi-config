@@ -13,10 +13,14 @@ tmp="$(mktemp -d)"
 cleanup() { rm -rf "$tmp"; }
 trap cleanup EXIT
 
-cp "$script_dir"/child.ts "$script_dir"/lifecycle.ts "$script_dir"/lifecycle.test.ts "$script_dir"/live-state.ts "$script_dir"/live-state.test.ts "$script_dir"/rpc-dispatcher.ts "$script_dir"/rpc-dispatcher.test.ts "$script_dir"/ui.ts "$script_dir"/ui.test.ts "$tmp"/
-ln -s lifecycle.ts "$tmp/lifecycle.js"
-ln -s live-state.ts "$tmp/live-state.js"
-mkdir -p "$tmp/node_modules/@mariozechner"
+sources=(child.ts dispatch-event.ts index.ts ipc.ts ipc-child.ts lifecycle.ts live-state.ts owner.ts registry.ts ui.ts zellij.ts)
+tests=(guard.test.ts ipc.test.ts ipc-child.test.ts child-bridge.test.ts lifecycle.test.ts live-state.test.ts dispatch-event.test.ts launch.test.ts owner.test.ts registry.test.ts tools.test.ts ui.test.ts)
+cp "${sources[@]/#/$script_dir/}" "${tests[@]/#/$script_dir/}" "$tmp"/
+for source in "${sources[@]}"; do ln -s "$source" "$tmp/${source%.ts}.js"; done
+mkdir -p "$tmp/node_modules/@mariozechner" "$tmp/node_modules/@sinclair"
+ln -s "$package_dir" "$tmp/node_modules/@mariozechner/pi-coding-agent"
 ln -s "$package_dir/node_modules/@earendil-works/pi-tui" "$tmp/node_modules/@mariozechner/pi-tui"
+ln -s "$package_dir/node_modules/@earendil-works" "$tmp/node_modules/@earendil-works"
+ln -s "$package_dir/node_modules/typebox" "$tmp/node_modules/@sinclair/typebox"
 
-node --experimental-transform-types --test "$tmp/lifecycle.test.ts" "$tmp/live-state.test.ts" "$tmp/rpc-dispatcher.test.ts" "$tmp/ui.test.ts"
+node --experimental-transform-types --test "${tests[@]/#/$tmp/}"

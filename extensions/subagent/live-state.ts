@@ -42,15 +42,25 @@ function extractText(content: unknown): string {
 		.map((part) => {
 			if (!part || typeof part !== "object") return "";
 			const block = part as Record<string, unknown>;
-			return block.type === "text" && typeof block.text === "string" ? block.text : "";
+			return block.type === "text" && typeof block.text === "string"
+				? block.text
+				: "";
 		})
 		.filter(Boolean)
 		.join("\n");
 }
 
-export function boundedDisplay(text: string, max: number, tailOnly = false): { text: string; truncated: boolean } {
+export function boundedDisplay(
+	text: string,
+	max: number,
+	tailOnly = false,
+): { text: string; truncated: boolean } {
 	if (text.length <= max) return { text, truncated: false };
-	if (tailOnly) return { text: `… [earlier output truncated] …\n${text.slice(-max)}`, truncated: true };
+	if (tailOnly)
+		return {
+			text: `… [earlier output truncated] …\n${text.slice(-max)}`,
+			truncated: true,
+		};
 	const half = Math.floor(max / 2);
 	return {
 		text: `${text.slice(0, half)}\n… [display truncated] …\n${text.slice(-half)}`,
@@ -69,26 +79,42 @@ interface AssistantMessageIdentity {
 export const MAX_FINALIZED_ASSISTANT_IDENTITIES = 256;
 
 /** Pi starts some provider streams before responseId is populated; these public AssistantMessage fields are the stable fallback. */
-function assistantMessageFallbackKey(message: Record<string, unknown> | undefined): string | undefined {
+function assistantMessageFallbackKey(
+	message: Record<string, unknown> | undefined,
+): string | undefined {
 	if (!message) return undefined;
 	const timestamp = message.timestamp;
-	if (typeof timestamp !== "number" || !Number.isFinite(timestamp)) return undefined;
-	return JSON.stringify([timestamp, message.api ?? "", message.provider ?? "", message.model ?? ""]);
+	if (typeof timestamp !== "number" || !Number.isFinite(timestamp))
+		return undefined;
+	return JSON.stringify([
+		timestamp,
+		message.api ?? "",
+		message.provider ?? "",
+		message.model ?? "",
+	]);
 }
 
-function assistantMessageIdentity(message: Record<string, unknown> | undefined): AssistantMessageIdentity | undefined {
+function assistantMessageIdentity(
+	message: Record<string, unknown> | undefined,
+): AssistantMessageIdentity | undefined {
 	const fallbackKey = assistantMessageFallbackKey(message);
-	if (!fallbackKey) return undefined;
-	const responseId = typeof message?.responseId === "string" && message.responseId ? message.responseId : undefined;
+	const timestamp = message?.timestamp;
+	if (!fallbackKey || typeof timestamp !== "number") return undefined;
+	const responseId =
+		typeof message?.responseId === "string" && message.responseId
+			? message.responseId
+			: undefined;
 	return {
 		key: responseId ? `response:${responseId}` : `fallback:${fallbackKey}`,
 		fallbackKey,
-		timestamp: message!.timestamp as number,
+		timestamp,
 		responseId,
 	};
 }
 
-export function assistantMessageKey(message: Record<string, unknown> | undefined): string | undefined {
+export function assistantMessageKey(
+	message: Record<string, unknown> | undefined,
+): string | undefined {
 	return assistantMessageIdentity(message)?.key;
 }
 
@@ -97,9 +123,11 @@ function matchesIdentity(
 	known: { fallbackKey?: string; responseId?: string },
 	allowResponseIdUpgrade: boolean,
 ): boolean {
-	if (known.responseId && identity.responseId) return known.responseId === identity.responseId;
+	if (known.responseId && identity.responseId)
+		return known.responseId === identity.responseId;
 	if (known.responseId && !identity.responseId) return false;
-	if (!known.responseId && identity.responseId && !allowResponseIdUpgrade) return false;
+	if (!known.responseId && identity.responseId && !allowResponseIdUpgrade)
+		return false;
 	return !!known.fallbackKey && known.fallbackKey === identity.fallbackKey;
 }
 
@@ -113,21 +141,33 @@ function matchesRetainedFinalizedIdentity(
 	return known.fallbackKey === identity.fallbackKey;
 }
 
-function wasFinalized(state: AssistantLiveState, identity: AssistantMessageIdentity): boolean {
-	return state.finalizedAssistantIdentities.some((known) => matchesRetainedFinalizedIdentity(identity, known));
+function wasFinalized(
+	state: AssistantLiveState,
+	identity: AssistantMessageIdentity,
+): boolean {
+	return state.finalizedAssistantIdentities.some((known) =>
+		matchesRetainedFinalizedIdentity(identity, known),
+	);
 }
 
-function rememberFinalizedIdentity(state: AssistantLiveState, identity: AssistantMessageIdentity): void {
+function rememberFinalizedIdentity(
+	state: AssistantLiveState,
+	identity: AssistantMessageIdentity,
+): void {
 	if (wasFinalized(state, identity)) return;
 	state.finalizedAssistantIdentities.push({
 		fallbackKey: identity.fallbackKey,
 		timestamp: identity.timestamp,
 		responseId: identity.responseId,
 	});
-	if (state.finalizedAssistantIdentities.length > MAX_FINALIZED_ASSISTANT_IDENTITIES) {
+	if (
+		state.finalizedAssistantIdentities.length >
+		MAX_FINALIZED_ASSISTANT_IDENTITIES
+	) {
 		state.finalizedAssistantIdentities.splice(
 			0,
-			state.finalizedAssistantIdentities.length - MAX_FINALIZED_ASSISTANT_IDENTITIES,
+			state.finalizedAssistantIdentities.length -
+				MAX_FINALIZED_ASSISTANT_IDENTITIES,
 		);
 	}
 }
@@ -137,10 +177,16 @@ export function assistantMessageMatchesFinalized(
 	message: Record<string, unknown> | undefined,
 ): boolean {
 	const identity = assistantMessageIdentity(message);
-	return !!identity && matchesIdentity(
-		identity,
-		{ fallbackKey: state.finalizedAssistantFallbackKey, responseId: state.finalizedAssistantResponseId },
-		false,
+	return (
+		!!identity &&
+		matchesIdentity(
+			identity,
+			{
+				fallbackKey: state.finalizedAssistantFallbackKey,
+				responseId: state.finalizedAssistantResponseId,
+			},
+			false,
+		)
 	);
 }
 
@@ -149,13 +195,21 @@ export function startAssistantMessage(
 	message: Record<string, unknown> | undefined,
 ): boolean {
 	const identity = assistantMessageIdentity(message);
-	if (!identity || state.assistantMessageActive || wasFinalized(state, identity)) return false;
+	if (
+		!identity ||
+		state.assistantMessageActive ||
+		wasFinalized(state, identity)
+	)
+		return false;
 	if (state.finalizedAssistantTimestamp !== undefined) {
 		if (identity.timestamp < state.finalizedAssistantTimestamp) return false;
 		if (
 			identity.timestamp === state.finalizedAssistantTimestamp &&
-			(!identity.responseId || !state.finalizedAssistantResponseId || identity.responseId === state.finalizedAssistantResponseId)
-		) return false;
+			(!identity.responseId ||
+				!state.finalizedAssistantResponseId ||
+				identity.responseId === state.finalizedAssistantResponseId)
+		)
+			return false;
 	}
 	state.assistantMessageGeneration += 1;
 	state.assistantMessageActive = true;
@@ -175,11 +229,19 @@ export function updateAssistantMessage(
 ): boolean {
 	if (!state.assistantMessageActive) return false;
 	const identity = assistantMessageIdentity(message);
-	if (!identity || wasFinalized(state, identity) || !matchesIdentity(
-		identity,
-		{ fallbackKey: state.assistantMessageFallbackKey, responseId: state.assistantMessageResponseId },
-		true,
-	)) return false;
+	if (
+		!identity ||
+		wasFinalized(state, identity) ||
+		!matchesIdentity(
+			identity,
+			{
+				fallbackKey: state.assistantMessageFallbackKey,
+				responseId: state.assistantMessageResponseId,
+			},
+			true,
+		)
+	)
+		return false;
 	if (!state.assistantMessageResponseId && identity.responseId) {
 		state.assistantMessageResponseId = identity.responseId;
 		state.assistantMessageKey = identity.key;
@@ -212,13 +274,22 @@ export function finalizeAssistantMessage(
 	return true;
 }
 
-export function updateToolActivity(tool: ToolActivity, result: unknown, max: number, at: number): void {
+export function updateToolActivity(
+	tool: ToolActivity,
+	result: unknown,
+	max: number,
+	at: number,
+): void {
 	if (!result || typeof result !== "object") return;
-	const value = result as { content?: unknown; details?: Record<string, unknown> };
+	const value = result as {
+		content?: unknown;
+		details?: Record<string, unknown>;
+	};
 	const bounded = boundedDisplay(extractText(value.content), max, true);
 	tool.output = bounded.text;
 	tool.outputTruncated = bounded.truncated;
 	const progress = value.details?.progress;
-	if (typeof progress === "number" && Number.isFinite(progress)) tool.progress = progress;
+	if (typeof progress === "number" && Number.isFinite(progress))
+		tool.progress = progress;
 	tool.updatedAt = at;
 }

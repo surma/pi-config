@@ -1,7 +1,23 @@
-export type SubagentState = "starting" | "running" | "done" | "error" | "killed";
-export type SessionLifecycle = "starting" | "running" | "retrying" | "finishing" | "killing" | "done" | "error" | "killed";
+export type SubagentState =
+	| "starting"
+	| "running"
+	| "done"
+	| "error"
+	| "killed";
+export type SessionLifecycle =
+	| "starting"
+	| "idle"
+	| "running"
+	| "retrying"
+	| "finishing"
+	| "killing"
+	| "done"
+	| "error"
+	| "killed";
+export type ProcessState = "alive" | "stopped";
+export type RunState = "idle" | "running" | "retrying" | "finishing";
 export type RunPhase = "active" | "ended";
-export type RunOutcome = "pending" | "succeeded" | "failed";
+export type RunOutcome = "pending" | "succeeded" | "failed" | "aborted";
 
 export interface SubagentRun {
 	id: number;
@@ -16,10 +32,15 @@ export interface SubagentRun {
 }
 
 export interface LifecycleState {
+	// state/lifecycle are retained for inspector and serialized compatibility.
 	state: SubagentState;
 	lifecycle: SessionLifecycle;
+	processState: ProcessState;
+	runState: RunState;
 	runSequence: number;
+	lastSettledRunId: number;
 	runs: SubagentRun[];
+	runOutcome?: RunOutcome;
 	tentativeError?: string;
 	finalError?: string;
 	settledAt?: number;
@@ -30,30 +51,55 @@ const MAX_RUN_HISTORY = 12;
 const MAX_RUN_ERROR_LENGTH = 8 * 1024;
 
 export function createLifecycleState(): LifecycleState {
-	return { state: "starting", lifecycle: "starting", runSequence: 0, runs: [] };
+	return {
+		state: "starting",
+		lifecycle: "idle",
+		processState: "alive",
+		runState: "idle",
+		runSequence: 0,
+		lastSettledRunId: 0,
+		runs: [],
+	};
 }
 
 export function currentRun(state: LifecycleState): SubagentRun | undefined {
 	return state.runs[state.runs.length - 1];
 }
 
-export function isLifecycleTerminal(state: LifecycleState): boolean {
-	return state.lifecycle === "done" || state.lifecycle === "error" || state.lifecycle === "killed";
+export function currentRunId(state: LifecycleState): number | undefined {
+	return state.runSequence || undefined;
 }
 
-export function startRun(state: LifecycleState, at: number): SubagentRun | undefined {
-	if (isLifecycleTerminal(state) || currentRun(state)?.phase === "active") return undefined;
+export function isLifecycleTerminal(state: LifecycleState): boolean {
+	return state.processState === "stopped";
+}
+
+export function startRun(
+	state: LifecycleState,
+	at: number,
+	suppliedRunId?: number,
+): SubagentRun | undefined {
+	if (isLifecycleTerminal(state) || currentRun(state)?.phase === "active")
+		return undefined;
+	const id =
+		suppliedRunId && suppliedRunId > state.runSequence
+			? suppliedRunId
+			: state.runSequence + 1;
+	state.runSequence = id;
 	const run: SubagentRun = {
-		id: ++state.runSequence,
+		id,
 		phase: "active",
 		outcome: "pending",
 		startedAt: at,
 		corroborated: false,
 	};
 	state.runs.push(run);
-	if (state.runs.length > MAX_RUN_HISTORY) state.runs.splice(0, state.runs.length - MAX_RUN_HISTORY);
+	if (state.runs.length > MAX_RUN_HISTORY)
+		state.runs.splice(0, state.runs.length - MAX_RUN_HISTORY);
 	state.state = "running";
+	state.runState = "running";
 	state.lifecycle = state.killRequestedAt ? "killing" : "running";
+	state.runOutcome = "pending";
 	state.tentativeError = undefined;
 	state.finalError = undefined;
 	return run;
@@ -62,21 +108,30 @@ export function startRun(state: LifecycleState, at: number): SubagentRun | undef
 export function corroborateRun(state: LifecycleState): boolean {
 	if (isLifecycleTerminal(state)) return false;
 	const run = currentRun(state);
-	if (!run || run.phase !== "active") return false;
+	if (run?.phase !== "active") return false;
 	run.corroborated = true;
 	return true;
 }
 
 export function recordAssistantEnd(
 	state: LifecycleState,
-	message: { stopReason?: string; errorMessage?: string; assistantMessageGeneration?: number },
+	message: {
+		stopReason?: string;
+		errorMessage?: string;
+		assistantMessageGeneration?: number;
+	},
 ): void {
 	if (!corroborateRun(state)) return;
-	const run = currentRun(state)!;
+	const run = currentRun(state);
+	if (!run) return;
 	if (message.stopReason) run.stopReason = message.stopReason;
-	if (message.assistantMessageGeneration !== undefined) run.assistantMessageGeneration = message.assistantMessageGeneration;
+	if (message.assistantMessageGeneration !== undefined)
+		run.assistantMessageGeneration = message.assistantMessageGeneration;
 	const rawError = message.errorMessage?.trim();
-	const error = rawError && rawError.length > MAX_RUN_ERROR_LENGTH ? `${rawError.slice(0, MAX_RUN_ERROR_LENGTH)}…` : rawError;
+	const error =
+		rawError && rawError.length > MAX_RUN_ERROR_LENGTH
+			? `${rawError.slice(0, MAX_RUN_ERROR_LENGTH)}…`
+			: rawError;
 	if (message.stopReason === "error" || error) {
 		run.outcome = "failed";
 		run.error = error || "Assistant response failed";
@@ -84,16 +139,21 @@ export function recordAssistantEnd(
 	}
 }
 
-export function endRun(state: LifecycleState, at: number, willRetry: boolean): boolean {
+export function endRun(
+	state: LifecycleState,
+	at: number,
+	willRetry: boolean,
+): boolean {
 	if (isLifecycleTerminal(state)) return false;
 	const run = currentRun(state);
-	if (!run || run.phase !== "active") return false;
+	if (run?.phase !== "active") return false;
 	run.phase = "ended";
 	run.corroborated = true;
 	run.endedAt = at;
 	if (run.outcome === "pending") run.outcome = "succeeded";
 	state.state = "running";
-	state.lifecycle = state.killRequestedAt ? "killing" : willRetry ? "retrying" : "finishing";
+	state.runState = willRetry ? "retrying" : "finishing";
+	state.lifecycle = state.killRequestedAt ? "killing" : state.runState;
 	return true;
 }
 
@@ -103,41 +163,113 @@ export function requestKill(state: LifecycleState, at: number): void {
 	state.lifecycle = "killing";
 }
 
-export function settleLifecycle(state: LifecycleState, at: number): SubagentState | undefined {
+/** Revive a stopped logical child for a new process incarnation. */
+export function reviveForResume(state: LifecycleState): void {
+	state.processState = "alive";
+	state.killRequestedAt = undefined;
+	state.settledAt = undefined;
+	resetRunViewForSession(state);
+}
+
+/** Clear session-specific live state without resetting the process-wide settlement cursor. */
+export function resetRunViewForSession(state: LifecycleState): void {
+	if (isLifecycleTerminal(state)) return;
+	state.state = "starting";
+	state.lifecycle = "idle";
+	state.runState = "idle";
+	state.runOutcome = "pending";
+	state.runs = [];
+	state.tentativeError = undefined;
+	state.finalError = undefined;
+}
+
+/** Settle one run while leaving the child process alive and re-enterable. */
+export function settleRunToIdle(
+	state: LifecycleState,
+	at: number,
+	outcome?: Exclude<RunOutcome, "pending">,
+	stopReason?: string,
+	errorMessage?: string,
+): SubagentState | undefined {
 	if (isLifecycleTerminal(state)) return state.state;
-	if (!state.killRequestedAt) {
-		const run = currentRun(state);
-		if (run?.phase === "active") {
-			if (run.corroborated) return undefined;
-			// A bare start after a completed run is only a candidate boundary. With no
-			// accepted activity to corroborate it, settlement proves it was duplicate/late.
-			state.runs.pop();
-		}
+	const run = currentRun(state);
+	if (run?.phase === "active") {
+		if (run.corroborated) return undefined;
+		state.runs.pop();
 	}
+	const settled = currentRun(state);
+	if (settled?.phase !== "ended" || settled.id <= state.lastSettledRunId)
+		return undefined;
+	if (outcome) settled.outcome = outcome;
+	if (stopReason) settled.stopReason = stopReason;
+	if (errorMessage) settled.error = errorMessage;
+	state.lastSettledRunId = Math.max(state.lastSettledRunId, settled.id);
 	state.settledAt = at;
+	state.runState = "idle";
+	state.lifecycle = "idle";
+	state.tentativeError = undefined;
+	state.runOutcome = settled.outcome;
+	if (settled.outcome === "failed") {
+		state.state = "error";
+		state.finalError =
+			settled.error || errorMessage || "Assistant response failed";
+	} else if (settled.outcome === "aborted") {
+		state.state = "running";
+		state.finalError = undefined;
+	} else {
+		state.state = "done";
+		state.finalError = undefined;
+	}
+	return state.state;
+}
+
+/** Backward-compatible name: settlement is now per-run and non-terminal. */
+export function settleLifecycle(
+	state: LifecycleState,
+	at: number,
+): SubagentState | undefined {
+	return settleRunToIdle(state, at);
+}
+
+export function markStopped(
+	state: LifecycleState,
+	at: number,
+	exit?: {
+		code?: number | null;
+		signal?: NodeJS.Signals | null;
+		error?: string;
+	},
+): SubagentState {
+	if (isLifecycleTerminal(state)) return state.state;
+	state.processState = "stopped";
+	state.settledAt = at;
+	state.runState = "idle";
 	state.tentativeError = undefined;
 	if (state.killRequestedAt) {
 		state.state = "killed";
 		state.lifecycle = "killed";
-		state.finalError = "Killed";
+		state.finalError = state.finalError || "Killed";
 		return state.state;
 	}
-	const run = [...state.runs].reverse().find((candidate) => candidate.phase === "ended");
-	if (run?.outcome === "failed") {
-		state.state = "error";
-		state.lifecycle = "error";
-		state.finalError = run.error || "Assistant response failed";
+	const last = currentRun(state);
+	if (last && last.id <= state.lastSettledRunId) {
+		state.state = last.outcome === "failed" ? "error" : "done";
+		state.lifecycle = state.state;
+		state.finalError =
+			last.outcome === "failed"
+				? last.error || "Assistant response failed"
+				: undefined;
 		return state.state;
 	}
-	if (run?.outcome === "succeeded") {
-		state.state = "done";
-		state.lifecycle = "done";
-		state.finalError = undefined;
-		return state.state;
-	}
+	const failed = [...state.runs]
+		.reverse()
+		.find((candidate) => candidate.outcome === "failed");
 	state.state = "error";
 	state.lifecycle = "error";
-	state.finalError = "agent_settled arrived without an ended agent run";
+	state.finalError =
+		exit?.error ||
+		failed?.error ||
+		`Process exited before agent_settled${exit?.signal ? ` via signal ${exit.signal}` : ` with code ${exit?.code ?? "unknown"}`}`;
 	return state.state;
 }
 
@@ -146,33 +278,19 @@ export function closeBeforeSettlement(
 	at: number,
 	exit: { code: number | null; signal: NodeJS.Signals | null },
 ): SubagentState {
-	if (isLifecycleTerminal(state)) return state.state;
-	state.settledAt = at;
-	state.tentativeError = undefined;
-	if (state.killRequestedAt) {
-		state.state = "killed";
-		state.lifecycle = "killed";
-		state.finalError = "Killed";
-		return state.state;
-	}
-	const failed = [...state.runs].reverse().find((candidate) => candidate.outcome === "failed");
-	state.state = "error";
-	state.lifecycle = "error";
-	state.finalError =
-		failed?.error ||
-		`Process exited before agent_settled${exit.signal ? ` via signal ${exit.signal}` : ` with code ${exit.code ?? "unknown"}`}`;
-	return state.state;
+	return markStopped(state, at, exit);
 }
 
 export function lifecycleActivity(
-	state: Pick<LifecycleState, "lifecycle">,
+	state: Pick<LifecycleState, "lifecycle" | "runState" | "processState">,
 	activity: { currentTool?: string; isStreaming: boolean; lastTool?: string },
 ): string {
 	if (state.lifecycle === "killing") return "killing";
+	if (state.processState === "stopped") return state.lifecycle;
 	if (activity.currentTool) return `tool: ${activity.currentTool}`;
 	if (activity.isStreaming) return "responding";
-	if (state.lifecycle === "retrying") return "retrying";
-	if (state.lifecycle === "finishing") return "finishing";
+	if (state.runState === "retrying") return "retrying";
+	if (state.runState === "finishing") return "finishing";
 	if (activity.lastTool) return `tool: ${activity.lastTool}`;
-	return state.lifecycle === "done" ? "final response" : state.lifecycle === "error" ? "error" : state.lifecycle === "killed" ? "killed" : "idle";
+	return "idle";
 }

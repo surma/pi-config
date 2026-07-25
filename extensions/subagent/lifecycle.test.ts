@@ -4,138 +4,160 @@ import {
 	closeBeforeSettlement,
 	corroborateRun,
 	createLifecycleState,
+	currentRunId,
 	endRun,
+	isLifecycleTerminal,
 	lifecycleActivity,
+	markStopped,
 	recordAssistantEnd,
 	requestKill,
-	settleLifecycle,
+	resetRunViewForSession,
+	reviveForResume,
+	settleRunToIdle,
 	startRun,
 } from "./lifecycle.ts";
 
-test("failed retry followed by success settles done without a terminal error", () => {
+test("agent settlement is non-terminal idle and a second run can start", () => {
 	const state = createLifecycleState();
 	startRun(state, 1);
-	recordAssistantEnd(state, { stopReason: "error", errorMessage: "temporary overload" });
-	endRun(state, 2, true);
-	assert.equal(state.lifecycle, "retrying");
-	assert.equal(state.tentativeError, "temporary overload");
+	recordAssistantEnd(state, { stopReason: "stop" });
+	endRun(state, 2, false);
+	assert.equal(settleRunToIdle(state, 3), "done");
+	assert.equal(state.processState, "alive");
+	assert.equal(state.runState, "idle");
+	assert.equal(isLifecycleTerminal(state), false);
+	assert.equal(state.lastSettledRunId, 1);
+	assert.equal(startRun(state, 4)?.id, 2);
+	assert.equal(currentRunId(state), 2);
+});
 
+test("session replacement preserves monotonic run and settlement cursors", () => {
+	const state = createLifecycleState();
+	startRun(state, 1, 5);
+	recordAssistantEnd(state, { stopReason: "stop" });
+	endRun(state, 2, false);
+	settleRunToIdle(state, 3);
+	assert.equal(state.runSequence, 5);
+	assert.equal(state.lastSettledRunId, 5);
+	resetRunViewForSession(state);
+	assert.equal(state.runSequence, 5);
+	assert.equal(state.lastSettledRunId, 5);
+	assert.equal(startRun(state, 4, 6)?.id, 6);
+	recordAssistantEnd(state, { stopReason: "stop" });
+	endRun(state, 5, false);
+	settleRunToIdle(state, 6);
+	assert.equal(state.lastSettledRunId, 6);
+});
+
+test("failed retry followed by success remains alive and records final success", () => {
+	const state = createLifecycleState();
+	startRun(state, 1);
+	recordAssistantEnd(state, { stopReason: "error", errorMessage: "temporary" });
+	endRun(state, 2, true);
+	assert.equal(state.runState, "retrying");
 	startRun(state, 3);
-	assert.equal(state.lifecycle, "running");
-	assert.equal(state.tentativeError, undefined);
 	recordAssistantEnd(state, { stopReason: "stop" });
 	endRun(state, 4, false);
-	assert.equal(state.lifecycle, "finishing");
-	assert.equal(settleLifecycle(state, 5), "done");
+	assert.equal(settleRunToIdle(state, 5), "done");
 	assert.equal(state.finalError, undefined);
-	assert.equal(state.runs[0]?.error, "temporary overload");
+	assert.equal(state.processState, "alive");
 });
 
-test("duplicate and late run boundaries are idempotent", () => {
+test("duplicate boundaries and uncorroborated late start are ignored", () => {
 	const state = createLifecycleState();
-	const first = startRun(state, 1);
-	assert.ok(first);
+	assert.ok(startRun(state, 1));
 	assert.equal(startRun(state, 2), undefined);
-	assert.equal(state.runs.length, 1);
-
-	assert.equal(endRun(state, 3, true), true);
-	assert.equal(state.lifecycle, "retrying");
+	recordAssistantEnd(state, { stopReason: "stop" });
+	assert.equal(endRun(state, 3, false), true);
 	assert.equal(endRun(state, 4, false), false);
-	assert.equal(state.lifecycle, "retrying");
-	assert.equal(state.runs[0]?.endedAt, 3);
-
-	const retry = startRun(state, 5);
-	assert.ok(retry);
-	assert.equal(state.runs.length, 2);
-	assert.equal(corroborateRun(state), true);
-	assert.equal(settleLifecycle(state, 6), undefined);
-	assert.equal(state.lifecycle, "running");
-	assert.equal(endRun(state, 7, false), true);
-	assert.equal(settleLifecycle(state, 8), "done");
-	assert.equal(startRun(state, 9), undefined);
-	assert.equal(endRun(state, 10, true), false);
-	assert.equal(state.lifecycle, "done");
+	assert.ok(startRun(state, 5));
+	assert.equal(settleRunToIdle(state, 6), "done");
+	assert.equal(state.runs.length, 1);
+	assert.equal(settleRunToIdle(state, 7), undefined);
 });
 
-test("settlement discards an uncorroborated post-end start", () => {
+test("corroborated active continuation cannot settle early", () => {
 	const state = createLifecycleState();
 	startRun(state, 1);
 	recordAssistantEnd(state, { stopReason: "stop" });
 	endRun(state, 2, false);
-
-	const duplicate = startRun(state, 3);
-	assert.ok(duplicate);
-	assert.equal(duplicate.corroborated, false);
-	assert.equal(settleLifecycle(state, 4), "done");
-	assert.equal(state.runs.length, 1);
-	assert.equal(state.runs[0]?.phase, "ended");
+	startRun(state, 3);
+	corroborateRun(state);
+	assert.equal(settleRunToIdle(state, 4), undefined);
+	assert.equal(state.runState, "running");
 });
 
-test("settlement does not discard a corroborated continuation", () => {
-	const state = createLifecycleState();
-	startRun(state, 1);
-	recordAssistantEnd(state, { stopReason: "stop" });
-	endRun(state, 2, false);
-
-	const continuation = startRun(state, 3);
-	assert.ok(continuation);
-	assert.equal(corroborateRun(state), true);
-	assert.equal(continuation.corroborated, true);
-	assert.equal(settleLifecycle(state, 4), undefined);
-	assert.equal(state.lifecycle, "running");
-	assert.equal(state.runs.length, 2);
-});
-
-test("unrecovered final failure settles error from the final run", () => {
-	const state = createLifecycleState();
-	startRun(state, 1);
-	recordAssistantEnd(state, { stopReason: "error", errorMessage: "quota exhausted" });
-	endRun(state, 2, false);
-	assert.equal(settleLifecycle(state, 3), "error");
-	assert.equal(state.finalError, "quota exhausted");
-});
-
-test("requested kill settles killed and terminal transitions are idempotent", () => {
-	const state = createLifecycleState();
-	startRun(state, 1);
-	requestKill(state, 2);
-	assert.equal(state.lifecycle, "killing");
-	assert.equal(settleLifecycle(state, 3), "killed");
-	assert.equal(settleLifecycle(state, 4), "killed");
-	startRun(state, 5);
-	assert.equal(state.runs.length, 1);
-});
-
-test("close before settlement uses failed-run evidence or deterministic process fallback", () => {
+test("failed and aborted outcomes classify the run without stopping process", () => {
 	const failed = createLifecycleState();
 	startRun(failed, 1);
-	recordAssistantEnd(failed, { stopReason: "error", errorMessage: "provider failed" });
+	recordAssistantEnd(failed, { stopReason: "error", errorMessage: "quota" });
 	endRun(failed, 2, false);
-	assert.equal(closeBeforeSettlement(failed, 3, { code: 1, signal: null }), "error");
-	assert.equal(failed.finalError, "provider failed");
-
-	const failedBeforeEnd = createLifecycleState();
-	startRun(failedBeforeEnd, 1);
-	recordAssistantEnd(failedBeforeEnd, { stopReason: "error", errorMessage: "stream failed" });
-	assert.equal(closeBeforeSettlement(failedBeforeEnd, 2, { code: 1, signal: null }), "error");
-	assert.equal(failedBeforeEnd.finalError, "stream failed");
-
-	const unexpected = createLifecycleState();
-	startRun(unexpected, 1);
-	assert.equal(closeBeforeSettlement(unexpected, 2, { code: 0, signal: null }), "error");
-	assert.equal(unexpected.finalError, "Process exited before agent_settled with code 0");
-
-	const killed = createLifecycleState();
-	startRun(killed, 1);
-	requestKill(killed, 2);
-	assert.equal(closeBeforeSettlement(killed, 3, { code: null, signal: "SIGTERM" }), "killed");
+	assert.equal(settleRunToIdle(failed, 3, "failed", "error", "quota"), "error");
+	assert.equal(failed.processState, "alive");
+	assert.equal(failed.finalError, "quota");
+	const aborted = createLifecycleState();
+	startRun(aborted, 1);
+	corroborateRun(aborted);
+	endRun(aborted, 2, false);
+	assert.equal(settleRunToIdle(aborted, 3, "aborted", "aborted"), "running");
+	assert.equal(aborted.runOutcome, "aborted");
+	assert.equal(aborted.processState, "alive");
 });
 
-test("activity precedence keeps a current stream ahead of the last tool", () => {
+test("resume revival clears the kill fence and preserves monotonic cursors", () => {
+	const state = createLifecycleState();
+	startRun(state, 1, 2);
+	recordAssistantEnd(state, { stopReason: "stop" });
+	endRun(state, 2, false);
+	settleRunToIdle(state, 3);
+	requestKill(state, 4);
+	markStopped(state, 5);
+	reviveForResume(state);
+	assert.equal(state.processState, "alive");
+	assert.equal(state.lifecycle, "idle");
+	assert.equal(state.killRequestedAt, undefined);
+	assert.equal(state.runSequence, 2);
+	assert.equal(state.lastSettledRunId, 2);
+	assert.equal(state.settledAt, undefined);
+	assert.equal(startRun(state, 6, 3)?.id, 3);
+	assert.equal(state.lifecycle, "running");
+});
+
+test("markStopped is the terminal transition", () => {
 	const state = createLifecycleState();
 	startRun(state, 1);
-	assert.equal(lifecycleActivity(state, { isStreaming: true, lastTool: "read" }), "responding");
-	assert.equal(lifecycleActivity(state, { currentTool: "bash", isStreaming: true, lastTool: "read" }), "tool: bash");
+	markStopped(state, 2, { code: 7 });
+	assert.equal(state.processState, "stopped");
+	assert.equal(isLifecycleTerminal(state), true);
+	assert.equal(state.state, "error");
+	assert.match(state.finalError || "", /code 7/);
+	assert.equal(startRun(state, 3), undefined);
+});
+
+test("kill and close fallback stop exactly once", () => {
+	const state = createLifecycleState();
+	startRun(state, 1);
 	requestKill(state, 2);
-	assert.equal(lifecycleActivity(state, { currentTool: "bash", isStreaming: true }), "killing");
+	assert.equal(
+		closeBeforeSettlement(state, 3, { code: null, signal: "SIGTERM" }),
+		"killed",
+	);
+	assert.equal(state.processState, "stopped");
+	assert.equal(
+		closeBeforeSettlement(state, 4, { code: 1, signal: null }),
+		"killed",
+	);
+});
+
+test("activity reports process and run state", () => {
+	const state = createLifecycleState();
+	assert.equal(lifecycleActivity(state, { isStreaming: false }), "idle");
+	startRun(state, 1);
+	assert.equal(lifecycleActivity(state, { isStreaming: true }), "responding");
+	assert.equal(
+		lifecycleActivity(state, { currentTool: "bash", isStreaming: true }),
+		"tool: bash",
+	);
+	requestKill(state, 2);
+	assert.equal(lifecycleActivity(state, { isStreaming: false }), "killing");
 });

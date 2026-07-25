@@ -1,14 +1,26 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { visibleWidth } from "@mariozechner/pi-tui";
-import { SubagentInspector, sanitizeTerminalText, type InspectorHandle } from "./ui.ts";
+import {
+	type InspectorHandle,
+	SubagentInspector,
+	sanitizeTerminalText,
+} from "./ui.ts";
 
-function handle(id: string, overrides: Partial<InspectorHandle> = {}): InspectorHandle {
+function handle(
+	id: string,
+	overrides: Partial<InspectorHandle> = {},
+): InspectorHandle {
 	return {
 		id,
 		name: `child-${id}`,
 		state: "running",
 		lifecycle: "running",
+		processState: "alive",
+		runState: "running",
+		runId: 1,
+		tabId: 2,
+		paneId: 3,
 		killing: false,
 		task: `task-${id}\nwith details`,
 		cwd: "/tmp/work",
@@ -27,7 +39,14 @@ function handle(id: string, overrides: Partial<InspectorHandle> = {}): Inspector
 		currentTool: undefined,
 		lastTool: "read",
 		isStreaming: true,
-		usage: { input: 10, output: 5, cacheRead: 2, cacheWrite: 1, cost: 0.01, turns: 1 },
+		usage: {
+			input: 10,
+			output: 5,
+			cacheRead: 2,
+			cacheWrite: 1,
+			cost: 0.01,
+			turns: 1,
+		},
 		currentAssistantText: `live-${id}`,
 		latestAssistantText: `final-${id}`,
 		activeTools: [],
@@ -36,12 +55,31 @@ function handle(id: string, overrides: Partial<InspectorHandle> = {}): Inspector
 	};
 }
 
-function fixture(initial: InspectorHandle[], files?: any, rows = 60) {
+interface TestFileStat {
+	size: number;
+	mtimeMs: number;
+}
+
+interface TestFiles {
+	readFile(path: string, encoding: string): Promise<string>;
+	stat(path: string): Promise<TestFileStat>;
+}
+
+type InspectorArguments = ConstructorParameters<typeof SubagentInspector>;
+
+function fixture(initial: InspectorHandle[], files?: TestFiles, rows = 60) {
 	const handles = initial;
 	let renders = 0;
 	let closed = false;
-	const tui = { terminal: { rows, columns: 120 }, requestRender: () => renders++ } as any;
-	const theme = { fg: (_color: string, text: string) => text, bg: (_color: string, text: string) => text, bold: (text: string) => text } as any;
+	const tui = {
+		terminal: { rows, columns: 120 },
+		requestRender: () => renders++,
+	} as unknown as InspectorArguments[0];
+	const theme = {
+		fg: (_color: string, text: string) => text,
+		bg: (_color: string, text: string) => text,
+		bold: (text: string) => text,
+	} as unknown as InspectorArguments[1];
 	const keybindings = {
 		matches(data: string, id: string) {
 			return (
@@ -54,7 +92,7 @@ function fixture(initial: InspectorHandle[], files?: any, rows = 60) {
 				(id === "tui.select.pageDown" && data === "pageDown")
 			);
 		},
-	} as any;
+	} as unknown as InspectorArguments[2];
 	const inspector = new SubagentInspector(
 		tui,
 		theme,
@@ -68,9 +106,18 @@ function fixture(initial: InspectorHandle[], files?: any, rows = 60) {
 				closed = true;
 			},
 		},
-		files,
+		files as unknown as InspectorArguments[4],
 	);
-	return { handles, inspector, get renders() { return renders; }, get closed() { return closed; } };
+	return {
+		handles,
+		inspector,
+		get renders() {
+			return renders;
+		},
+		get closed() {
+			return closed;
+		},
+	};
 }
 
 function plain(lines: string[]): string {
@@ -84,7 +131,16 @@ const noFiles = {
 
 test("status, original task, and live output have distinct hierarchy", async () => {
 	const child = handle("a1", {
-		activeTools: [{ toolCallId: "tool-1", name: "bash", startedAt: Date.now() - 1_000, updatedAt: Date.now(), output: "partial output", outputTruncated: false }],
+		activeTools: [
+			{
+				toolCallId: "tool-1",
+				name: "bash",
+				startedAt: Date.now() - 1_000,
+				updatedAt: Date.now(),
+				output: "partial output",
+				outputTruncated: false,
+			},
+		],
 	});
 	const fx = fixture([child], noFiles);
 	fx.inspector.render(120);
@@ -99,7 +155,10 @@ test("status, original task, and live output have distinct hierarchy", async () 
 	fx.inspector.handleInput("p");
 	await Promise.resolve();
 	const task = plain(fx.inspector.render(120));
-	assert.ok(task.indexOf("ORIGINAL DELEGATED TASK") < task.indexOf("CAPTURED PI EFFECTIVE SYSTEM PROMPT"));
+	assert.ok(
+		task.indexOf("ORIGINAL DELEGATED TASK") <
+			task.indexOf("CAPTURED PI EFFECTIVE SYSTEM PROMPT"),
+	);
 	assert.match(task, /task-a1/);
 
 	fx.inspector.handleInput("r");
@@ -116,17 +175,22 @@ test("status, original task, and live output have distinct hierarchy", async () 
 test("list and open detail reconcile lifecycle updates", () => {
 	const child = handle("a1");
 	const fx = fixture([child], noFiles);
-	assert.match(plain(fx.inspector.render(80)), /\[RUNNING\]/);
-	fx.inspector.handleInput("enter");
-	child.state = "done";
-	child.lifecycle = "done";
-	child.isStreaming = false;
-	child.completedAt = Date.now();
-	fx.inspector.refresh();
-	assert.match(plain(fx.inspector.render(80)), /\[DONE\]/);
-	fx.inspector.handleInput("escape");
-	assert.match(plain(fx.inspector.render(80)), /\[DONE\]/);
-	fx.inspector.dispose();
+	try {
+		assert.match(plain(fx.inspector.render(80)), /\[ALIVE\/RUNNING\]/);
+		fx.inspector.handleInput("enter");
+		child.state = "done";
+		child.lifecycle = "done";
+		child.processState = "stopped";
+		child.runState = "idle";
+		child.isStreaming = false;
+		child.completedAt = Date.now();
+		fx.inspector.refresh();
+		assert.match(plain(fx.inspector.render(80)), /\[STOPPED\/IDLE\]/);
+		fx.inspector.handleInput("escape");
+		assert.match(plain(fx.inspector.render(80)), /\[STOPPED\/IDLE\]/);
+	} finally {
+		fx.inspector.dispose();
+	}
 });
 
 test("all rendered lines fit narrow and wide widths after sanitization", () => {
@@ -139,7 +203,10 @@ test("all rendered lines fit narrow and wide widths after sanitization", () => {
 		fx.inspector.render(width);
 		fx.inspector.handleInput("r");
 		const lines = fx.inspector.render(width);
-		assert.ok(lines.every((line) => visibleWidth(line) <= width), `line exceeded ${width} columns`);
+		assert.ok(
+			lines.every((line) => visibleWidth(line) <= width),
+			`line exceeded ${width} columns`,
+		);
 		assert.doesNotMatch(plain(lines), /\u001b\[2J/);
 		fx.inspector.dispose();
 	}
@@ -147,14 +214,22 @@ test("all rendered lines fit narrow and wide widths after sanitization", () => {
 });
 
 test("manual live scroll pauses follow until f resumes", () => {
-	const child = handle("a1", { currentAssistantText: Array.from({ length: 40 }, (_, index) => `line ${index}`).join("\n") });
+	const child = handle("a1", {
+		currentAssistantText: Array.from(
+			{ length: 40 },
+			(_, index) => `line ${index}`,
+		).join("\n"),
+	});
 	const fx = fixture([child], noFiles, 16);
 	fx.inspector.render(80);
 	fx.inspector.handleInput("r");
 	assert.match(plain(fx.inspector.render(80)), /FOLLOWING LIVE OUTPUT/);
 	fx.inspector.handleInput("up");
 	child.currentAssistantText += "\nnewest line";
-	assert.match(plain(fx.inspector.render(80)), /PAUSED — End\/f resumes latest/);
+	assert.match(
+		plain(fx.inspector.render(80)),
+		/PAUSED — End\/f resumes latest/,
+	);
 	fx.inspector.handleInput("f");
 	const resumed = plain(fx.inspector.render(80));
 	assert.match(resumed, /FOLLOWING LIVE OUTPUT/);
@@ -168,7 +243,8 @@ test("stale prompt reads cannot overwrite a newer selection", async () => {
 		resolveFirst = resolve;
 	});
 	const files = {
-		readFile: async (path: string) => (path.includes("a.prompt") ? first : "prompt-b"),
+		readFile: async (path: string) =>
+			path.includes("a.prompt") ? first : "prompt-b",
 		stat: async () => ({ size: 0, mtimeMs: 0 }),
 	};
 	const fx = fixture([handle("a"), handle("b")], files);
@@ -214,13 +290,17 @@ test("active heartbeat refreshes elapsed labels and dispose stops future renders
 });
 
 test("stale transcript reads are ignored and queued refresh uses the newer child", async () => {
-	let resolveFirstStat!: (value: any) => void;
-	const firstStat = new Promise<any>((resolve) => {
+	let resolveFirstStat: ((value: TestFileStat) => void) | undefined;
+	const firstStat = new Promise<TestFileStat>((resolve) => {
 		resolveFirstStat = resolve;
 	});
 	const files = {
-		stat: async (path: string) => (path.includes("a.jsonl") ? firstStat : { size: 20, mtimeMs: 2 }),
-		readFile: async (path: string) => path.includes("a.jsonl") ? `${JSON.stringify({ type: "session_info", name: "history-a" })}\n` : `${JSON.stringify({ type: "session_info", name: "history-b" })}\n`,
+		stat: async (path: string) =>
+			path.includes("a.jsonl") ? firstStat : { size: 20, mtimeMs: 2 },
+		readFile: async (path: string) =>
+			path.includes("a.jsonl")
+				? `${JSON.stringify({ type: "session_info", name: "history-a" })}\n`
+				: `${JSON.stringify({ type: "session_info", name: "history-b" })}\n`,
 	};
 	const fx = fixture([handle("a"), handle("b")], files);
 	fx.inspector.render(100);
@@ -228,7 +308,7 @@ test("stale transcript reads are ignored and queued refresh uses the newer child
 	fx.inspector.handleInput("escape");
 	fx.inspector.handleInput("down");
 	fx.inspector.handleInput("r");
-	resolveFirstStat({ size: 20, mtimeMs: 1 });
+	resolveFirstStat?.({ size: 20, mtimeMs: 1 });
 	await firstStat;
 	await new Promise((resolve) => setTimeout(resolve, 0));
 	const rendered = plain(fx.inspector.render(100));
