@@ -29,7 +29,6 @@ function handle(
 		requestedThinking: "medium",
 		actualModel: { provider: "provider", id: "model" },
 		actualThinking: "medium",
-		configuredTools: ["read", "bash"],
 		sessionPath: `/tmp/${id}.jsonl`,
 		promptPath: `/tmp/${id}.prompt`,
 		resultKind: "partial",

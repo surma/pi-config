@@ -163,6 +163,16 @@ test("all nine tool schemas accept valid parameters and reject invalid parameter
 		false,
 		"subagent_start rejects missing thinking",
 	);
+	assert.equal(
+		Check(startSchema, {
+			task: "work",
+			model: "p/m",
+			thinking: "high",
+			tools: ["read"],
+		}),
+		false,
+		"subagent_start rejects child tool configuration",
+	);
 });
 
 test("start is blocked for nested children before launch", async () => {
@@ -296,7 +306,6 @@ exit 2
 				sessionFile: "/tmp/same-session.jsonl",
 				requestedModel: "p/m",
 				requestedThinking: "off",
-				configuredTools: [],
 				processState: "alive",
 				runState: "running",
 				runId: 8,
@@ -485,7 +494,6 @@ async function setupControllerWithChild(opts: {
 				sessionFile: opts.hasSessionFile ? sessionFilePath : undefined,
 				requestedModel: "p/m",
 				requestedThinking: "off",
-				configuredTools: [],
 				processState: opts.processState ?? "alive",
 				runState: "idle",
 				runId: opts.runId ?? 0,
@@ -693,7 +701,6 @@ test("foreign and legacy registries are not loaded or modified", async () => {
 		socketPath: join(directory, "fsock"),
 		requestedModel: "p/m",
 		requestedThinking: "off",
-		configuredTools: [],
 		processState: "alive",
 		runState: "idle",
 		createdAt: 1,
@@ -871,6 +878,28 @@ test("resume opens the exact child session with a new fenced incarnation", async
 		const sessionIndex = launchArgs.indexOf("--session");
 		assert.equal(launchArgs[sessionIndex + 1], s.sessionFilePath);
 		assert.ok(launchArgs.includes("--offline"));
+		const envIndex = launchArgs.indexOf("env");
+		const commandIndex = launchArgs.findIndex(
+			(value, index) => index > envIndex && !value.includes("="),
+		);
+		const envKeys = launchArgs
+			.slice(envIndex + 1, commandIndex)
+			.map((value) => value.slice(0, value.indexOf("=")));
+		assert.deepEqual(envKeys, [
+			"PI_SUBAGENT_CHILD",
+			"PI_SUBAGENT_CHILD_ID",
+			"PI_SUBAGENT_OWNER_SESSION_FILE",
+			"PI_SUBAGENT_OWNER_SESSION_ID",
+			"PI_SUBAGENT_CONTROLLER_INSTANCE_ID",
+			"PI_SUBAGENT_INCARNATION",
+			"PI_SUBAGENT_RUN_ID_BASE",
+			"PI_SUBAGENT_SYSTEM_PROMPT",
+			"PI_SUBAGENT_DEPTH",
+			"PI_SUBAGENT_PROMPT_PATH",
+			"BRIDGE_SOCKET_PATH",
+			"BRIDGE_LOG_PATH",
+			"TERM",
+		]);
 		assert.notEqual(next?.incarnation, s.incarnation);
 		const status = await requireTool(s.tools, "subagent_status").execute("x", {
 			id: s.childId,

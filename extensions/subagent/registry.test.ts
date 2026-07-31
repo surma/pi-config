@@ -30,7 +30,6 @@ function entry(overrides: Partial<RegistryEntry> = {}): RegistryEntry {
 		socketPath: "/tmp/session/sock",
 		requestedModel: "p/m",
 		requestedThinking: "off",
-		configuredTools: [],
 		processState: "alive",
 		runState: "idle",
 		createdAt: 1,

@@ -174,7 +174,7 @@ A settled child remains alive and interactive. Settlement never calls `ctx.shutd
 
 The extension registers nine tools.
 
-- `subagent_start {task, model, thinking, name?, cwd?, tools?, systemPrompt?}`
+- `subagent_start {task, model, thinking, name?, cwd?, systemPrompt?}`
   - The model and thinking level are mandatory.
   - The tool starts a visible child and waits for a bounded IPC handshake.
 - `subagent_list {includeFinished?}`

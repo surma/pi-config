@@ -24,12 +24,6 @@ const launchControllerInstanceId =
 const incarnation = process.env.PI_SUBAGENT_INCARNATION || "";
 const delegatedPrompt = process.env.PI_SUBAGENT_SYSTEM_PROMPT || "";
 const promptPath = process.env.PI_SUBAGENT_PROMPT_PATH;
-const hasInheritedActiveTools =
-	process.env.PI_SUBAGENT_ACTIVE_TOOLS !== undefined;
-const inheritedActiveTools = (process.env.PI_SUBAGENT_ACTIVE_TOOLS || "")
-	.split(",")
-	.map((value) => value.trim())
-	.filter(Boolean);
 const subagentDepth = Math.max(
 	1,
 	Number.parseInt(process.env.PI_SUBAGENT_DEPTH || "1", 10) || 1,
@@ -142,10 +136,6 @@ export default function childSubagentExtension(pi: ExtensionAPI) {
 			usage: { ...usage },
 		});
 
-	const applyInheritedActiveTools = () => {
-		if (hasInheritedActiveTools)
-			pi.setActiveTools(Array.from(new Set(inheritedActiveTools)));
-	};
 	const base = <T extends ChildFrame["type"]>(type: T) => ({
 		type,
 		schemaVersion: IPC_SCHEMA_VERSION as 1,
@@ -274,7 +264,6 @@ export default function childSubagentExtension(pi: ExtensionAPI) {
 		}
 		persisted.sessionId = nextSessionId;
 		syncPersistent();
-		applyInheritedActiveTools();
 		ensureConnector();
 		// A duplicate session_start on the same connection is intentionally harmless;
 		// the parent deduplicates hello by child connectionId.
@@ -282,7 +271,6 @@ export default function childSubagentExtension(pi: ExtensionAPI) {
 		if (sessionReason === "reload" || sessionReason === "resume") snapshot();
 	});
 	pi.on("before_agent_start", async (rawEvent) => {
-		applyInheritedActiveTools();
 		const sections = [rawEvent.systemPrompt];
 		if (delegatedPrompt.trim())
 			sections.push(`Direct delegated guidance:\n${delegatedPrompt.trim()}`);

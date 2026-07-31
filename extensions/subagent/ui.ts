@@ -43,7 +43,6 @@ export interface InspectorHandle {
 	requestedThinking: string;
 	actualModel: { provider: string; id: string; name?: string };
 	actualThinking: string;
-	configuredTools: string[];
 	sessionPath: string;
 	promptPath: string;
 	resultPath?: string;
@@ -598,14 +597,6 @@ export class SubagentInspector implements Focusable {
 			`${handle.usage.turns} turns · ↑${handle.usage.input} ↓${handle.usage.output} · cache R${handle.usage.cacheRead} W${handle.usage.cacheWrite} · $${handle.usage.cost.toFixed(4)}`,
 			width,
 		);
-		if (width >= 52)
-			this.pushField(
-				lines,
-				"Tools",
-				handle.configuredTools.join(", ") || "(none)",
-				width,
-			);
-
 		this.pushHeading(lines, "OUTCOME", width, true);
 		this.pushField(
 			lines,

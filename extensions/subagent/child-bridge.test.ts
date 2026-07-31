@@ -62,7 +62,6 @@ test("companion stays alive, emits identity/run frames, and accepts follow-up", 
 		const messages: { content: unknown; options: unknown }[] = [];
 		const pi = {
 			on: (name: string, fn: TestHandler) => handlers.set(name, fn),
-			setActiveTools: () => {},
 			getThinkingLevel: () => "high",
 			sendUserMessage: (content: unknown, options: unknown) =>
 				messages.push({ content, options }),
@@ -220,7 +219,6 @@ test("same-session resume clears an active run after extension replacement", asy
 		const first = (await import(`./child.ts?resume-old=${Date.now()}`)).default;
 		const pi = {
 			on: (name: string, fn: TestHandler) => firstHandlers.set(name, fn),
-			setActiveTools: () => {},
 			getThinkingLevel: () => "high",
 			sendUserMessage: () => {},
 		};

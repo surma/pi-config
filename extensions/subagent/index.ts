@@ -117,7 +117,6 @@ interface TaskSpec {
 	cwd?: string;
 	model: string;
 	thinking: ThinkingLevel;
-	tools?: string[];
 	systemPrompt?: string;
 }
 
@@ -128,7 +127,6 @@ interface SubagentHandle extends SubagentDispatchHandle {
 	cwd: string;
 	requestedModel: string;
 	requestedThinking: ThinkingLevel;
-	configuredTools: string[];
 	sessionDir: string;
 	socketPath: string;
 	promptPath: string;
@@ -175,15 +173,17 @@ const ThinkingSchema = StringEnum([
 	"high",
 	"xhigh",
 ] as const);
-const TaskSpecSchema = Type.Object({
-	name: Type.Optional(Type.String()),
-	task: Type.String({ minLength: 1 }),
-	cwd: Type.Optional(Type.String()),
-	model: Type.String({ minLength: 1 }),
-	thinking: ThinkingSchema,
-	tools: Type.Optional(Type.Array(Type.String())),
-	systemPrompt: Type.Optional(Type.String()),
-});
+const TaskSpecSchema = Type.Object(
+	{
+		name: Type.Optional(Type.String()),
+		task: Type.String({ minLength: 1 }),
+		cwd: Type.Optional(Type.String()),
+		model: Type.String({ minLength: 1 }),
+		thinking: ThinkingSchema,
+		systemPrompt: Type.Optional(Type.String()),
+	},
+	{ additionalProperties: false },
+);
 const ListSchema = Type.Object({
 	includeFinished: Type.Optional(Type.Boolean({ default: true })),
 });
@@ -338,7 +338,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			promptPath: handle.promptPath,
 			requestedModel: handle.requestedModel,
 			requestedThinking: handle.requestedThinking,
-			configuredTools: [...handle.configuredTools],
 			processState: handle.processState,
 			runState: handle.runState,
 			runId: handle.runSequence || undefined,
@@ -448,7 +447,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			requestedThinking: handle.requestedThinking,
 			actualModel,
 			actualThinking: handle.actualThinking || handle.requestedThinking,
-			configuredTools: [...handle.configuredTools],
 			sessionPath: handle.sessionPath || "",
 			promptPath: handle.promptPath,
 			resultPath: handle.resultPath,
@@ -500,7 +498,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			socketPath: string;
 			requestedModel: string;
 			requestedThinking: string;
-			configuredTools: string[];
 			createdAt: number;
 			lastActivityAt: number;
 			ownerSessionFile: string;
@@ -519,7 +516,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			requestedThinking: isThinking(entry.requestedThinking)
 				? entry.requestedThinking
 				: "off",
-			configuredTools: [...entry.configuredTools],
 			sessionDir: entry.sessionDir,
 			socketPath: entry.socketPath,
 			promptPath:
@@ -1131,7 +1127,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			socketPath,
 			requestedModel,
 			requestedThinking,
-			configuredTools: getRequestedTools(spec.tools),
 			processState: "alive",
 			runState: "idle",
 			createdAt: now(),
@@ -1164,7 +1159,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				PI_SUBAGENT_INCARNATION: incarnation,
 				PI_SUBAGENT_RUN_ID_BASE: "0",
 				PI_SUBAGENT_SYSTEM_PROMPT: spec.systemPrompt || "",
-				PI_SUBAGENT_ACTIVE_TOOLS: handle.configuredTools.join(","),
 				PI_SUBAGENT_DEPTH: String(getDepth() + 1),
 				PI_SUBAGENT_PROMPT_PATH: handle.promptPath,
 				BRIDGE_SOCKET_PATH: socketPath,
@@ -1272,7 +1266,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				PI_SUBAGENT_INCARNATION: incarnation,
 				PI_SUBAGENT_RUN_ID_BASE: String(handle.runSequence),
 				PI_SUBAGENT_SYSTEM_PROMPT: "",
-				PI_SUBAGENT_ACTIVE_TOOLS: handle.configuredTools.join(","),
 				PI_SUBAGENT_DEPTH: String(getDepth() + 1),
 				PI_SUBAGENT_PROMPT_PATH: handle.promptPath,
 				BRIDGE_SOCKET_PATH: socketPath,
@@ -1370,12 +1363,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		return Math.max(
 			0,
 			Number.parseInt(process.env.PI_SUBAGENT_DEPTH || "0", 10) || 0,
-		);
-	}
-	function getRequestedTools(requested?: string[]) {
-		const available = new Set(pi.getActiveTools());
-		return (requested?.length ? requested : [...available]).filter(
-			(name) => available.has(name) && !name.startsWith("subagent_"),
 		);
 	}
 	function selectedModel(
@@ -1478,7 +1465,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			requestedThinking: handle.requestedThinking,
 			actualModel,
 			actualThinking: handle.actualThinking || handle.requestedThinking,
-			configuredTools: [...handle.configuredTools],
 			sessionPath: handle.sessionPath || "",
 			promptPath: handle.promptPath,
 			resultPath: handle.resultPath,

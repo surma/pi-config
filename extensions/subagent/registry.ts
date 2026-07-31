@@ -18,7 +18,6 @@ export interface RegistryEntry {
 	promptPath?: string;
 	requestedModel: string;
 	requestedThinking: string;
-	configuredTools: string[];
 	processState: "alive" | "stopped";
 	runState: RunState;
 	runId?: number;
