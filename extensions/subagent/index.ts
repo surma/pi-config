@@ -70,12 +70,13 @@ import {
 	sanitizeTerminalText,
 } from "./ui.js";
 import {
+	cleanupManagedSession,
 	closeValidatedSubagentTab,
 	discoverPaneId,
+	ensureZellij,
 	listPanes,
 	newTab,
 	paneMatchesSubagent,
-	requireZellij,
 	revalidatePane,
 	sendKeys,
 } from "./zellij.js";
@@ -1219,7 +1220,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		requestedModel: string,
 		requestedThinking: ThinkingLevel,
 	): Promise<SubagentHandle> {
-		requireZellij();
+		await ensureZellij();
 		if (!(await requireCurrentAuthority()))
 			throw new Error(leaseConflictMessage());
 		const resolvedOwner = owner;
@@ -1325,7 +1326,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		handle: SubagentHandle,
 		task?: string,
 	): Promise<void> {
-		requireZellij();
+		await ensureZellij();
 		if (!(await requireCurrentAuthority()))
 			throw new Error(leaseConflictMessage());
 		const resolvedOwner = owner;
@@ -1852,6 +1853,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			leaseHeld = false;
 		}
 		await persist();
+		await cleanupManagedSession();
 		if (ctx.mode === "tui") ctx.ui.setWidget("subagent", undefined);
 		latestCtx = null;
 	});
