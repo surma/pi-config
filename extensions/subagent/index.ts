@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { accessSync, constants, promises as fs } from "node:fs";
 import { basename, delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -33,6 +33,7 @@ import {
 	resetRunViewForSession,
 	reviveForResume,
 	type SessionLifecycle,
+	type SubagentRun,
 } from "./lifecycle.js";
 import {
 	acquireLease,
@@ -53,6 +54,16 @@ import {
 	reconcileRegistryForOwner,
 	saveRegistry,
 } from "./registry.js";
+import {
+	persistRunResult,
+	readRunResult,
+	type SettledRunOutcome,
+	writeLatestResult,
+} from "./result-store.js";
+import {
+	SettlementNotificationQueue,
+	type SettlementNotificationRecord,
+} from "./settlement-notifications.js";
 import {
 	type InspectorHandle,
 	SubagentInspector,
@@ -152,7 +163,7 @@ interface SubagentHandle extends SubagentDispatchHandle {
 	promptCaptured?: boolean;
 	transcriptPersisted?: boolean;
 	resultPath?: string;
-	persistedResultHash?: string;
+	settlementPersistenceChain: Promise<void>;
 	stderr: string;
 	diagnostics: string[];
 	waiters: Set<() => void>;
@@ -188,6 +199,13 @@ const ListSchema = Type.Object({
 	includeFinished: Type.Optional(Type.Boolean({ default: true })),
 });
 const StatusSchema = Type.Object({ id: Type.String() });
+const ResultSchema = Type.Object(
+	{
+		id: Type.String({ description: "Logical child id." }),
+		runId: Type.Integer({ minimum: 1, description: "Exact settled run id." }),
+	},
+	{ additionalProperties: false },
+);
 const WaitSchema = Type.Object({
 	id: Type.Optional(Type.String()),
 	all: Type.Optional(Type.Boolean()),
@@ -238,9 +256,6 @@ function truncate(value: string | undefined, max = 240) {
 	const text = (value || "").replace(/\s+/g, " ").trim();
 	return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
-function hashText(text: string) {
-	return createHash("sha1").update(text).digest("hex");
-}
 function executableOnPath(name: string): string | undefined {
 	for (const directory of (process.env.PATH || "").split(delimiter)) {
 		const candidate = join(directory || ".", name);
@@ -286,6 +301,26 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	let leaseHeld = false;
 	let leaseRenewTimer: NodeJS.Timeout | undefined;
 	let livenessTimer: NodeJS.Timeout | undefined;
+	let sessionShuttingDown = false;
+	let settlementNotificationEpoch = 0;
+	const settlementNotifications = new SettlementNotificationQueue(
+		(message, options) => pi.sendMessage(message, options),
+		(record) => {
+			const handle = handles.get(record.childId);
+			return (
+				!sessionShuttingDown &&
+				leaseHeld &&
+				owner?.ownerSessionFile === record.ownerSessionFile &&
+				owner.ownerSessionId === record.ownerSessionId &&
+				handle?.incarnation === record.incarnation &&
+				!handle.killRequestedAt
+			);
+		},
+	);
+	const suppressAllSettlementNotifications = () => {
+		settlementNotificationEpoch++;
+		settlementNotifications.suppressAll();
+	};
 
 	const sorted = () =>
 		[...handles.values()].sort(
@@ -311,6 +346,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		);
 		if (!authoritative) {
 			leaseHeld = false;
+			suppressAllSettlementNotifications();
 			stopTimers();
 			refreshUi();
 		}
@@ -383,17 +419,87 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		void persist();
 	};
 
-	async function ensureResult(handle: SubagentHandle): Promise<void> {
-		if (!handle.resultText) return;
-		const hash = hashText(handle.resultText);
-		if (handle.persistedResultHash === hash) return;
-		handle.resultPath ||= join(handle.sessionDir, "result.md");
-		await fs.writeFile(handle.resultPath, handle.resultText, {
-			encoding: "utf8",
-			mode: 0o600,
+	function acceptSettlement(
+		handle: SubagentHandle,
+		runId: number,
+		outcome: SettledRunOutcome,
+		result: string,
+		settledAt: number,
+		source: "event" | "snapshot",
+	): void {
+		const incarnation = handle.incarnation;
+		const fallbackResult = result;
+		const notificationEpoch = settlementNotificationEpoch;
+		const notification: SettlementNotificationRecord = {
+			ownerSessionFile: handle.ownerSessionFile,
+			ownerSessionId: handle.ownerSessionId,
+			childId: handle.id,
+			name: handle.name,
+			incarnation,
+			runId,
+			eventKind: "run_settled",
+			outcome,
+			childAlive: handle.processState === "alive",
+			preview: truncate(fallbackResult),
+		};
+		handle.settlementPersistenceChain = handle.settlementPersistenceChain.then(
+			async () => {
+				let exact = await readRunResult(handle.sessionDir, runId);
+				try {
+					if (exact.status !== "available" && source === "event") {
+						await persistRunResult(handle.sessionDir, {
+							runId,
+							outcome,
+							incarnation,
+							settledAt,
+							result: fallbackResult,
+						});
+						exact = await readRunResult(handle.sessionDir, runId);
+					}
+				} catch (error) {
+					addDiagnostic(
+						handle,
+						`Run ${runId} result persistence failed: ${String(error)}`,
+					);
+				}
+				if (exact.status === "available") {
+					notification.preview = truncate(exact.record.result);
+					if (
+						handle.incarnation === incarnation &&
+						handle.runSequence === runId &&
+						handle.lastSettledRunId === runId &&
+						handle.runState === "idle"
+					) {
+						handle.resultText = exact.record.result;
+					}
+					try {
+						handle.resultPath = await writeLatestResult(
+							handle.sessionDir,
+							exact.record.result,
+						);
+					} catch (error) {
+						addDiagnostic(
+							handle,
+							`Latest result persistence failed for run ${runId}: ${String(error)}`,
+						);
+					}
+				}
+				if (
+					notificationEpoch !== settlementNotificationEpoch ||
+					sessionShuttingDown ||
+					!leaseHeld ||
+					handle.killRequestedAt
+				) {
+					return;
+				}
+				settlementNotifications.queue(notification);
+			},
+		).catch((error) => {
+			addDiagnostic(
+				handle,
+				`Run ${runId} settlement processing failed: ${String(error)}`,
+			);
 		});
-		await fs.chmod(handle.resultPath, 0o600).catch(() => {});
-		handle.persistedResultHash = hash;
 	}
 	async function transcriptStatus(handle: SubagentHandle) {
 		if (!handle.sessionPath)
@@ -415,9 +521,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		return handle.runOutcome === "succeeded" ? "final" : "partial";
 	}
 	async function serialize(handle: SubagentHandle) {
-		await ensureResult(handle).catch((error) =>
-			addDiagnostic(handle, `Result persistence failed: ${String(error)}`),
-		);
+		await handle.settlementPersistenceChain;
 		const transcript = await transcriptStatus(handle);
 		const actualModel =
 			handle.actualModel ||
@@ -554,6 +658,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			diagnostics: [],
 			waiters: new Set(),
 			ipcMutationChain: Promise.resolve(),
+			settlementPersistenceChain: Promise.resolve(),
 			reconnecting: entry.detached,
 			ownerSessionFile: entry.ownerSessionFile,
 			ownerSessionId: entry.ownerSessionId,
@@ -571,10 +676,20 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			maxRecentTools: MAX_RECENT_TOOLS,
 			update: () => update(handle),
 			diagnostic: (message: string) => addDiagnostic(handle, message),
-			onAssistantFinalized: () => void ensureResult(handle),
-			onSettled: () => {
+			onAssistantFinalized: () => {},
+			onSettled: (run: SubagentRun) => {
 				handle.completedAt = handle.settledAt;
 				handle.error = handle.finalError;
+				if (run.outcome !== "pending") {
+					acceptSettlement(
+						handle,
+						run.id,
+						run.outcome,
+						handle.resultText,
+						handle.settledAt || run.endedAt || now(),
+						"event",
+					);
+				}
 				notifyWaiters(handle);
 				update(handle);
 			},
@@ -626,6 +741,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		}
 	}
 	function applySnapshot(handle: SubagentHandle, frame: SnapshotFrame) {
+		const previousSettledRunId = handle.lastSettledRunId;
 		handle.sessionId = frame.sessionId;
 		handle.sessionPath = frame.sessionFile;
 		handle.runState = frame.runState;
@@ -649,6 +765,16 @@ export default function subagentExtension(pi: ExtensionAPI) {
 					: frame.runOutcome === "succeeded"
 						? "done"
 						: "running";
+			if (frame.runId > previousSettledRunId) {
+				acceptSettlement(
+					handle,
+					frame.runId,
+					frame.runOutcome,
+					frame.assistantTail,
+					frame.updatedAt,
+					"snapshot",
+				);
+			}
 			notifyWaiters(handle);
 		} else if (frame.runState !== "idle") handle.state = "running";
 		handle.lifecycle = frame.runState;
@@ -1035,6 +1161,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		if (handle.processState === "stopped") return handle;
 		if (handle.terminationPromise) return handle.terminationPromise;
 		handle.terminationPromise = (async () => {
+			settlementNotifications.suppressChild(handle.id);
 			requestKill(handle, now());
 			update(handle);
 			await interrupt(handle).catch((error) =>
@@ -1078,7 +1205,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			}
 			handle.completedAt ||=
 				handle.processState === "stopped" ? now() : undefined;
-			await ensureResult(handle);
+			await handle.settlementPersistenceChain;
 			update(handle);
 			await persistenceChain;
 			return handle;
@@ -1161,6 +1288,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				PI_SUBAGENT_SYSTEM_PROMPT: spec.systemPrompt || "",
 				PI_SUBAGENT_DEPTH: String(getDepth() + 1),
 				PI_SUBAGENT_PROMPT_PATH: handle.promptPath,
+				PI_SUBAGENT_SESSION_DIR: handle.sessionDir,
 				BRIDGE_SOCKET_PATH: socketPath,
 				BRIDGE_LOG_PATH: join(sessionDir, "child-events.log"),
 				TERM: "xterm-256color",
@@ -1268,6 +1396,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				PI_SUBAGENT_SYSTEM_PROMPT: "",
 				PI_SUBAGENT_DEPTH: String(getDepth() + 1),
 				PI_SUBAGENT_PROMPT_PATH: handle.promptPath,
+				PI_SUBAGENT_SESSION_DIR: handle.sessionDir,
 				BRIDGE_SOCKET_PATH: socketPath,
 				BRIDGE_LOG_PATH: join(handle.sessionDir, "child-events.log"),
 				TERM: "xterm-256color",
@@ -1315,15 +1444,22 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		});
 	}
 	async function waitFor(
-		targets: { handle: SubagentHandle; cursor: number }[],
+		targets: {
+			handle: SubagentHandle;
+			cursor: number;
+			settledRunId?: number;
+		}[],
 		timeoutSeconds: number,
 		signal: AbortSignal | undefined,
 	): Promise<"completed" | "timedOut" | "canceled"> {
 		const done = () =>
-			targets.every(
-				({ handle, cursor }) =>
-					handle.processState === "stopped" || handle.lastSettledRunId > cursor,
-			);
+			targets.every((target) => {
+				if (target.handle.lastSettledRunId > target.cursor) {
+					target.settledRunId ||= target.handle.lastSettledRunId;
+					return true;
+				}
+				return target.handle.processState === "stopped";
+			});
 		await Promise.all(targets.map(({ handle }) => probeProcess(handle)));
 		if (done()) return "completed";
 		return new Promise((resolve) => {
@@ -1534,6 +1670,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				(ok) => {
 					if (!ok) {
 						leaseHeld = false;
+						suppressAllSettlementNotifications();
 						for (const handle of handles.values())
 							addDiagnostic(handle, "Controller lease lost during renewal.");
 						stopTimers();
@@ -1547,6 +1684,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 							`Lease renewal failed: ${error instanceof Error ? error.message : String(error)}`,
 						);
 					leaseHeld = false;
+					suppressAllSettlementNotifications();
 					stopTimers();
 				},
 			);
@@ -1659,6 +1797,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	}
 
 	pi.on("session_start", async (_event, ctx) => {
+		sessionShuttingDown = false;
 		latestCtx = ctx;
 		await establishController(ctx);
 		await reconcile().catch((error) =>
@@ -1668,6 +1807,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		refreshUi();
 	});
 	pi.on("session_shutdown", async (event, ctx) => {
+		sessionShuttingDown = true;
+		suppressAllSettlementNotifications();
 		latestCtx = ctx;
 		const reason = event?.reason || "quit";
 		if (reason === "quit") {
@@ -1717,7 +1858,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	pi.on("before_agent_start", async (event) => ({
 		systemPrompt:
 			event.systemPrompt +
-			`\n\nSubagent extension is available. Use it only for explicit delegation. subagent_start requires an explicit provider/model and thinking level; use list_models when needed instead of guessing. Children are persistent interactive Pi TUIs in tabs of the current Zellij session. Use subagent_follow_up for another turn, subagent_steer during a run, subagent_interrupt to abort a run while keeping the child alive, subagent_wait with a finite timeout and settlement cursor, and subagent_kill only to terminate.`,
+			`\n\nSubagent extension is available. Use it only for explicit delegation. subagent_start requires an explicit provider/model and thinking level; use list_models when needed instead of guessing. Children are persistent interactive Pi TUIs in tabs of the current Zellij session. Settled-run notifications arrive automatically while children remain alive. Use subagent_result with the child ID and run ID for exact settled output. Use subagent_wait with a finite timeout only for explicit synchronization. Use subagent_status for live diagnostics. Do not poll subagent_status or subagent_wait for routine completion. Use subagent_follow_up for another turn, subagent_steer during a run, subagent_interrupt to abort a run while keeping the child alive, and subagent_kill only to terminate.`,
 	}));
 
 	pi.registerTool<typeof TaskSpecSchema, unknown>({
@@ -1841,6 +1982,86 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			};
 		},
 	});
+	pi.registerTool<typeof ResultSchema, unknown>({
+		name: "subagent_result",
+		label: "Subagent Result",
+		description:
+			"Return the exact persisted output and outcome for one child run. This retrieval is idempotent and never falls back to another run.",
+		parameters: ResultSchema,
+		async execute(_id, params) {
+			const handle = handles.get(params.id);
+			if (!handle)
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: `Unknown subagent id: ${params.id}`,
+						},
+					],
+					details: {
+						status: "unknown_child",
+						reason: "unknown_child",
+						available: false,
+						childId: params.id,
+						runId: params.runId,
+					},
+				};
+			await handle.settlementPersistenceChain;
+			const exact = await readRunResult(handle.sessionDir, params.runId);
+			if (exact.status === "available")
+				return {
+					content: [{ type: "text" as const, text: exact.record.result }],
+					details: {
+						status: "available",
+						reason: exact.reason,
+						available: true,
+						childId: handle.id,
+						...exact.record,
+					},
+				};
+			if (
+				params.runId === handle.runSequence &&
+				handle.processState === "alive" &&
+				handle.runState !== "idle"
+			)
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: `Subagent #${handle.id} run ${params.runId} is active.`,
+						},
+					],
+					details: {
+						status: "pending",
+						reason: "run_active",
+						available: false,
+						childId: handle.id,
+						runId: params.runId,
+					},
+				};
+			const reason =
+				exact.status === "missing" && params.runId > handle.runSequence
+					? "run_not_known"
+					: exact.reason;
+			return {
+				content: [
+					{
+						type: "text" as const,
+						text: exact.message,
+					},
+				],
+				details: {
+					status: exact.status,
+					reason,
+					available: false,
+					childId: handle.id,
+					runId: params.runId,
+					resultPath: exact.resultPath,
+					metadataPath: exact.metadataPath,
+				},
+			};
+		},
+	});
 	pi.registerTool<typeof WaitSchema, unknown>({
 		name: "subagent_wait",
 		label: "Subagent Wait",
@@ -1889,32 +2110,44 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				handle,
 				cursor:
 					params.afterRunId ??
-					(handle.resultText && handle.runOutcome === "succeeded"
+					(handle.lastSettledRunId > 0 &&
+					handle.runState === "idle" &&
+					handle.runOutcome === "succeeded"
 						? 0
 						: handle.lastSettledRunId),
 			}));
 			const waited = await waitFor(targets, params.timeoutSeconds, signal);
-			const settledHandles = await Promise.all(chosen.map(serialize));
-			const settled = chosen.find(
-				(handle) =>
-					handle.resultText &&
-					handle.runOutcome === "succeeded" &&
-					handle.lastSettledRunId > (params.afterRunId ?? 0),
+			await Promise.all(
+				targets.map(({ handle }) => handle.settlementPersistenceChain),
 			);
-			const resultText = settled?.resultText;
+			const exactResults = await Promise.all(
+				targets.map(async (target) =>
+					target.settledRunId
+						? readRunResult(target.handle.sessionDir, target.settledRunId)
+						: undefined,
+				),
+			);
+			const exact = exactResults.find(
+				(result) => result?.status === "available",
+			);
+			const record = exact?.status === "available" ? exact.record : undefined;
+			const settledHandles = await Promise.all(chosen.map(serialize));
 			const outcome = waited;
 			return {
 				content: [
 					{
 						type: "text" as const,
-						text: resultText
-							? resultText
-							: `Wait ${outcome}. Child processes remain ${chosen.every(active) ? "alive" : "unchanged"}.`,
+						text:
+							record?.result ??
+							`Wait ${outcome}. Child processes remain ${chosen.every(active) ? "alive" : "unchanged"}.`,
 					},
 				],
 				details: {
 					outcome,
-					result: resultText || undefined,
+					result: record?.result,
+					runId: record?.runId,
+					runOutcome: record?.outcome,
+					resultPath: record?.resultPath,
 					handles: settledHandles,
 				},
 			};

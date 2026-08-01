@@ -5,6 +5,7 @@ import {
 	isLifecycleTerminal,
 	type LifecycleState,
 	recordAssistantEnd,
+	type SubagentRun,
 	settleRunToIdle,
 	startRun,
 } from "./lifecycle.js";
@@ -56,7 +57,7 @@ export interface SubagentDispatchOptions {
 	update: (streaming?: boolean) => void;
 	diagnostic: (message: string) => void;
 	onAssistantFinalized: () => void;
-	onSettled: () => void;
+	onSettled: (run: SubagentRun) => void;
 }
 
 function cloneToolActivity(tool: ToolActivity): ToolActivity {
@@ -175,6 +176,7 @@ export function dispatchSubagentEvent(
 			}
 			handle.agentStartedAt ||= at;
 			handle.agentEndedAt = undefined;
+			handle.resultText = "";
 			handle.activeTools.clear();
 			updateCurrentTool(handle);
 			options.update();
@@ -380,6 +382,17 @@ export function dispatchSubagentEvent(
 		case "agent_settled": {
 			if (isLifecycleTerminal(handle))
 				return ignoreTerminal(options, "agent_settled");
+			const current = currentRun(handle);
+			if (
+				typeof record.runId === "number" &&
+				current &&
+				record.runId !== current.id
+			) {
+				options.diagnostic(
+					"Ignored agent_settled for a stale or unexpected run id.",
+				);
+				return false;
+			}
 			const outcome =
 				record.runOutcome === "succeeded" ||
 				record.runOutcome === "failed" ||
@@ -402,8 +415,10 @@ export function dispatchSubagentEvent(
 				return false;
 			}
 			handle.error = handle.finalError;
+			const settled = currentRun(handle);
+			if (!settled) return false;
 			options.update();
-			options.onSettled();
+			options.onSettled(settled);
 			return true;
 		}
 		case "extension_error":

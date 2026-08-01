@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { promises as nodeFs } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { tmpdir } from "node:os";
@@ -13,6 +14,7 @@ import type { TSchema } from "@sinclair/typebox";
 import { Check } from "@sinclair/typebox/value";
 import subagentExtension from "./index.ts";
 import { canonicalOwnerSessionFile } from "./owner.ts";
+import { persistRunResult, runResultPaths } from "./result-store.ts";
 
 interface TestResult {
 	content: { text: string }[];
@@ -27,8 +29,15 @@ interface TestTool {
 }
 
 type TestHandler = (...args: unknown[]) => unknown;
+interface SentMessage {
+	message: Record<string, unknown>;
+	options: Record<string, unknown>;
+}
 
-function setup(handlers?: Map<string, TestHandler>): Map<string, TestTool> {
+function setup(
+	handlers?: Map<string, TestHandler>,
+	sentMessages?: SentMessage[],
+): Map<string, TestTool> {
 	const tools = new Map<string, TestTool>();
 	const api = {
 		on: (name: string, handler: TestHandler) => handlers?.set(name, handler),
@@ -39,6 +48,11 @@ function setup(handlers?: Map<string, TestHandler>): Map<string, TestTool> {
 		registerCommand: () => {},
 		getActiveTools: () => ["read"],
 		getThinkingLevel: () => "off",
+		sendMessage: (message: unknown, options: unknown) =>
+			sentMessages?.push({
+				message: message as Record<string, unknown>,
+				options: options as Record<string, unknown>,
+			}),
 	};
 	const marker = process.env.PI_SUBAGENT_CHILD;
 	delete process.env.PI_SUBAGENT_CHILD;
@@ -66,7 +80,7 @@ const context = {
 	},
 } as unknown as ExtensionContext;
 
-test("exactly nine public tools are registered", () => {
+test("exactly ten public tools are registered", () => {
 	const tools = setup();
 	assert.deepEqual(
 		[...tools.keys()],
@@ -74,6 +88,7 @@ test("exactly nine public tools are registered", () => {
 			"subagent_start",
 			"subagent_list",
 			"subagent_status",
+			"subagent_result",
 			"subagent_wait",
 			"subagent_steer",
 			"subagent_follow_up",
@@ -122,7 +137,21 @@ test("start and kill descriptions guide child cleanup", () => {
 	);
 });
 
-test("all nine tool schemas accept valid parameters and reject invalid parameters", () => {
+test("prompt guidance distinguishes notifications, results, waits, and status", async () => {
+	const handlers = new Map<string, TestHandler>();
+	const tools = setup(handlers);
+	const prompt = (await handlers.get("before_agent_start")?.({
+		systemPrompt: "base",
+	})) as { systemPrompt: string };
+	assert.match(prompt.systemPrompt, /notifications arrive automatically/);
+	assert.match(prompt.systemPrompt, /subagent_result/);
+	assert.match(prompt.systemPrompt, /finite timeout only for explicit synchronization/);
+	assert.match(prompt.systemPrompt, /subagent_status for live diagnostics/);
+	assert.match(prompt.systemPrompt, /Do not poll/);
+	assert.match(requireTool(tools, "subagent_result").description, /never falls back/);
+});
+
+test("all ten tool schemas accept valid parameters and reject invalid parameters", () => {
 	const tools = setup();
 	const cases: [string, unknown, unknown][] = [
 		[
@@ -132,6 +161,7 @@ test("all nine tool schemas accept valid parameters and reject invalid parameter
 		],
 		["subagent_list", {}, { includeFinished: "yes" }],
 		["subagent_status", { id: "child" }, {}],
+		["subagent_result", { id: "child", runId: 1 }, { id: "child" }],
 		[
 			"subagent_wait",
 			{ id: "child", timeoutSeconds: 1 },
@@ -473,6 +503,7 @@ async function setupControllerWithChild(opts: {
 		"controllers",
 		ownerKey,
 	);
+	const registryPath = join(ownerRegDir, "registry.json");
 	await mkdir(ownerRegDir, { recursive: true, mode: 0o700 });
 	const sessionDir = join(agentDirectory, "sessions", "subagents", childId);
 	await mkdir(sessionDir, { recursive: true, mode: 0o700 });
@@ -481,7 +512,7 @@ async function setupControllerWithChild(opts: {
 			mode: 0o600,
 		});
 	await writeFile(
-		join(ownerRegDir, "registry.json"),
+		registryPath,
 		`${JSON.stringify([
 			{
 				childId,
@@ -517,6 +548,7 @@ async function setupControllerWithChild(opts: {
 	process.env.PI_SUBAGENT_ZELLIJ_BIN = zellij;
 	process.env.ZELLIJ_SESSION_NAME = "test";
 	const handlers = new Map<string, TestHandler>();
+	const sentMessages: SentMessage[] = [];
 	const ctx = {
 		mode: "json",
 		sessionManager: {
@@ -524,11 +556,12 @@ async function setupControllerWithChild(opts: {
 			getSessionId: () => ownerSessionId,
 		},
 	} as unknown as ExtensionContext;
-	const tools = setup(handlers);
+	const tools = setup(handlers, sentMessages);
 	await handlers.get("session_start")?.({ reason: "startup" }, ctx);
 	return {
 		tools,
 		handlers,
+		sentMessages,
 		ctx,
 		agentDirectory,
 		zellijScript: zellij,
@@ -538,6 +571,8 @@ async function setupControllerWithChild(opts: {
 		incarnation,
 		controllerInstanceId,
 		socketPath,
+		registryPath,
+		sessionDir,
 		sessionFilePath,
 		paneCommand,
 		cleanup: async () => {
@@ -568,6 +603,270 @@ function makeFrame(
 ): string {
 	return `${JSON.stringify({ type, schemaVersion: 1, at: Date.now(), ...base, ...extra })}\n`;
 }
+
+test("wait preserves timeout, cancellation, all-child, and stopped-process behavior", async () => {
+	const live = await setupControllerWithChild({ hasSessionFile: true });
+	try {
+		const timedOut = await requireTool(live.tools, "subagent_wait").execute(
+			"x",
+			{ id: live.childId, timeoutSeconds: 1 },
+		);
+		assert.equal(timedOut.details.outcome, "timedOut");
+		const controller = new AbortController();
+		controller.abort();
+		const canceled = await requireTool(live.tools, "subagent_wait").execute(
+			"x",
+			{ id: live.childId, timeoutSeconds: 1 },
+			controller.signal,
+		);
+		assert.equal(canceled.details.outcome, "canceled");
+	} finally {
+		await live.cleanup();
+	}
+
+	const stopped = await setupControllerWithChild({ processState: "stopped" });
+	try {
+		const stoppedResult = await requireTool(
+			stopped.tools,
+			"subagent_wait",
+		).execute("x", { id: stopped.childId, timeoutSeconds: 1 });
+		assert.equal(stoppedResult.details.outcome, "completed");
+		const allResult = await requireTool(stopped.tools, "subagent_wait").execute(
+			"x",
+			{ all: true, timeoutSeconds: 1 },
+		);
+		assert.equal(allResult.details.outcome, "completed");
+	} finally {
+		await stopped.cleanup();
+	}
+});
+
+test("subagent_result returns stable structured artifact states", async () => {
+	const unknown = await requireTool(setup(), "subagent_result").execute("x", {
+		id: "missing-child",
+		runId: 1,
+	});
+	assert.deepEqual(unknown.details, {
+		status: "unknown_child",
+		reason: "unknown_child",
+		available: false,
+		childId: "missing-child",
+		runId: 1,
+	});
+
+	const s = await setupControllerWithChild({
+		processState: "stopped",
+		runId: 4,
+		lastSettledRunId: 4,
+	});
+	try {
+		const missing = await requireTool(s.tools, "subagent_result").execute(
+			"x",
+			{ id: s.childId, runId: 1 },
+		);
+		assert.equal(missing.details.status, "missing");
+		assert.equal(missing.details.reason, "artifact_missing");
+
+		const incompletePaths = runResultPaths(s.sessionDir, 2);
+		await mkdir(incompletePaths.directory, { recursive: true });
+		await writeFile(incompletePaths.resultPath, "partial");
+		const incomplete = await requireTool(
+			s.tools,
+			"subagent_result",
+		).execute("x", { id: s.childId, runId: 2 });
+		assert.equal(incomplete.details.status, "incomplete");
+		assert.equal(incomplete.details.reason, "artifact_incomplete");
+
+		const invalidPaths = runResultPaths(s.sessionDir, 3);
+		await mkdir(invalidPaths.directory, { recursive: true });
+		await writeFile(invalidPaths.resultPath, "invalid");
+		await writeFile(invalidPaths.metadataPath, "not-json");
+		const invalid = await requireTool(s.tools, "subagent_result").execute(
+			"x",
+			{ id: s.childId, runId: 3 },
+		);
+		assert.equal(invalid.details.status, "invalid_metadata");
+		assert.equal(invalid.details.reason, "metadata_invalid");
+
+		await persistRunResult(s.sessionDir, {
+			runId: 4,
+			outcome: "failed",
+			incarnation: s.incarnation,
+			settledAt: 40,
+			result: "",
+		});
+		const available = await requireTool(s.tools, "subagent_result").execute(
+			"x",
+			{ id: s.childId, runId: 4 },
+		);
+		const repeated = await requireTool(s.tools, "subagent_result").execute(
+			"x",
+			{ id: s.childId, runId: 4 },
+		);
+		assert.equal(available.details.status, "available");
+		assert.equal(available.details.reason, "result_available");
+		assert.equal(available.details.outcome, "failed");
+		assert.equal(available.content[0]?.text, "");
+		assert.deepEqual(repeated, available);
+	} finally {
+		await s.cleanup();
+	}
+});
+
+test("an older settlement cannot repopulate a newer run fallback", async () => {
+	const s = await setupControllerWithChild({ hasSessionFile: true });
+	const originalRename = nodeFs.rename;
+	let releaseRename = () => {};
+	let renameBlocked = false;
+	let socket: net.Socket | undefined;
+	try {
+		socket = await connectSocket(s.socketPath);
+		socket.setEncoding("utf8");
+		const f = (type: string, extra: Record<string, unknown> = {}) =>
+			socket?.write(
+				makeFrame(
+					type,
+					{
+						childId: s.childId,
+						connectionId: "race-connection",
+						ownerSessionFile: s.ownerSessionFile,
+						ownerSessionId: s.ownerSessionId,
+						launchControllerInstanceId: s.controllerInstanceId,
+						incarnation: s.incarnation,
+					},
+					extra,
+				),
+			);
+		f("hello", {
+			sessionId: "race-session",
+			sessionFile: s.sessionFilePath,
+			sessionFileExists: true,
+			pid: 101,
+			model: { provider: "p", id: "m" },
+			thinkingLevel: "off",
+			reason: "startup",
+		});
+		await eventually(() =>
+			requireTool(s.tools, "subagent_list")
+				.execute("x", {})
+				.then((result) =>
+					(result.details.handles as SerializedHandle[]).some(
+						(handle) => handle.pid === 101,
+					),
+				),
+		);
+
+		const firstPaths = runResultPaths(s.sessionDir, 1);
+		const renameRelease = new Promise<void>((resolve) => {
+			releaseRename = resolve;
+		});
+		nodeFs.rename = async (oldPath, newPath) => {
+			if (!renameBlocked && String(newPath) === firstPaths.directory) {
+				renameBlocked = true;
+				await renameRelease;
+			}
+			return originalRename(oldPath, newPath);
+		};
+		const firstMessage = {
+			role: "assistant",
+			api: "test",
+			provider: "test",
+			model: "m",
+			timestamp: Date.now(),
+			responseId: "race-run-1",
+			content: [{ type: "text", text: "run one output" }],
+			stopReason: "stop",
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				cost: { total: 0 },
+			},
+		};
+		f("event", { event: "agent_start", runId: 1 });
+		f("event", {
+			event: "message_start",
+			runId: 1,
+			message: { ...firstMessage, content: [] },
+		});
+		f("event", { event: "message_end", runId: 1, message: firstMessage });
+		f("event", {
+			event: "agent_end",
+			runId: 1,
+			willRetry: false,
+			messages: [firstMessage],
+		});
+		f("event", {
+			event: "agent_settled",
+			runId: 1,
+			runOutcome: "succeeded",
+		});
+		await eventually(() => renameBlocked);
+
+		f("event", { event: "agent_start", runId: 2 });
+		await eventually(async () => {
+			const entries = JSON.parse(await readFile(s.registryPath, "utf8")) as {
+				runId?: number;
+				runState?: string;
+			}[];
+			return entries[0]?.runId === 2 && entries[0]?.runState === "running";
+		});
+		releaseRename();
+		const firstResult = await requireTool(
+			s.tools,
+			"subagent_result",
+		).execute("x", { id: s.childId, runId: 1 });
+		assert.equal(firstResult.content[0]?.text, "run one output");
+
+		const secondMessage = {
+			...firstMessage,
+			timestamp: Date.now() + 1,
+			responseId: "race-run-2",
+			content: [],
+		};
+		f("event", {
+			event: "message_start",
+			runId: 2,
+			message: secondMessage,
+		});
+		f("event", { event: "message_end", runId: 2, message: secondMessage });
+		f("event", {
+			event: "agent_end",
+			runId: 2,
+			willRetry: false,
+			messages: [secondMessage],
+		});
+		f("event", {
+			event: "agent_settled",
+			runId: 2,
+			runOutcome: "succeeded",
+		});
+		await eventually(async () => {
+			const entries = JSON.parse(await readFile(s.registryPath, "utf8")) as {
+				lastSettledRunId?: number;
+			}[];
+			return entries[0]?.lastSettledRunId === 2;
+		});
+		const secondResult = await requireTool(
+			s.tools,
+			"subagent_result",
+		).execute("x", { id: s.childId, runId: 2 });
+		assert.equal(secondResult.details.status, "available");
+		assert.equal(secondResult.content[0]?.text, "");
+		assert.equal(await readFile(firstPaths.resultPath, "utf8"), "run one output");
+		assert.equal(
+			await readFile(runResultPaths(s.sessionDir, 2).resultPath, "utf8"),
+			"",
+		);
+		assert.equal(await readFile(join(s.sessionDir, "result.md"), "utf8"), "");
+	} finally {
+		releaseRename();
+		nodeFs.rename = originalRename;
+		socket?.destroy();
+		await s.cleanup();
+	}
+});
 
 test("result visibility: settled wait exposes content and details.result", async () => {
 	const s = await setupControllerWithChild({ hasSessionFile: true });
@@ -624,6 +923,18 @@ test("result visibility: settled wait exposes content and details.result", async
 			},
 		};
 		f("event", { event: "agent_start", runId: 1 });
+		await eventually(() =>
+			requireTool(s.tools, "subagent_status")
+				.execute("x", { id: s.childId })
+				.then((result) => result.details.runState === "running"),
+		);
+		const pendingResult = await requireTool(
+			s.tools,
+			"subagent_result",
+		).execute("x", { id: s.childId, runId: 1 });
+		assert.equal(pendingResult.details.status, "pending");
+		assert.equal(pendingResult.details.reason, "run_active");
+		assert.equal(pendingResult.details.outcome, undefined);
 		f("event", {
 			event: "message_start",
 			runId: 1,
@@ -645,6 +956,24 @@ test("result visibility: settled wait exposes content and details.result", async
 			runOutcome: "succeeded",
 			runId: 1,
 		});
+		f("snapshot", {
+			sessionId: "s1",
+			sessionFile: s.sessionFilePath,
+			runState: "idle",
+			runId: 1,
+			runOutcome: "succeeded",
+			isStreaming: false,
+			assistantTail: "final answer",
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				cost: 0,
+				turns: 1,
+			},
+			updatedAt: Date.now(),
+		});
 		await eventually(() =>
 			requireTool(s.tools, "subagent_list")
 				.execute("x", {})
@@ -661,6 +990,146 @@ test("result visibility: settled wait exposes content and details.result", async
 		assert.equal(waitResult.details.outcome, "completed");
 		assert.equal(waitResult.content[0]?.text, "final answer");
 		assert.equal(waitResult.details.result, "final answer");
+		assert.equal(waitResult.details.runId, 1);
+		const allWaitResult = await requireTool(
+			s.tools,
+			"subagent_wait",
+		).execute("x", { all: true, timeoutSeconds: 1 });
+		assert.equal(allWaitResult.details.outcome, "completed");
+		assert.equal(allWaitResult.details.result, "final answer");
+		const firstResult = await requireTool(
+			s.tools,
+			"subagent_result",
+		).execute("x", { id: s.childId, runId: 1 });
+		assert.equal(firstResult.content[0]?.text, "final answer");
+		assert.equal(firstResult.details.outcome, "succeeded");
+		assert.equal(
+			await readFile(join(s.sessionDir, "result.md"), "utf8"),
+			"final answer",
+		);
+		await eventually(() => s.sentMessages.length === 1);
+		assert.deepEqual(s.sentMessages[0]?.options, {
+			triggerTurn: true,
+			deliverAs: "steer",
+		});
+		const firstNotification = s.sentMessages[0]?.message.details as {
+			settlements: { runId: number; outcome: string }[];
+		};
+		assert.equal(firstNotification.settlements.length, 1);
+		assert.equal(firstNotification.settlements[0]?.runId, 1);
+		assert.equal(firstNotification.settlements[0]?.outcome, "succeeded");
+
+		const settleRun = (
+			runId: number,
+			text: string,
+			outcome: "succeeded" | "failed" | "aborted",
+		) => {
+			const timestamp = Date.now() + runId;
+			const message = {
+				...assistantMessage,
+				timestamp,
+				responseId: `r-${timestamp}`,
+				content: [{ type: "text", text }],
+				stopReason: outcome === "failed" ? "error" : outcome,
+				errorMessage: outcome === "failed" ? "run failed" : undefined,
+			};
+			f("event", { event: "agent_start", runId });
+			f("event", {
+				event: "message_start",
+				runId,
+				message: { ...message, content: [] },
+			});
+			f("event", { event: "message_end", runId, message });
+			f("event", {
+				event: "agent_end",
+				willRetry: false,
+				messages: [message],
+				runId,
+			});
+			f("event", {
+				event: "agent_settled",
+				runOutcome: outcome,
+				stopReason: message.stopReason,
+				errorMessage: message.errorMessage,
+				runId,
+			});
+		};
+		const secondWait = requireTool(s.tools, "subagent_wait").execute(
+			"x",
+			{ id: s.childId, timeoutSeconds: 2, afterRunId: 1 },
+		);
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		settleRun(2, "", "failed");
+		const secondWaitResult = await secondWait;
+		assert.equal(secondWaitResult.details.runId, 2);
+		assert.equal(secondWaitResult.details.runOutcome, "failed");
+		assert.equal(secondWaitResult.content[0]?.text, "");
+		assert.equal(await readFile(join(s.sessionDir, "result.md"), "utf8"), "");
+		settleRun(3, "", "aborted");
+		await eventually(() =>
+			requireTool(s.tools, "subagent_status")
+				.execute("x", { id: s.childId })
+				.then((result) => result.details.lastSettledRunId === 3),
+		);
+		const retainedFirst = await requireTool(
+			s.tools,
+			"subagent_result",
+		).execute("x", { id: s.childId, runId: 1 });
+		const failedResult = await requireTool(
+			s.tools,
+			"subagent_result",
+		).execute("x", { id: s.childId, runId: 2 });
+		assert.equal(retainedFirst.content[0]?.text, "final answer");
+		assert.equal(failedResult.content[0]?.text, "");
+		assert.equal(failedResult.details.outcome, "failed");
+		assert.equal(
+			await readFile(join(s.sessionDir, "runs", "1", "result.md"), "utf8"),
+			"final answer",
+		);
+		assert.equal(
+			await readFile(join(s.sessionDir, "runs", "2", "result.md"), "utf8"),
+			"",
+		);
+		const missing = await requireTool(s.tools, "subagent_result").execute(
+			"x",
+			{ id: s.childId, runId: 99 },
+		);
+		assert.equal(missing.details.available, false);
+		assert.equal(missing.details.status, "missing");
+		assert.equal(missing.details.reason, "run_not_known");
+		await eventually(() => s.sentMessages.length === 2);
+		const secondNotification = s.sentMessages[1]?.message.details as {
+			settlements: { runId: number; outcome: string }[];
+		};
+		assert.deepEqual(
+			secondNotification.settlements.map(({ runId, outcome }) => ({
+				runId,
+				outcome,
+			})),
+			[
+				{ runId: 2, outcome: "failed" },
+				{ runId: 3, outcome: "aborted" },
+			],
+		);
+
+		const abortedResult = await requireTool(
+			s.tools,
+			"subagent_result",
+		).execute("x", { id: s.childId, runId: 3 });
+		assert.equal(abortedResult.details.outcome, "aborted");
+		assert.equal(abortedResult.content[0]?.text, "");
+		assert.equal(await readFile(join(s.sessionDir, "result.md"), "utf8"), "");
+
+		settleRun(4, "shutdown result", "succeeded");
+		await eventually(() =>
+			requireTool(s.tools, "subagent_status")
+				.execute("x", { id: s.childId })
+				.then((result) => result.details.lastSettledRunId === 4),
+		);
+		await s.handlers.get("session_shutdown")?.({ reason: "reload" }, s.ctx);
+		await s.handlers.get("session_start")?.({ reason: "reload" }, s.ctx);
+		await new Promise((resolve) => setTimeout(resolve, 75));
+		assert.equal(s.sentMessages.length, 2);
 		socket.destroy();
 	} finally {
 		await s.cleanup();
@@ -896,6 +1365,7 @@ test("resume opens the exact child session with a new fenced incarnation", async
 			"PI_SUBAGENT_SYSTEM_PROMPT",
 			"PI_SUBAGENT_DEPTH",
 			"PI_SUBAGENT_PROMPT_PATH",
+			"PI_SUBAGENT_SESSION_DIR",
 			"BRIDGE_SOCKET_PATH",
 			"BRIDGE_LOG_PATH",
 			"TERM",

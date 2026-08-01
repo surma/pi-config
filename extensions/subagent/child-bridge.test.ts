@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, readFile } from "node:fs/promises";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -47,6 +47,7 @@ test("companion stays alive, emits identity/run frames, and accepts follow-up", 
 	const old = {
 		id: process.env.PI_SUBAGENT_CHILD_ID,
 		socket: process.env.BRIDGE_SOCKET_PATH,
+		sessionDir: process.env.PI_SUBAGENT_SESSION_DIR,
 	};
 	process.env.PI_SUBAGENT_CHILD_ID = "stable-child";
 	process.env.BRIDGE_SOCKET_PATH = socketPath;
@@ -54,6 +55,7 @@ test("companion stays alive, emits identity/run frames, and accepts follow-up", 
 	process.env.PI_SUBAGENT_OWNER_SESSION_ID = "owner-session";
 	process.env.PI_SUBAGENT_CONTROLLER_INSTANCE_ID = "controller-a";
 	process.env.PI_SUBAGENT_INCARNATION = "inc-stable";
+	process.env.PI_SUBAGENT_SESSION_DIR = dir;
 	try {
 		const { default: childExtension } = await import(
 			`./child.ts?test=${Date.now()}`
@@ -87,11 +89,42 @@ test("companion stays alive, emits identity/run frames, and accepts follow-up", 
 		assert.equal(hello?.incarnation, "inc-stable");
 		assert.equal(hello?.sessionId, "session");
 		await handlers.get("agent_start")?.({}, ctx);
+		await handlers.get("message_end")?.(
+			{
+				message: {
+					role: "assistant",
+					content: [
+						{ type: "text", text: "first exact" },
+						{ type: "text", text: "result" },
+					],
+					usage: {},
+				},
+			},
+			ctx,
+		);
 		await handlers.get("agent_end")?.({ willRetry: false, messages: [] }, ctx);
 		await handlers.get("agent_settled")?.({ runOutcome: "succeeded" }, ctx);
 		await handlers.get("agent_start")?.({}, ctx);
+		await handlers.get("message_end")?.(
+			{
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "second exact result" }],
+					usage: {},
+				},
+			},
+			ctx,
+		);
 		await handlers.get("agent_end")?.({ willRetry: false, messages: [] }, ctx);
 		await handlers.get("agent_settled")?.({ runOutcome: "succeeded" }, ctx);
+		assert.equal(
+			await readFile(join(dir, "runs", "1", "result.md"), "utf8"),
+			"first exact\nresult",
+		);
+		assert.equal(
+			await readFile(join(dir, "runs", "2", "result.md"), "utf8"),
+			"second exact result",
+		);
 		await eventually(
 			() =>
 				received.filter(
@@ -175,6 +208,8 @@ test("companion stays alive, emits identity/run frames, and accepts follow-up", 
 		else process.env.BRIDGE_SOCKET_PATH = old.socket;
 		delete process.env.PI_SUBAGENT_OWNER_SESSION_FILE;
 		delete process.env.PI_SUBAGENT_INCARNATION;
+		if (old.sessionDir === undefined) delete process.env.PI_SUBAGENT_SESSION_DIR;
+		else process.env.PI_SUBAGENT_SESSION_DIR = old.sessionDir;
 		peer?.destroy();
 		await new Promise<void>((resolve) => server.close(() => resolve()));
 	}
