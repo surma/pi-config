@@ -11,7 +11,6 @@ import {
 	formatSize,
 	truncateTail,
 } from "@mariozechner/pi-coding-agent";
-import { Text } from "@mariozechner/pi-tui";
 import { Type } from "typebox";
 import { dlog } from "./escape-debug/log.js";
 
@@ -23,6 +22,7 @@ const BASH_UPDATE_THROTTLE_MS = 100;
 const COMMAND_PREVIEW_MAX_CHARS = 160;
 const STALL_CHECK_INTERVAL_MS = 5_000;
 const STALL_THRESHOLD_MS = 45_000;
+const COMPLETION_NOTIFICATION_BATCH_MS = 50;
 
 const PROMPT_PATTERNS = [
 	/\(y\/n\)/i,
@@ -64,6 +64,10 @@ type BashJob = {
 	completion: Deferred<void>;
 	stallTimer?: NodeJS.Timeout;
 	finalized: boolean;
+	detached: boolean;
+	completionNotificationSuppressed: boolean;
+	completionNotificationQueued: boolean;
+	completionNotificationSent: boolean;
 };
 
 type TailState = {
@@ -94,11 +98,6 @@ const bashSchema = Type.Object({
 
 const jobIdSchema = Type.Object({
 	jobId: Type.String({ description: "Managed bash job id" }),
-});
-
-const waitSchema = Type.Object({
-	jobId: Type.String({ description: "Managed bash job id" }),
-	timeout: Type.Optional(Type.Number({ minimum: 1, description: "Additional time to wait in seconds (optional, no default timeout)" })),
 });
 
 const jobs = new Map<string, BashJob>();
@@ -243,7 +242,7 @@ function formatRunningMessage(job: BashJob, tail = getTailState(job)): string {
 		`Started: ${formatStartedAt(job.startedAt)} (${formatDuration(Date.now() - job.startedAt)} elapsed)`,
 		`PID: ${job.pid ?? "unknown"}`,
 		`Log file: ${job.outputPath}`,
-		`Use bash_wait with jobId \"${job.jobId}\" to wait longer, bash_status to inspect it, bash_kill to stop it, or bash_jobs to list jobs.`,
+		`Use bash_status with jobId \"${job.jobId}\" to inspect it, bash_kill to stop it, or bash_jobs to list jobs.`,
 		"",
 		"Output so far:",
 		tail.text || "(no output yet)",
@@ -308,13 +307,27 @@ function finalizeJob(job: BashJob, exitCode: number | null, _signal: NodeJS.Sign
 		clearInterval(job.stallTimer);
 		job.stallTimer = undefined;
 	}
-	if (!job.logStream.destroyed) {
-		job.logStream.end();
-	}
 	job.endedAt = Date.now();
 	job.exitCode = exitCode;
 	job.status = job.killRequested ? "killed" : exitCode === 0 ? "completed" : "failed";
-	job.completion.resolve();
+
+	let completionReady = false;
+	const resolveCompletion = () => {
+		if (completionReady) return;
+		completionReady = true;
+		job.completion.resolve();
+	};
+	if (job.logStream.destroyed || job.logStream.writableFinished || job.logStream.errored) {
+		resolveCompletion();
+		return;
+	}
+	job.logStream.once("finish", resolveCompletion);
+	job.logStream.once("error", resolveCompletion);
+	try {
+		job.logStream.end(resolveCompletion);
+	} catch {
+		resolveCompletion();
+	}
 }
 
 function startStallWatchdog(job: BashJob): void {
@@ -374,6 +387,10 @@ function registerJob(command: string, cwd: string, child: ChildProcess): BashJob
 		chunksBytes: 0,
 		completion,
 		finalized: false,
+		detached: false,
+		completionNotificationSuppressed: false,
+		completionNotificationQueued: false,
+		completionNotificationSent: false,
 	};
 	jobs.set(jobId, job);
 	logStream.on("error", () => {
@@ -419,7 +436,7 @@ function spawnManagedJob(command: string, cwd: string): BashJob {
 function getJob(jobId: string): BashJob {
 	const job = jobs.get(jobId);
 	if (!job) {
-		throw new Error(`Unknown bash job: ${jobId}. It may have already finished and been cleaned up. Use bash_jobs to see running jobs.`);
+		throw new Error(`Unknown bash job: ${jobId}. It may have already finished and been cleaned up. Use bash_jobs to list running jobs and terminal jobs that await retrieval.`);
 	}
 	return job;
 }
@@ -541,6 +558,7 @@ async function runManagedBash(
 	timeoutSeconds: number,
 	signal: AbortSignal | undefined,
 	onUpdate: ((result: BashToolResult) => void) | undefined,
+	onDetached: (job: BashJob) => void,
 ): Promise<BashToolResult> {
 	const job = spawnManagedJob(command, cwd);
 	dlog("BASH", "runManagedBash_spawned", {
@@ -573,7 +591,14 @@ async function runManagedBash(
 			};
 
 			job.completion.promise.then(() => finish("completed"));
-			timeoutHandle = setTimeout(() => finish("timed_out"), timeoutSeconds * 1000);
+			timeoutHandle = setTimeout(() => {
+				if (job.finalized) return;
+				job.detached = true;
+				job.completion.promise.then(() => onDetached(job)).catch(() => {
+					// Notification scheduling is best-effort.
+				});
+				finish("timed_out");
+			}, timeoutSeconds * 1000);
 			if (timeoutHandle.unref) timeoutHandle.unref();
 
 			abortHandler = () => {
@@ -615,94 +640,6 @@ async function runManagedBash(
 	}
 }
 
-async function waitForJob(
-	job: BashJob,
-	timeoutSeconds: number | undefined,
-	signal: AbortSignal | undefined,
-	onUpdate?: (result: BashToolResult) => void,
-): Promise<void> {
-	dlog("BASH", "waitForJob_enter", {
-		jobId: job.jobId,
-		jobStatus: job.status,
-		timeoutSeconds,
-		haveSignal: !!signal,
-		signalAlreadyAborted: signal?.aborted ?? null,
-		haveOnUpdate: !!onUpdate,
-	});
-	if (job.status !== "running") {
-		dlog("BASH", "waitForJob_short_circuit_not_running", { jobId: job.jobId, status: job.status });
-		return;
-	}
-
-	const stopUpdating = attachOutputUpdater(job, onUpdate, { emitInitialOutput: true });
-	try {
-		await new Promise<void>((resolve, reject) => {
-			let timeoutHandle: NodeJS.Timeout | undefined;
-			let abortHandler: (() => void) | undefined;
-			let settled = false;
-
-			const finish = () => {
-				if (settled) return;
-				settled = true;
-				if (timeoutHandle) clearTimeout(timeoutHandle);
-				if (abortHandler && signal) signal.removeEventListener("abort", abortHandler);
-				dlog("BASH", "waitForJob_finish", {
-					jobId: job.jobId,
-					jobStatus: job.status,
-					signalAborted: signal?.aborted ?? null,
-				});
-				resolve();
-			};
-
-			const fail = (error: Error) => {
-				if (settled) return;
-				settled = true;
-				if (timeoutHandle) clearTimeout(timeoutHandle);
-				if (abortHandler && signal) signal.removeEventListener("abort", abortHandler);
-				dlog("BASH", "waitForJob_fail", {
-					jobId: job.jobId,
-					error: error.message,
-					signalAborted: signal?.aborted ?? null,
-				});
-				reject(error);
-			};
-
-			job.completion.promise.then(() => finish());
-			if (timeoutSeconds !== undefined && timeoutSeconds > 0) {
-				timeoutHandle = setTimeout(finish, timeoutSeconds * 1000);
-				if (timeoutHandle.unref) timeoutHandle.unref();
-			}
-
-			abortHandler = () => {
-				dlog("BASH", "waitForJob_abort_fired", {
-					jobId: job.jobId,
-					settled,
-					signalAborted: signal?.aborted ?? null,
-				});
-				fail(new Error(`Stopped waiting for job ${job.jobId}`));
-			};
-			if (signal) {
-				if (signal.aborted) {
-					dlog("BASH", "waitForJob_signal_already_aborted", { jobId: job.jobId });
-					abortHandler();
-				} else {
-					signal.addEventListener("abort", abortHandler, { once: true });
-					dlog("BASH", "waitForJob_listener_attached", { jobId: job.jobId });
-				}
-			} else {
-				dlog("BASH", "waitForJob_no_signal", { jobId: job.jobId });
-			}
-		});
-	} finally {
-		dlog("BASH", "waitForJob_exit", {
-			jobId: job.jobId,
-			jobStatus: job.status,
-			signalAborted: signal?.aborted ?? null,
-		});
-		stopUpdating();
-	}
-}
-
 function formatStatus(job: BashJob, tail = getTailState(job)): string {
 	const lines = [
 		`Job: ${job.jobId}`,
@@ -731,18 +668,30 @@ function getRunningJobs(): BashJob[] {
 }
 
 function formatJobsList(): string {
-	const runningJobs = getRunningJobs();
-	if (runningJobs.length === 0) {
-		return "No running managed bash jobs.";
+	const managedJobs = [...jobs.values()].sort((a, b) => b.startedAt - a.startedAt);
+	if (managedJobs.length === 0) {
+		return "No managed bash jobs.";
 	}
 
-	const sorted = runningJobs.sort((a, b) => b.startedAt - a.startedAt);
-	const lines = sorted.map((job) => {
-		const runtime = formatDuration(Date.now() - job.startedAt);
-		const extra = job.interactiveStall ? " · waiting for input?" : "";
-		return `● ${job.jobId} · running · ${runtime}${extra}\n    ${job.command}\n    ${job.outputPath}`;
-	});
-	return `Running managed bash jobs (${runningJobs.length}):\n\n${lines.join("\n\n")}`;
+	const runningJobs = managedJobs.filter((job) => job.status === "running");
+	const terminalJobs = managedJobs.filter((job) => job.status !== "running");
+	const sections: string[] = [];
+	if (runningJobs.length > 0) {
+		const lines = runningJobs.map((job) => {
+			const runtime = formatDuration(Date.now() - job.startedAt);
+			const extra = job.interactiveStall ? " · waiting for input?" : "";
+			return `● ${job.jobId} · running · ${runtime}${extra}\n    ${job.command}\n    ${job.outputPath}`;
+		});
+		sections.push(`Running managed bash jobs (${runningJobs.length}):\n\n${lines.join("\n\n")}`);
+	}
+	if (terminalJobs.length > 0) {
+		const lines = terminalJobs.map((job) => {
+			const runtime = formatDuration((job.endedAt ?? Date.now()) - job.startedAt);
+			return `● ${job.jobId} · ${job.status} · ${runtime}\n    ${job.command}\n    ${job.outputPath}`;
+		});
+		sections.push(`Terminal managed bash jobs awaiting retrieval (${terminalJobs.length}):\n\n${lines.join("\n\n")}`);
+	}
+	return sections.join("\n\n");
 }
 
 // Hard deadline for the post-SIGKILL wait in killJob. If the child is
@@ -804,12 +753,95 @@ async function killJob(job: BashJob, signal?: AbortSignal): Promise<void> {
 
 export default function (pi: ExtensionAPI) {
 	const bashResultRenderer = createBashToolDefinition(process.cwd()).renderResult;
+	const pendingCompletionNotifications = new Set<BashJob>();
+	let completionNotificationTimer: NodeJS.Timeout | undefined;
+	let sessionShuttingDown = false;
+
+	const flushCompletionNotifications = () => {
+		completionNotificationTimer = undefined;
+		const terminalJobs = [...pendingCompletionNotifications];
+		pendingCompletionNotifications.clear();
+		if (sessionShuttingDown) return;
+		const eligibleJobs = terminalJobs.filter(
+			(job) =>
+				job.detached &&
+				job.status !== "running" &&
+				!job.completionNotificationSuppressed &&
+				!job.completionNotificationSent,
+		);
+		if (eligibleJobs.length === 0) return;
+		for (const job of eligibleJobs) {
+			job.completionNotificationQueued = false;
+			job.completionNotificationSent = true;
+		}
+		const lines = [
+			"Managed bash job completion:",
+			...eligibleJobs.map((job) => `- ${job.jobId} · ${job.status} · ${formatCommandPreview(job.command)}`),
+			"Use bash_status with a job ID to retrieve its final output.",
+		];
+		try {
+			pi.sendMessage(
+				{
+					customType: "bash-job-completion",
+					content: lines.join("\n"),
+					display: true,
+					details: {
+						jobs: eligibleJobs.map((job) => ({
+							jobId: job.jobId,
+							status: job.status,
+							command: formatCommandPreview(job.command),
+						})),
+					},
+				},
+				{ triggerTurn: true, deliverAs: "steer" },
+			);
+		} catch (error) {
+			dlog("BASH", "completion_notification_failed", {
+				error: (error as Error)?.message ?? String(error),
+				jobIds: eligibleJobs.map((job) => job.jobId),
+			});
+		}
+	};
+
+	const queueCompletionNotification = (job: BashJob) => {
+		if (
+			!job.detached ||
+			job.status === "running" ||
+			job.completionNotificationSuppressed ||
+			job.completionNotificationQueued ||
+			job.completionNotificationSent ||
+			sessionShuttingDown
+		) {
+			return;
+		}
+		job.completionNotificationQueued = true;
+		pendingCompletionNotifications.add(job);
+		completionNotificationTimer ??= setTimeout(flushCompletionNotifications, COMPLETION_NOTIFICATION_BATCH_MS);
+		completionNotificationTimer.unref?.();
+	};
+
+	const suppressCompletionNotification = (job: BashJob) => {
+		job.completionNotificationSuppressed = true;
+		job.completionNotificationQueued = false;
+		pendingCompletionNotifications.delete(job);
+		if (pendingCompletionNotifications.size === 0 && completionNotificationTimer) {
+			clearTimeout(completionNotificationTimer);
+			completionNotificationTimer = undefined;
+		}
+	};
 
 	pi.on("session_start", () => {
+		sessionShuttingDown = false;
 		maxLogBytes = loadMaxLogBytes();
 	});
 
 	pi.on("session_shutdown", async () => {
+		sessionShuttingDown = true;
+		if (completionNotificationTimer) {
+			clearTimeout(completionNotificationTimer);
+			completionNotificationTimer = undefined;
+		}
+		for (const job of jobs.values()) suppressCompletionNotification(job);
 		const runningJobs = getRunningJobs();
 		await Promise.all(
 			runningJobs.map(async (job) => {
@@ -830,14 +862,14 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "bash",
 		label: "bash",
-		description: `Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). Supports an optional cwd override for this command. Timeout defaults to ${defaultBashTimeoutSeconds} seconds; if the command exceeds it, it stays alive as a managed bash job instead of being killed. Use bash_wait, bash_status, bash_kill, or bash_jobs to manage it.`,
+		description: `Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). Supports an optional cwd override for this command. Timeout defaults to ${defaultBashTimeoutSeconds} seconds; if the command exceeds it, it stays alive as a managed bash job instead of being killed. Use bash_status, bash_kill, or bash_jobs to manage it.`,
 		promptSnippet: `Execute bash commands (ls, grep, find, etc.). Supports an optional cwd override. Timeout defaults to ${defaultBashTimeoutSeconds}s; commands that exceed it continue as managed bash jobs.`,
 		promptGuidelines: [
 			"Prefer the cwd parameter over prepending commands with cd when you want to run a command in another directory.",
-			"When a timed bash command is still running, use bash_wait, bash_status, bash_kill, or bash_jobs instead of rerunning it from scratch.",
-			"Use bash_jobs when you need to recover a job id for a still-running managed bash job.",
+			"When a timed bash command is still running, use bash_status, bash_kill, or bash_jobs instead of rerunning it from scratch.",
+			"Use bash_jobs to recover job IDs for running jobs and terminal jobs that await retrieval.",
 			`If you omit timeout, bash uses a default soft timeout of ${defaultBashTimeoutSeconds} seconds before the command becomes a managed job.`,
-			"Do not use shell backgrounding tricks like &, nohup, or disown to detach work. Instead, let bash create a managed job and then use bash_wait, bash_status, bash_kill, or bash_jobs.",
+			"Do not use shell backgrounding tricks like &, nohup, or disown to detach work. Instead, let bash create a managed job and then use bash_status, bash_kill, or bash_jobs.",
 		],
 		parameters: bashSchema,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
@@ -855,6 +887,7 @@ export default function (pi: ExtensionAPI) {
 					params.timeout ?? defaultBashTimeoutSeconds,
 					signal,
 					onUpdate,
+					queueCompletionNotification,
 				);
 			} catch (err) {
 				dlog("BASH", "tool_bash_threw", {
@@ -873,61 +906,6 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
-		name: "bash_wait",
-		label: "bash_wait",
-		description: "Wait for a managed bash job to finish, or for additional time to elapse. Returns updated output and status without rerunning the command.",
-		promptSnippet: "Wait for an existing managed bash job to finish or produce more output.",
-		promptGuidelines: ["Use this after bash returns a running managed job and you want to wait longer without restarting the command."],
-		parameters: waitSchema,
-		renderCall(args, theme) {
-			const timeoutSuffix = args.timeout ? theme.fg("muted", ` (timeout ${args.timeout}s)`) : "";
-			const job = typeof args.jobId === "string" ? jobs.get(args.jobId) : undefined;
-			const commandSuffix = job ? theme.fg("muted", ` — ${formatCommandPreview(job.command)}`) : "";
-			return new Text(theme.fg("toolTitle", theme.bold(`bash_wait ${args.jobId}`)) + timeoutSuffix + commandSuffix, 0, 0);
-		},
-		renderResult: bashResultRenderer,
-		async execute(_toolCallId, params, signal, onUpdate) {
-			dlog("BASH", "tool_bash_wait_enter", {
-				toolCallId: _toolCallId,
-				jobId: params.jobId,
-				timeout: params.timeout,
-				haveSignal: !!signal,
-				signalAlreadyAborted: signal?.aborted ?? null,
-			});
-			try {
-				const job = getJob(params.jobId);
-				await waitForJob(job, params.timeout, signal, onUpdate);
-				if (job.status === "running") {
-					dlog("BASH", "tool_bash_wait_still_running", {
-						toolCallId: _toolCallId,
-						jobId: params.jobId,
-						signalAborted: signal?.aborted ?? null,
-					});
-					return {
-						content: [{ type: "text", text: formatRunningMessage(job) }],
-						details: buildDetails(job),
-					};
-				}
-				dlog("BASH", "tool_bash_wait_completed", {
-					toolCallId: _toolCallId,
-					jobId: params.jobId,
-					finalStatus: job.status,
-					signalAborted: signal?.aborted ?? null,
-				});
-				return completedJobResponseOrThrow(job, true);
-			} catch (err) {
-				dlog("BASH", "tool_bash_wait_threw", {
-					toolCallId: _toolCallId,
-					jobId: params.jobId,
-					error: (err as Error)?.message ?? String(err),
-					signalAborted: signal?.aborted ?? null,
-				});
-				throw err;
-			}
-		},
-	});
-
-	pi.registerTool({
 		name: "bash_status",
 		label: "bash_status",
 		description: "Inspect the current status of a managed bash job, including elapsed time, log path, and recent output.",
@@ -936,15 +914,23 @@ export default function (pi: ExtensionAPI) {
 		renderResult: bashResultRenderer,
 		async execute(_toolCallId, params) {
 			const job = getJob(params.jobId);
+			if (job.status !== "running") {
+				await job.completion.promise;
+				suppressCompletionNotification(job);
+				const tail = getTailState(job);
+				const response = {
+					content: [{ type: "text", text: formatStatus(job, tail) }],
+					details: buildDetails(job, false, tail),
+				};
+				forgetJob(job);
+				return response;
+			}
+
 			const tail = getTailState(job);
-			const response = {
+			return {
 				content: [{ type: "text", text: formatStatus(job, tail) }],
 				details: buildDetails(job, false, tail),
 			};
-			if (job.status !== "running") {
-				forgetJob(job);
-			}
-			return response;
 		},
 	});
 
@@ -962,6 +948,7 @@ export default function (pi: ExtensionAPI) {
 				signalAlreadyAborted: signal?.aborted ?? null,
 			});
 			const job = getJob(params.jobId);
+			suppressCompletionNotification(job);
 			await killJob(job, signal);
 			const { text, details } = consumeCompletedJob(job, true);
 			dlog("BASH", "tool_bash_kill_exit", {
@@ -979,8 +966,8 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "bash_jobs",
 		label: "bash_jobs",
-		description: "List currently running managed bash jobs.",
-		promptSnippet: "List running managed bash jobs so you can recover job ids for active backgrounded commands.",
+		description: "List running managed bash jobs and terminal jobs that await output retrieval.",
+		promptSnippet: "List managed bash jobs so you can recover job ids for active or completed detached commands.",
 		parameters: Type.Object({}),
 		async execute() {
 			return {
@@ -990,7 +977,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("bash-jobs", {
-		description: "Show running managed bash jobs",
+		description: "Show managed bash jobs",
 		handler: async (_args, ctx) => {
 			if (ctx.hasUI) {
 				ctx.ui.notify(formatJobsList(), "info");
