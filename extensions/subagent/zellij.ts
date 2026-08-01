@@ -23,11 +23,103 @@ export interface SubagentPaneIdentity {
 	incarnation: string;
 }
 
+let managedSessionName: string | undefined;
+
+function zellijBinary(): string {
+	return process.env.PI_SUBAGENT_ZELLIJ_BIN || "zellij";
+}
+
+/**
+ * @deprecated Use ensureZellij() instead.
+ */
 export function requireZellij(): void {
 	if (!process.env.ZELLIJ_SESSION_NAME)
 		throw new Error(
 			"Subagent delegation requires running inside a Zellij session. Start pi inside zellij first.",
 		);
+}
+
+/**
+ * Ensure a Zellij session is available. If the process is already inside a
+ * Zellij session, this is a no-op. Otherwise, a detached session is started
+ * and ZELLIJ_SESSION_NAME is set in process.env so that subsequent
+ * `zellij action` calls route to it.
+ */
+export async function ensureZellij(): Promise<void> {
+	if (process.env.ZELLIJ_SESSION_NAME) return;
+	if (managedSessionName) {
+		process.env.ZELLIJ_SESSION_NAME = managedSessionName;
+		return;
+	}
+
+	const binary = zellijBinary();
+	const sessionName = `pi-subagent-${process.pid}`;
+
+	// Start a zellij session. The server process starts independently of the
+	// client. Without a real terminal the client exits immediately, but the
+	// server persists and accepts `zellij action` commands.
+	await new Promise<void>((resolve) => {
+		const proc = spawn(binary, ["-s", sessionName], {
+			stdio: "ignore",
+			detached: true,
+			shell: false,
+		});
+		proc.unref();
+		proc.on("error", () => resolve());
+		proc.on("close", () => resolve());
+		// Server may need a moment to bind its socket.
+		setTimeout(resolve, 1000);
+	});
+
+	// Verify the session exists.
+	const sessions = await listSessionNames(binary);
+	if (!sessions.includes(sessionName)) {
+		throw new Error(
+			`Failed to start a detached Zellij session ("${sessionName}"). ` +
+			"Make sure zellij is installed and on PATH " +
+			"(or set PI_SUBAGENT_ZELLIJ_BIN).",
+		);
+	}
+
+	managedSessionName = sessionName;
+	process.env.ZELLIJ_SESSION_NAME = sessionName;
+}
+
+async function listSessionNames(binary: string): Promise<string[]> {
+	return new Promise((resolve) => {
+		const proc = spawn(binary, ["list-sessions", "--short", "--no-formatting"], {
+			stdio: ["ignore", "pipe", "pipe"],
+			shell: false,
+		});
+		let stdout = "";
+		proc.stdout.setEncoding("utf8");
+		proc.stdout.on("data", (chunk: string) => {
+			stdout += chunk;
+		});
+		proc.on("error", () => resolve([]));
+		proc.on("close", () =>
+			resolve(stdout.trim().split("\n").filter(Boolean)),
+		);
+	});
+}
+
+/**
+ * Kill a managed Zellij session that was auto-started by ensureZellij().
+ * Safe to call multiple times or when no managed session exists.
+ */
+export async function cleanupManagedSession(): Promise<void> {
+	if (!managedSessionName) return;
+	const name = managedSessionName;
+	managedSessionName = undefined;
+	const binary = zellijBinary();
+	await new Promise<void>((resolve) => {
+		const proc = spawn(binary, ["kill-session", name], {
+			stdio: "ignore",
+			shell: false,
+		});
+		proc.on("error", () => resolve());
+		proc.on("close", () => resolve());
+	});
 }
 
 async function action(args: string[]): Promise<string> {
@@ -77,7 +169,7 @@ export async function newTab(
 	cmd: string[],
 	env: Record<string, string>,
 ): Promise<number> {
-	requireZellij();
+	await ensureZellij();
 	const stdout = await action(buildNewTabArgs(name, cwd, cmd, env));
 	const tabId = Number.parseInt(stdout.trim(), 10);
 	if (!Number.isFinite(tabId) || tabId <= 0)
@@ -88,7 +180,7 @@ export async function newTab(
 }
 
 export async function listPanes(): Promise<PaneInfo[]> {
-	requireZellij();
+	await ensureZellij();
 	const parsed: unknown = JSON.parse(
 		await action(["list-panes", "--json", "-a"]),
 	);
@@ -105,7 +197,7 @@ export async function listPanes(): Promise<PaneInfo[]> {
 }
 
 export async function listTabs(): Promise<TabInfo[]> {
-	requireZellij();
+	await ensureZellij();
 	const parsed: unknown = JSON.parse(
 		await action(["list-tabs", "--json", "-a"]),
 	);

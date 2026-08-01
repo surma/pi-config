@@ -238,7 +238,7 @@ test("start fails clearly outside Zellij", async () => {
 		);
 		assert.match(
 			result.content[0]?.text ?? "",
-			/requires running inside a Zellij session/,
+			/Failed to start a detached Zellij session|zellij is installed/,
 		);
 	} finally {
 		if (previousSession === undefined) delete process.env.ZELLIJ_SESSION_NAME;
