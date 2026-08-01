@@ -13,6 +13,7 @@ import {
 	type ShutdownReason,
 } from "./ipc.js";
 import { connectChild, type IpcChildConnector } from "./ipc-child.js";
+import { persistRunResult } from "./result-store.js";
 
 const childId = process.env.PI_SUBAGENT_CHILD_ID ?? "";
 const socketPath = process.env.BRIDGE_SOCKET_PATH;
@@ -24,6 +25,7 @@ const launchControllerInstanceId =
 const incarnation = process.env.PI_SUBAGENT_INCARNATION || "";
 const delegatedPrompt = process.env.PI_SUBAGENT_SYSTEM_PROMPT || "";
 const promptPath = process.env.PI_SUBAGENT_PROMPT_PATH;
+const sessionDir = process.env.PI_SUBAGENT_SESSION_DIR;
 const subagentDepth = Math.max(
 	1,
 	Number.parseInt(process.env.PI_SUBAGENT_DEPTH || "1", 10) || 1,
@@ -39,6 +41,7 @@ interface PersistentBridgeState {
 	currentTool?: string;
 	isStreaming: boolean;
 	assistantTail: string;
+	resultText: string;
 	usage: {
 		input: number;
 		output: number;
@@ -101,6 +104,7 @@ export default function childSubagentExtension(pi: ExtensionAPI) {
 		runOutcome: "pending" as const,
 		isStreaming: false,
 		assistantTail: "",
+		resultText: "",
 		usage: {
 			input: 0,
 			output: 0,
@@ -122,6 +126,7 @@ export default function childSubagentExtension(pi: ExtensionAPI) {
 	let currentTool = persisted.currentTool;
 	let isStreaming = persisted.isStreaming;
 	let assistantTail = persisted.assistantTail;
+	let resultText = persisted.resultText || "";
 	const usage = { ...persisted.usage };
 	const syncPersistent = () =>
 		Object.assign(persisted, {
@@ -133,6 +138,7 @@ export default function childSubagentExtension(pi: ExtensionAPI) {
 			currentTool,
 			isStreaming,
 			assistantTail,
+			resultText,
 			usage: { ...usage },
 		});
 
@@ -261,6 +267,7 @@ export default function childSubagentExtension(pi: ExtensionAPI) {
 			currentTool = undefined;
 			isStreaming = false;
 			assistantTail = "";
+			resultText = "";
 		}
 		persisted.sessionId = nextSessionId;
 		syncPersistent();
@@ -290,6 +297,7 @@ export default function childSubagentExtension(pi: ExtensionAPI) {
 		runState = "running";
 		runOutcome = "pending";
 		stopReason = errorMessage = undefined;
+		resultText = "";
 		syncPersistent();
 		await captureEffectivePrompt(ctx.getSystemPrompt());
 		event("agent_start");
@@ -324,6 +332,21 @@ export default function childSubagentExtension(pi: ExtensionAPI) {
 						? "failed"
 						: "succeeded";
 		syncPersistent();
+		if (sessionDir) {
+			try {
+				await persistRunResult(sessionDir, {
+					runId,
+					outcome: runOutcome,
+					incarnation,
+					settledAt: Date.now(),
+					result: resultText,
+				});
+			} catch (error) {
+				process.stderr.write(
+					`Failed to persist exact result for run ${runId}: ${error instanceof Error ? error.message : String(error)}\n`,
+				);
+			}
+		}
 		event("agent_settled", { runOutcome, stopReason, errorMessage });
 		snapshot();
 		// Deliberately no ctx.shutdown(): settlement ends a run, not the child process.
@@ -355,9 +378,11 @@ export default function childSubagentExtension(pi: ExtensionAPI) {
 									? part.text
 									: "",
 							)
-							.join("")
+							.filter(Boolean)
+							.join("\n")
 					: "";
 				if (text) assistantTail = text.slice(-64 * 1024);
+				if (name === "message_end") resultText = text;
 				isStreaming =
 					name !== "message_end" &&
 					rawEvent.assistantMessageEvent?.type !== "done" &&

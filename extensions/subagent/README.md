@@ -69,7 +69,25 @@ Per-child artifacts remain at this path:
 <agent-dir>/sessions/subagents/<child-id>/
 ```
 
-These artifacts include the prompt, child event log, saved Pi session, and `result.md`.
+These artifacts include the prompt, child event log, saved Pi session, and the latest-result compatibility file.
+
+The shared `result.md` file atomically mirrors the latest settled run after exact persistence succeeds. Empty failed or aborted output replaces older content.
+
+Each settled run also has durable exact artifacts:
+
+```text
+<agent-dir>/sessions/subagents/<child-id>/runs/<run-id>/
+  result.md
+  result.json
+```
+
+The Markdown file contains only the exact run output. The JSON file records the run outcome, incarnation, and settlement time.
+
+The extension writes both files in a private temporary directory. An atomic directory rename publishes the complete immutable pair.
+
+The first concurrent publisher wins. Later writers read that pair and never replace it.
+
+Result persistence is best-effort. A settlement continues after a write failure, and diagnostics record the failure.
 
 The extension creates private directories with mode `0700`. It creates lease, registry, prompt, result, and socket files with restrictive permissions.
 
@@ -108,14 +126,37 @@ Pane markers contain the full identity and socket path. Every targeted Zellij ac
 
 The child streams structured lifecycle events to the parent. Existing assistant events provide the final response.
 
-A successful settled `subagent_wait` returns the exact final response in both locations:
+A successful settled `subagent_wait` returns the exact response for its resolved run in both locations:
 
 ```text
 content[0].text
 details.result
 ```
 
-The extension also saves that response in `result.md`. The parent does not need to read the child JSONL to obtain it.
+The extension saves each response in an immutable `runs/<run-id>` artifact pair. A later run never overwrites that pair.
+
+`subagent_result` retrieves one exact run by child ID and run ID. It never falls back to the latest result.
+
+The tool returns these stable status and reason combinations:
+
+| Status | Reason | Meaning |
+| --- | --- | --- |
+| `unknown_child` | `unknown_child` | The child ID is unknown. |
+| `pending` | `run_active` | The requested run is the current active run. |
+| `missing` | `artifact_missing` | A known historical run has no artifact pair. |
+| `missing` | `run_not_known` | The requested run is newer than the child run cursor. |
+| `incomplete` | `artifact_incomplete` | Only one file exists in the final run directory. |
+| `invalid_metadata` | `metadata_invalid` | The metadata file is invalid or describes another run. |
+| `unreadable` | `artifact_unreadable` | The tool cannot read one or both files. |
+| `available` | `result_available` | The complete exact result is available. |
+
+Only an `available` result includes `outcome`. Empty output remains an available result with its actual outcome.
+
+Settlement notifications report completed runs while their child processes remain alive. Notifications batch nearby settlements and direct the parent to `subagent_result`.
+
+Use `subagent_wait` only when the parent requires explicit synchronization with a finite deadline. Do not poll it for routine completion.
+
+Use `subagent_status` for live lifecycle and diagnostic information. Do not poll it for routine completion.
 
 `subagent_wait` uses settlement cursors. An explicit `afterRunId` requires a later settled run.
 
@@ -172,7 +213,7 @@ A settled child remains alive and interactive. Settlement never calls `ctx.shutd
 
 ## Tools
 
-The extension registers nine tools.
+The extension registers ten tools.
 
 - `subagent_start {task, model, thinking, name?, cwd?, systemPrompt?}`
   - The model and thinking level are mandatory.
@@ -181,6 +222,8 @@ The extension registers nine tools.
   - The tool lists current and retained children for the active owner.
 - `subagent_status {id}`
   - The tool returns lifecycle, activity, identity, usage, diagnostics, and artifact paths.
+- `subagent_result {id, runId}`
+  - The tool returns the exact persisted output and actual outcome for one settled run.
 - `subagent_wait {id?|all?, timeoutSeconds, afterRunId?}`
   - The tool waits for a settlement cursor or a stopped process.
 - `subagent_steer {id, message}`
@@ -218,7 +261,7 @@ Run the deterministic suite from this directory:
 PI_TEST_PACKAGE_DIR=/path/to/pi-0.82.0 ./test.sh
 ```
 
-The suite covers result visibility, owner isolation, lease races, authority loss, full frame fences, resume, parent lifecycle, liveness, and UI behavior.
+The suite covers per-run results, settlement notifications, waits, owner isolation, lease races, frame fences, resume, lifecycle, liveness, and UI behavior.
 
 A separate disposable integration gate must use a real Pi and a real Zellij session. It must set a disposable `PI_CODING_AGENT_DIR`.
 
