@@ -23,4 +23,5 @@ ln -s "$package_dir/node_modules/@earendil-works/pi-tui" "$tmp/node_modules/@mar
 ln -s "$package_dir/node_modules/@earendil-works" "$tmp/node_modules/@earendil-works"
 ln -s "$package_dir/node_modules/typebox" "$tmp/node_modules/@sinclair/typebox"
 
-node --experimental-transform-types --test "${tests[@]/#/$tmp/}"
+env -u ZELLIJ -u ZELLIJ_PANE_ID -u ZELLIJ_SESSION_NAME \
+	node --experimental-transform-types --test "${tests[@]/#/$tmp/}"

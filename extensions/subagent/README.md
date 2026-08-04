@@ -18,6 +18,8 @@ The validated runtime versions are Zellij 0.44.3 and Pi 0.82.0. Revalidate lifec
 
 `subagent_start` opens a tab in the current Zellij session. The tab runs a normal interactive Pi TUI.
 
+Before each Zellij action, the extension resolves the current session from the parent pane ID, command, and working directory. It passes that session through Zellij's explicit `--session` option. This prevents an old `ZELLIJ_SESSION_NAME` from redirecting actions after a session rename. An ambiguous parent pane fails closed.
+
 The extension uses `devx pi` when an executable `devx` exists. Otherwise, it uses the current Pi executable.
 
 Every child starts with `--offline`. The command loads `child.ts` through `-e`, so other extensions and provider proxies remain available.

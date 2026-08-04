@@ -226,8 +226,13 @@ test("start is blocked for nested children before launch", async () => {
 test("start fails clearly outside Zellij", async () => {
 	const previousSession = process.env.ZELLIJ_SESSION_NAME;
 	const previousDepth = process.env.PI_SUBAGENT_DEPTH;
+	const previousZellij = process.env.PI_SUBAGENT_ZELLIJ_BIN;
 	delete process.env.ZELLIJ_SESSION_NAME;
 	delete process.env.PI_SUBAGENT_DEPTH;
+	process.env.PI_SUBAGENT_ZELLIJ_BIN = join(
+		tmpdir(),
+		"missing-pi-subagent-zellij",
+	);
 	try {
 		const result = await requireTool(setup(), "subagent_start").execute(
 			"x",
@@ -245,6 +250,9 @@ test("start fails clearly outside Zellij", async () => {
 		else process.env.ZELLIJ_SESSION_NAME = previousSession;
 		if (previousDepth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
 		else process.env.PI_SUBAGENT_DEPTH = previousDepth;
+		if (previousZellij === undefined)
+			delete process.env.PI_SUBAGENT_ZELLIJ_BIN;
+		else process.env.PI_SUBAGENT_ZELLIJ_BIN = previousZellij;
 	}
 });
 
@@ -302,7 +310,7 @@ test("same-session resume hello clears an active parent run view", async () => {
 	await writeFile(
 		zellij,
 		`#!/bin/sh
-if [ "$2" = list-panes ]; then printf '%s\\n' ${JSON.stringify(panes)}; exit 0; fi
+if [ "$4" = list-panes ]; then printf '%s\\n' ${JSON.stringify(panes)}; exit 0; fi
 exit 2
 `,
 	);
@@ -489,7 +497,7 @@ async function setupControllerWithChild(opts: {
 		: JSON.stringify([]);
 	await writeFile(
 		zellij,
-		`#!/bin/sh\nif [ "$2" = list-panes ]; then printf '%s\\n' ${JSON.stringify(panes)}; exit 0; fi\nexit 2\n`,
+		`#!/bin/sh\nif [ "$4" = list-panes ]; then printf '%s\\n' ${JSON.stringify(panes)}; exit 0; fi\nexit 2\n`,
 	);
 	await chmod(zellij, 0o755);
 	const ownerKey = createHash("sha1")
@@ -1202,7 +1210,7 @@ test("foreign and legacy registries are not loaded or modified", async () => {
 	]);
 	await writeFile(
 		zellij,
-		`#!/bin/sh\nif [ "$2" = list-panes ]; then printf '%s\\n' ${JSON.stringify(foreignPanes)}; exit 0; fi\nexit 2\n`,
+		`#!/bin/sh\nif [ "$4" = list-panes ]; then printf '%s\\n' ${JSON.stringify(foreignPanes)}; exit 0; fi\nexit 2\n`,
 	);
 	await chmod(zellij, 0o755);
 	const myOwner = `/tmp/my-owner-${Date.now().toString(36)}.jsonl`;
@@ -1286,7 +1294,7 @@ test("resume opens the exact child session with a new fenced incarnation", async
 	try {
 		await writeFile(
 			s.zellijScript,
-			`#!${process.execPath}\nconst fs = require("node:fs");\nconst args = process.argv.slice(2);\nif (args[0] !== "action") process.exit(2);\nif (args[1] === "new-tab") { fs.writeFileSync(${JSON.stringify(statePath)}, JSON.stringify(args)); process.stdout.write("3\\n"); process.exit(0); }\nif (args[1] === "list-panes") { if (!fs.existsSync(${JSON.stringify(statePath)})) { process.stdout.write("[]\\n"); process.exit(0); } const launched = JSON.parse(fs.readFileSync(${JSON.stringify(statePath)}, "utf8")); process.stdout.write(JSON.stringify([{ id: 4, tab_id: 3, is_plugin: false, exited: false, pane_command: "pi", terminal_command: launched.join(" ") }]) + "\\n"); process.exit(0); }\nprocess.exit(2);\n`,
+			`#!${process.execPath}\nconst fs = require("node:fs");\nconst args = process.argv.slice(2);\nconst actionIndex = args.indexOf("action");\nif (actionIndex < 0) process.exit(2);\nconst action = args[actionIndex + 1];\nif (action === "new-tab") { fs.writeFileSync(${JSON.stringify(statePath)}, JSON.stringify(args)); process.stdout.write("3\\n"); process.exit(0); }\nif (action === "list-panes") { if (!fs.existsSync(${JSON.stringify(statePath)})) { process.stdout.write("[]\\n"); process.exit(0); } const launched = JSON.parse(fs.readFileSync(${JSON.stringify(statePath)}, "utf8")); process.stdout.write(JSON.stringify([{ id: 4, tab_id: 3, is_plugin: false, exited: false, pane_command: "pi", terminal_command: launched.join(" ") }]) + "\\n"); process.exit(0); }\nprocess.exit(2);\n`,
 		);
 		await chmod(s.zellijScript, 0o755);
 		const resumed = requireTool(s.tools, "subagent_resume").execute("x", {
@@ -1344,7 +1352,7 @@ test("resume opens the exact child session with a new fenced incarnation", async
 		const launchArgs = JSON.parse(
 			await readFile(statePath, "utf8"),
 		) as string[];
-		const sessionIndex = launchArgs.indexOf("--session");
+		const sessionIndex = launchArgs.lastIndexOf("--session");
 		assert.equal(launchArgs[sessionIndex + 1], s.sessionFilePath);
 		assert.ok(launchArgs.includes("--offline"));
 		const envIndex = launchArgs.indexOf("env");
@@ -1465,7 +1473,7 @@ test("quit closes only an owned identity-validated stopped tab", async () => {
 		]);
 		await writeFile(
 			s.zellijScript,
-			`#!/bin/sh\nif [ "$2" = list-panes ]; then printf '%s\\n' ${JSON.stringify(panes)}; exit 0; fi\nif [ "$2" = close-tab-by-id ]; then printf closed > ${JSON.stringify(closed)}; exit 0; fi\nexit 2\n`,
+			`#!/bin/sh\nif [ "$4" = list-panes ]; then printf '%s\\n' ${JSON.stringify(panes)}; exit 0; fi\nif [ "$4" = close-tab-by-id ]; then printf closed > ${JSON.stringify(closed)}; exit 0; fi\nexit 2\n`,
 		);
 		await s.handlers.get("session_shutdown")?.({ reason: "quit" }, s.ctx);
 		await eventually(() =>
@@ -1484,7 +1492,7 @@ test("periodic liveness detects a manual close or hard kill without tool activit
 	try {
 		await writeFile(
 			s.zellijScript,
-			`#!/bin/sh\nif [ "$2" = list-panes ]; then printf '[]\\n'; exit 0; fi\nexit 2\n`,
+			`#!/bin/sh\nif [ "$4" = list-panes ]; then printf '[]\\n'; exit 0; fi\nexit 2\n`,
 		);
 		await chmod(s.zellijScript, 0o755);
 		await eventually(async () => {
@@ -1516,7 +1524,7 @@ test("a failed periodic Zellij probe preserves a live child", async () => {
 		);
 		await writeFile(
 			s.zellijScript,
-			`#!/bin/sh\nif [ "$2" = list-panes ]; then printf '[]\\n'; exit 0; fi\nexit 2\n`,
+			`#!/bin/sh\nif [ "$4" = list-panes ]; then printf '[]\\n'; exit 0; fi\nexit 2\n`,
 		);
 		await eventually(async () => {
 			const result = await requireTool(s.tools, "subagent_list").execute(
