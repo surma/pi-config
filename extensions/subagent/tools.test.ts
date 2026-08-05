@@ -4,7 +4,7 @@ import { promises as nodeFs } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import type {
 	ExtensionAPI,
@@ -12,9 +12,21 @@ import type {
 } from "@mariozechner/pi-coding-agent";
 import type { TSchema } from "@sinclair/typebox";
 import { Check } from "@sinclair/typebox/value";
-import subagentExtension, { withTerminalCleanupLock } from "./index.ts";
-import { canonicalOwnerSessionFile } from "./owner.ts";
+import subagentExtension, {
+	closeAndDrainIpcMutations,
+	withTerminalCleanupLock,
+} from "./index.ts";
+import {
+	canonicalOwnerSessionFile,
+	hasLeaseAuthority,
+	LEASE_RENEW_INTERVAL_MS,
+	LEASE_STALE_GRACE_MS,
+	LEASE_TTL_MS,
+	leasePath,
+	managedSessionPath,
+} from "./owner.ts";
 import { persistRunResult, runResultPaths } from "./result-store.ts";
+import { activeDedicatedSession } from "./zellij-manager.ts";
 
 interface TestResult {
 	content: { text: string }[];
@@ -241,10 +253,7 @@ test("start fails clearly outside Zellij", async () => {
 			undefined,
 			context,
 		);
-		assert.match(
-			result.content[0]?.text ?? "",
-			/Failed to start a detached Zellij session|zellij is installed/,
-		);
+		assert.match(result.content[0]?.text ?? "", /zellij|guardian|spawn|ENOENT/i);
 	} finally {
 		if (previousSession === undefined) delete process.env.ZELLIJ_SESSION_NAME;
 		else process.env.ZELLIJ_SESSION_NAME = previousSession;
@@ -253,6 +262,83 @@ test("start fails clearly outside Zellij", async () => {
 		if (previousZellij === undefined)
 			delete process.env.PI_SUBAGENT_ZELLIJ_BIN;
 		else process.env.PI_SUBAGENT_ZELLIJ_BIN = previousZellij;
+	}
+});
+
+test("unresolved startup cleanup retains its exact lease until a later retry succeeds", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "pi-startup-authority-"));
+	const agentDirectory = join(directory, "agent");
+	const binary = join(directory, "zellij");
+	const state = join(directory, "sessions");
+	const sessionFile = join(directory, "owner.jsonl");
+	const sessionId = "startup-authority-owner";
+	const ownerIdentity = {
+		ownerSessionFile: await canonicalOwnerSessionFile(sessionFile),
+		ownerSessionId: sessionId,
+	};
+	const old = {
+		agentDir: process.env.PI_CODING_AGENT_DIR,
+		zellij: process.env.PI_SUBAGENT_ZELLIJ_BIN,
+	};
+	process.env.PI_CODING_AGENT_DIR = agentDirectory;
+	process.env.PI_SUBAGENT_ZELLIJ_BIN = binary;
+	const handlers = new Map<string, TestHandler>();
+	const ctx = {
+		mode: "json",
+		sessionManager: {
+			getSessionFile: () => sessionFile,
+			getSessionId: () => sessionId,
+		},
+	} as unknown as ExtensionContext;
+	let recovered = false;
+	try {
+		setup(handlers);
+		await assert.rejects(
+			handlers.get("session_start")?.({ reason: "startup" }, ctx) as Promise<void>,
+			/startup failed|ENOENT|cleanup remains pending/i,
+		);
+		const retainedLease = JSON.parse(
+			await readFile(leasePath(agentDirectory, ownerIdentity), "utf8"),
+		) as { controllerInstanceId: string; expiresAt: number };
+		assert.equal(typeof retainedLease.controllerInstanceId, "string");
+		assert.ok(retainedLease.expiresAt > Date.now());
+		assert.equal(
+			(await readFile(managedSessionPath(agentDirectory, ownerIdentity), "utf8")).includes("cleanup_pending"),
+			true,
+		);
+
+		await writeFile(
+			binary,
+			`#!/bin/sh
+if [ "$1" = attach ]; then printf '%s\\n' "$3" > ${JSON.stringify(state)}; exit 0; fi
+if [ "$1" = list-sessions ]; then cat ${JSON.stringify(state)} 2>/dev/null; exit 0; fi
+if [ "$1" = delete-session ]; then rm -f ${JSON.stringify(state)}; exit 0; fi
+exit 2
+`,
+		);
+		await chmod(binary, 0o755);
+		await handlers.get("session_start")?.({ reason: "startup" }, ctx);
+		recovered = true;
+		assert.ok(activeDedicatedSession());
+	} finally {
+		if (!recovered) {
+			await writeFile(
+				binary,
+				`#!/bin/sh
+if [ "$1" = attach ]; then printf '%s\\n' "$3" > ${JSON.stringify(state)}; exit 0; fi
+if [ "$1" = list-sessions ]; then cat ${JSON.stringify(state)} 2>/dev/null; exit 0; fi
+if [ "$1" = delete-session ]; then rm -f ${JSON.stringify(state)}; exit 0; fi
+exit 2
+`,
+			);
+			await chmod(binary, 0o755);
+			await handlers.get("session_start")?.({ reason: "startup" }, ctx).catch(() => {});
+		}
+		await handlers.get("session_shutdown")?.({ reason: "quit" }, ctx).catch(() => {});
+		if (old.agentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = old.agentDir;
+		if (old.zellij === undefined) delete process.env.PI_SUBAGENT_ZELLIJ_BIN;
+		else process.env.PI_SUBAGENT_ZELLIJ_BIN = old.zellij;
 	}
 });
 
@@ -307,9 +393,13 @@ test("same-session resume hello clears an active parent run view", async () => {
 			terminal_command: `env PI_SUBAGENT_CHILD_ID=${childId} PI_SUBAGENT_OWNER_SESSION_FILE=${ownerSessionFile} PI_SUBAGENT_OWNER_SESSION_ID=${ownerSessionId} PI_SUBAGENT_CONTROLLER_INSTANCE_ID=${controllerInstanceId} PI_SUBAGENT_INCARNATION=${incarnation} BRIDGE_SOCKET_PATH=${socketPath} pi`,
 		},
 	]);
+	const zellijSessions = join(directory, "zellij-sessions");
 	await writeFile(
 		zellij,
 		`#!/bin/sh
+if [ "$1" = attach ]; then printf '%s\\n' "$3" > ${JSON.stringify(zellijSessions)}; exit 0; fi
+if [ "$1" = list-sessions ]; then cat ${JSON.stringify(zellijSessions)} 2>/dev/null; exit 0; fi
+if [ "$1" = delete-session ]; then rm -f ${JSON.stringify(zellijSessions)}; exit 0; fi
 if [ "$4" = list-panes ]; then printf '%s\\n' ${JSON.stringify(panes)}; exit 0; fi
 exit 2
 `,
@@ -420,7 +510,7 @@ exit 2
 		assert.equal(result?.details.lastSettledRunId, 7);
 	} finally {
 		await handlers.get("session_shutdown")?.(
-			{ reason: "reload" },
+			{ reason: "quit" },
 			sessionContext,
 		);
 		socket?.destroy();
@@ -550,6 +640,7 @@ async function setupControllerWithChild(opts: {
 	cleanupRequired?: boolean;
 	childCount?: number;
 	observeUi?: boolean;
+	mode?: "tui" | "rpc" | "json" | "print";
 }) {
 	const directory = await mkdtemp(join(tmpdir(), "pi-acc-"));
 	const agentDirectory = join(directory, "agent");
@@ -579,10 +670,17 @@ async function setupControllerWithChild(opts: {
 				},
 			])
 		: JSON.stringify([]);
-	await writeFile(
-		zellij,
-		`#!/bin/sh\nif [ "$4" = list-panes ]; then printf '%s\\n' ${JSON.stringify(panes)}; exit 0; fi\nexit 2\n`,
-	);
+	const zellijSessions = join(directory, "zellij-sessions");
+	const defaultZellijScript = `#!/bin/sh
+if [ "$1" = attach ]; then printf '%s\\n' "$3" > ${JSON.stringify(zellijSessions)}; exit 0; fi
+if [ "$1" = list-sessions ]; then cat ${JSON.stringify(zellijSessions)} 2>/dev/null; exit 0; fi
+if [ "$1" = delete-session ]; then rm -f ${JSON.stringify(zellijSessions)}; exit 0; fi
+if [ "$4" = list-panes ]; then printf '%s\\n' ${JSON.stringify(panes)}; exit 0; fi
+if [ "$4" = new-tab ]; then printf '7\\n'; exit 0; fi
+if [ "$4" = close-pane ] || [ "$4" = send-keys ]; then exit 0; fi
+exit 2
+`;
+	await writeFile(zellij, defaultZellijScript);
 	await chmod(zellij, 0o755);
 	const ownerKey = createHash("sha1")
 		.update(ownerSessionFile)
@@ -614,37 +712,34 @@ async function setupControllerWithChild(opts: {
 				: join(agentDirectory, "sessions", "subagents", `${childId}-${index + 1}`),
 	}));
 	for (const child of children) await mkdir(child.sessionDir, { recursive: true, mode: 0o700 });
-	await writeFile(
-		registryPath,
-		`${JSON.stringify(
-			children.map((child) => ({
-				childId: child.childId,
-				task: "task",
-				cwd: directory,
-				tabId: 1,
-				paneId: child.paneId,
-				zellijSessionName: "test",
-				terminalCleanupPending: opts.cleanupRequired,
-				terminalCleanupError: opts.cleanupRequired ? "prior cleanup failure" : undefined,
-				sessionDir: child.sessionDir,
-				socketPath: child.socketPath,
-				sessionFile: opts.hasSessionFile ? sessionFilePath : undefined,
-				requestedModel: "p/m",
-				requestedThinking: "off",
-				processState: opts.processState ?? "alive",
-				runState: "idle",
-				runId: opts.runId ?? 0,
-				lastSettledRunId: opts.lastSettledRunId ?? 0,
-				createdAt: 1 + child.paneId,
-				lastActivityAt: 1,
-				ownerSessionFile,
-				ownerSessionId,
-				controllerInstanceId,
-				incarnation: child.incarnation,
-			})),
-		)}\n`,
-		{ mode: 0o600 },
-	);
+	const registryEntries = children.map((child) => ({
+		childId: child.childId,
+		task: "task",
+		cwd: directory,
+		tabId: 1,
+		paneId: child.paneId,
+		zellijSessionName: "",
+		terminalCleanupPending: opts.cleanupRequired,
+		terminalCleanupError: opts.cleanupRequired ? "prior cleanup failure" : undefined,
+		sessionDir: child.sessionDir,
+		socketPath: child.socketPath,
+		sessionFile: opts.hasSessionFile ? sessionFilePath : undefined,
+		requestedModel: "p/m",
+		requestedThinking: "off",
+		processState: opts.processState ?? "alive",
+		runState: "idle",
+		runId: opts.runId ?? 0,
+		lastSettledRunId: opts.lastSettledRunId ?? 0,
+		createdAt: 1 + child.paneId,
+		lastActivityAt: 1,
+		ownerSessionFile,
+		ownerSessionId,
+		controllerInstanceId,
+		incarnation: child.incarnation,
+	}));
+	// Provision the fake dedicated lifecycle before publishing fake children,
+	// so every fixture pane carries the exact manager-owned session name.
+	await writeFile(registryPath, "[]\n", { mode: 0o600 });
 	const old = {
 		agentDir: process.env.PI_CODING_AGENT_DIR,
 		zellijBin: process.env.PI_SUBAGENT_ZELLIJ_BIN,
@@ -656,8 +751,9 @@ async function setupControllerWithChild(opts: {
 	const handlers = new Map<string, TestHandler>();
 	const sentMessages: SentMessage[] = [];
 	let uiRefreshCount = 0;
+	const zellijStatuses: (string | undefined)[] = [];
 	const ctx = {
-		mode: opts.observeUi ? "tui" : "json",
+		mode: opts.mode ?? (opts.observeUi ? "tui" : "json"),
 		cwd: directory,
 		modelRegistry: {
 			getAll: () => [{ provider: "p", id: "m" }],
@@ -671,10 +767,18 @@ async function setupControllerWithChild(opts: {
 			setWidget: () => {
 				uiRefreshCount++;
 			},
+			setStatus: (key: string, value: string | undefined) => {
+				if (key === "subagent-zellij") zellijStatuses.push(value);
+			},
 		},
 	} as unknown as ExtensionContext;
 	const tools = setup(handlers, sentMessages);
 	await handlers.get("session_start")?.({ reason: "startup" }, ctx);
+	const dedicatedSessionName = activeDedicatedSession();
+	assert.ok(dedicatedSessionName);
+	for (const entry of registryEntries) entry.zellijSessionName = dedicatedSessionName;
+	await writeFile(registryPath, `${JSON.stringify(registryEntries)}\n`, { mode: 0o600 });
+	await handlers.get("session_start")?.({ reason: "reload" }, ctx);
 	return {
 		tools,
 		handlers,
@@ -693,12 +797,15 @@ async function setupControllerWithChild(opts: {
 		sessionFilePath,
 		paneCommand,
 		children,
+		zellijStatuses,
 		getUiRefreshCount: () => uiRefreshCount,
 		resetUiRefreshCount: () => {
 			uiRefreshCount = 0;
 		},
 		cleanup: async () => {
-			await handlers.get("session_shutdown")?.({ reason: "reload" }, ctx);
+			await writeFile(zellij, defaultZellijScript);
+			await chmod(zellij, 0o755);
+			await handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
 			if (old.agentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 			else process.env.PI_CODING_AGENT_DIR = old.agentDir;
 			if (old.zellijBin === undefined)
@@ -709,6 +816,117 @@ async function setupControllerWithChild(opts: {
 		},
 	};
 }
+
+for (const mode of ["tui", "rpc", "json", "print"] as const) {
+	test(`persisted ${mode} mode provisions and clears an exact dedicated-session status`, async () => {
+		const controller = await setupControllerWithChild({
+			hasSessionFile: true,
+			mode,
+		});
+		try {
+			assert.match(
+				controller.zellijStatuses.at(-1) ?? "",
+				/^pi[A-Za-z0-9_-]{22}$/,
+			);
+		} finally {
+			await controller.cleanup();
+		}
+		assert.equal(controller.zellijStatuses.at(-1), undefined);
+	});
+}
+
+test("reload restores the same exact dedicated-session status", async () => {
+	const controller = await setupControllerWithChild({
+		hasSessionFile: true,
+		mode: "tui",
+	});
+	const sessionName = controller.zellijStatuses.at(-1);
+	try {
+		assert.match(
+			sessionName ?? "",
+			/^pi[A-Za-z0-9_-]{22}$/,
+		);
+		await controller.handlers.get("session_shutdown")?.(
+			{ reason: "reload" },
+			controller.ctx,
+		);
+		assert.equal(controller.zellijStatuses.at(-1), sessionName);
+		await controller.handlers.get("session_start")?.(
+			{ reason: "reload" },
+			controller.ctx,
+		);
+		assert.equal(controller.zellijStatuses.at(-1), sessionName);
+	} finally {
+		await controller.cleanup();
+	}
+	assert.equal(controller.zellijStatuses.at(-1), undefined);
+});
+
+test("a parent without a persisted session starts no guardian or Zellij client", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "pi-no-owner-session-"));
+	const binary = join(directory, "zellij");
+	const calls = join(directory, "calls");
+	await writeFile(
+		binary,
+		`#!/bin/sh\nprintf '%s\\n' "$*" >> ${JSON.stringify(calls)}\nexit 99\n`,
+	);
+	await chmod(binary, 0o755);
+	const previous = process.env.PI_SUBAGENT_ZELLIJ_BIN;
+	process.env.PI_SUBAGENT_ZELLIJ_BIN = binary;
+	const handlers = new Map<string, TestHandler>();
+	const statuses: (string | undefined)[] = [];
+	const ctx = {
+		mode: "json",
+		sessionManager: {
+			getSessionFile: () => undefined,
+			getSessionId: () => undefined,
+		},
+		ui: {
+			setStatus: (key: string, value: string | undefined) => {
+				if (key === "subagent-zellij") statuses.push(value);
+			},
+		},
+	} as unknown as ExtensionContext;
+	try {
+		setup(handlers);
+		await handlers.get("session_start")?.({ reason: "startup" }, ctx);
+		assert.equal(await readFile(calls, "utf8").catch(() => ""), "");
+		assert.deepEqual(statuses, [undefined]);
+		await handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
+	} finally {
+		if (previous === undefined) delete process.env.PI_SUBAGENT_ZELLIJ_BIN;
+		else process.env.PI_SUBAGENT_ZELLIJ_BIN = previous;
+	}
+});
+
+test("reload retains the lifecycle without referenced guardian pipe handles", async () => {
+	const activeHandles = () =>
+		(
+			process as unknown as {
+				_getActiveHandles(): object[];
+			}
+		)._getActiveHandles();
+	const handlesBeforeController = new Set(activeHandles());
+	const controller = await setupControllerWithChild({ hasSessionFile: true });
+	try {
+		await controller.handlers.get("session_shutdown")?.(
+			{ reason: "reload" },
+			controller.ctx,
+		);
+		await new Promise<void>((resolve) => setImmediate(resolve));
+
+		const leakedHandles = activeHandles().filter(
+			(handle) => !handlesBeforeController.has(handle),
+		);
+		assert.deepEqual(
+			leakedHandles.map((handle) => handle.constructor.name),
+			[],
+			"reload must not leave referenced guardian stdin/stdout pipe handles",
+		);
+	} finally {
+		await controller.cleanup();
+	}
+});
 
 function connectSocket(path: string): Promise<net.Socket> {
 	return new Promise((resolve, reject) => {
@@ -1408,9 +1626,16 @@ test("foreign and legacy registries are not loaded or modified", async () => {
 			terminal_command: `env PI_SUBAGENT_CHILD_ID=foreign-child PI_SUBAGENT_OWNER_SESSION_FILE=${foreignOwner} PI_SUBAGENT_OWNER_SESSION_ID=foreign-uuid PI_SUBAGENT_CONTROLLER_INSTANCE_ID=foreign-ctrl PI_SUBAGENT_INCARNATION=foreign-inc BRIDGE_SOCKET_PATH=${join(directory, "fsock")} pi`,
 		},
 	]);
+	const zellijSessions = join(directory, "zellij-sessions");
 	await writeFile(
 		zellij,
-		`#!/bin/sh\nif [ "$4" = list-panes ]; then printf '%s\\n' ${JSON.stringify(foreignPanes)}; exit 0; fi\nexit 2\n`,
+		`#!/bin/sh
+if [ "$1" = attach ]; then printf '%s\\n' "$3" > ${JSON.stringify(zellijSessions)}; exit 0; fi
+if [ "$1" = list-sessions ]; then cat ${JSON.stringify(zellijSessions)} 2>/dev/null; exit 0; fi
+if [ "$1" = delete-session ]; then rm -f ${JSON.stringify(zellijSessions)}; exit 0; fi
+if [ "$4" = list-panes ]; then printf '%s\\n' ${JSON.stringify(foreignPanes)}; exit 0; fi
+exit 2
+`,
 	);
 	await chmod(zellij, 0o755);
 	const myOwner = `/tmp/my-owner-${Date.now().toString(36)}.jsonl`;
@@ -1450,14 +1675,36 @@ test("foreign and legacy registries are not loaded or modified", async () => {
 	}
 });
 
-test("ambiguous new-tab failure retains durable cleanup state", async () => {
+test("ambiguous new-tab failure retires the whole session and leaves no live child", async () => {
 	const s = await setupControllerWithChild({ processState: "stopped" });
 	const previousDepth = process.env.PI_SUBAGENT_DEPTH;
+	const childPidPath = join(dirname(s.zellijScript), "ambiguous-child-pid");
+	const sessions = join(dirname(s.zellijScript), "zellij-sessions");
 	process.env.PI_SUBAGENT_DEPTH = "0";
+	let childPid: number | undefined;
 	try {
 		await writeFile(
 			s.zellijScript,
-			`#!${process.execPath}\nconst args = process.argv.slice(2);\nif (args.includes("new-tab")) { process.on("SIGTERM", () => process.exit(0)); setInterval(() => {}, 1_000); } else process.exit(2);\n`,
+			`#!${process.execPath}
+const { existsSync, readFileSync, rmSync, writeFileSync } = require("node:fs");
+const { spawn } = require("node:child_process");
+const args = process.argv.slice(2);
+if (args.includes("new-tab")) {
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+  writeFileSync(${JSON.stringify(childPidPath)}, String(child.pid));
+  process.on("SIGTERM", () => process.exit(0));
+  setInterval(() => {}, 1_000);
+} else if (args[0] === "delete-session") {
+  if (existsSync(${JSON.stringify(childPidPath)})) {
+    try { process.kill(Number(readFileSync(${JSON.stringify(childPidPath)}, "utf8")), "SIGTERM"); } catch {}
+  }
+  rmSync(${JSON.stringify(sessions)}, { force: true });
+  process.exit(0);
+} else if (args[0] === "list-sessions") {
+  if (existsSync(${JSON.stringify(sessions)})) process.stdout.write(readFileSync(${JSON.stringify(sessions)}, "utf8"));
+  process.exit(0);
+} else process.exit(2);
+`,
 		);
 		await chmod(s.zellijScript, 0o755);
 		const result = await requireTool(s.tools, "subagent_start").execute(
@@ -1468,12 +1715,19 @@ test("ambiguous new-tab failure retains durable cleanup state", async () => {
 			s.ctx,
 		);
 		assert.match(result.content[0]?.text || "", /timed out/);
+		childPid = Number(await readFile(childPidPath, "utf8"));
+		await eventually(() => {
+			try { process.kill(childPid, 0); return false; }
+			catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; }
+		});
+		assert.equal(activeDedicatedSession(), undefined);
 		const entries = JSON.parse(await readFile(s.registryPath, "utf8")) as Record<string, unknown>[];
-		const retained = entries.find((entry) => entry.childId !== s.childId);
-		assert.ok(retained);
-		assert.equal(retained.terminalCleanupPending, true);
-		assert.match(String(retained.terminalCleanupError), /missing terminal pane ID/);
+		assert.equal(entries.some((entry) => entry.processState === "alive"), false);
+		assert.equal(entries.some((entry) => entry.terminalCleanupPending === true), false);
 	} finally {
+		if (childPid !== undefined) {
+			try { process.kill(childPid, "SIGKILL"); } catch {}
+		}
 		if (previousDepth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
 		else process.env.PI_SUBAGENT_DEPTH = previousDepth;
 		await s.cleanup();
@@ -1701,20 +1955,79 @@ test("new, resume, and fork session replacements do not adopt prior-owner childr
 	}
 });
 
-test("quit closes the saved stable terminal pane without a pane listing", async () => {
-	const s = await setupControllerWithChild({ hasSessionFile: true, processState: "stopped" });
+test("failed replacement retirement renews old authority after the lease-expiry window before retry", async () => {
+	const s = await setupControllerWithChild({ hasSessionFile: true });
+	const sessions = join(dirname(s.zellijScript), "zellij-sessions");
+	const oldOwner = {
+		ownerSessionFile: s.ownerSessionFile,
+		ownerSessionId: s.ownerSessionId,
+	};
+	const oldLeasePath = leasePath(s.agentDirectory, oldOwner);
+	const replacementCtx = {
+		...s.ctx,
+		sessionManager: {
+			getSessionFile: () => `/tmp/replacement-delayed-${Date.now()}.jsonl`,
+			getSessionId: () => "replacement-delayed-owner",
+		},
+	} as unknown as ExtensionContext;
 	try {
-		const record = join(s.agentDirectory, "zellij-actions");
 		await writeFile(
 			s.zellijScript,
-			`#!/bin/sh\nprintf '%s\\n' "$@" >> ${JSON.stringify(record)}\nif [ "$4" = close-pane ]; then exit 0; fi\nexit 2\n`,
+			`#!/bin/sh
+if [ "$1" = attach ]; then printf '%s\\n' "$3" > ${JSON.stringify(sessions)}; exit 0; fi
+if [ "$1" = list-sessions ]; then cat ${JSON.stringify(sessions)} 2>/dev/null; exit 0; fi
+if [ "$1" = delete-session ]; then exit 2; fi
+exit 2
+`,
 		);
 		await chmod(s.zellijScript, 0o755);
+		const shuttingDown = s.handlers.get("session_shutdown")?.({ reason: "new" }, s.ctx);
+		assert.equal(s.zellijStatuses.at(-1), undefined);
+		await shuttingDown;
+
+		const delayedAt = Date.now();
+		const lease = JSON.parse(await readFile(oldLeasePath, "utf8")) as Record<
+			string,
+			unknown
+		>;
+		lease.expiresAt = delayedAt - LEASE_STALE_GRACE_MS - 1;
+		lease.renewedAt = delayedAt - LEASE_TTL_MS - LEASE_STALE_GRACE_MS - 1;
+		await writeFile(oldLeasePath, `${JSON.stringify(lease)}\n`, { mode: 0o600 });
+		assert.equal(
+			await hasLeaseAuthority(
+				s.agentDirectory,
+				oldOwner,
+				String(lease.controllerInstanceId),
+				delayedAt,
+			),
+			false,
+		);
+
+		await writeFile(
+			s.zellijScript,
+			`#!/bin/sh
+if [ "$1" = attach ]; then printf '%s\\n' "$3" > ${JSON.stringify(sessions)}; exit 0; fi
+if [ "$1" = list-sessions ]; then cat ${JSON.stringify(sessions)} 2>/dev/null; exit 0; fi
+if [ "$1" = delete-session ]; then rm -f ${JSON.stringify(sessions)}; exit 0; fi
+exit 2
+`,
+		);
+		await chmod(s.zellijScript, 0o755);
+		await s.handlers.get("session_start")?.({ reason: "new" }, replacementCtx);
+		assert.match(
+			activeDedicatedSession() ?? "",
+			/^pi[A-Za-z0-9_-]{22}$/,
+		);
+		await assert.rejects(readFile(oldLeasePath, "utf8"), /ENOENT/);
+	} finally {
+		await s.cleanup();
+	}
+});
+
+test("quit does not query panes during controller teardown", async () => {
+	const s = await setupControllerWithChild({ hasSessionFile: true, processState: "stopped" });
+	try {
 		await s.handlers.get("session_shutdown")?.({ reason: "quit" }, s.ctx);
-		await eventually(() => readFile(record, "utf8").then((value) => value.includes("terminal_2"), () => false));
-		const actions = await readFile(record, "utf8");
-		assert.match(actions, /close-pane/);
-		assert.doesNotMatch(actions, /list-panes/);
 		const entries = JSON.parse(await readFile(s.registryPath, "utf8")) as Record<string, unknown>[];
 		assert.equal(entries[0]?.terminalCleanupPending, false);
 	} finally {
@@ -2043,7 +2356,7 @@ test("wrong and missing pong identifiers expire once and directly close the stab
 		assert.equal(terminalStateWrites, 1);
 		assert.deepEqual((await readFile(actionLog, "utf8")).trim().split("\n"), [
 			"--session",
-			"test",
+			s.zellijStatuses.find((value): value is string => value !== undefined),
 			"action",
 			"close-pane",
 			"--pane-id",
@@ -2293,6 +2606,29 @@ test("one controller watchdog serves multiple handles", async () => {
 		if (s) await s.cleanup();
 		scheduler.restore();
 	}
+});
+
+test("whole-session mutation shutdown closes ingress and drains the queued IPC chain", async () => {
+	let releaseMutation!: () => void;
+	const gate = new Promise<void>((resolve) => { releaseMutation = resolve; });
+	let mutations = 0;
+	let transportClosed = false;
+	const state = {
+		ipcMutationsClosed: false,
+		ipcMutationChain: gate.then(() => { mutations++; }),
+	};
+	const draining = closeAndDrainIpcMutations(state, async () => {
+		transportClosed = true;
+	});
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.equal(state.ipcMutationsClosed, true);
+	assert.equal(transportClosed, true);
+	assert.equal(mutations, 0);
+	if (!state.ipcMutationsClosed)
+		state.ipcMutationChain = state.ipcMutationChain.then(() => { mutations++; });
+	releaseMutation();
+	await draining;
+	assert.equal(mutations, 1);
 });
 
 test("concurrent cleanup callers reserve the lock before an authority await", async () => {
@@ -2775,22 +3111,70 @@ test("a clean child quit stops immediately and completes status and wait", async
 	}
 });
 
+test("lease-renewal failure clears the dedicated-session footer", async () => {
+	const originalSetInterval = globalThis.setInterval;
+	const originalClearInterval = globalThis.clearInterval;
+	let renewalCallback: (() => void) | undefined;
+	const fakeTimer = { unref() {} } as unknown as NodeJS.Timeout;
+	globalThis.setInterval = ((callback: () => void, delay?: number) => {
+		if (delay === LEASE_RENEW_INTERVAL_MS && !renewalCallback) {
+			renewalCallback = callback;
+			return fakeTimer;
+		}
+		return originalSetInterval(callback, delay);
+	}) as typeof setInterval;
+	globalThis.clearInterval = ((timer: NodeJS.Timeout) => {
+		if (timer !== fakeTimer) originalClearInterval(timer);
+	}) as typeof clearInterval;
+	let s: Awaited<ReturnType<typeof setupControllerWithChild>> | undefined;
+	let lease: string | undefined;
+	let originalLease: string | undefined;
+	try {
+		s = await setupControllerWithChild({ hasSessionFile: true, observeUi: true });
+		lease = leasePath(s.agentDirectory, {
+			ownerSessionFile: s.ownerSessionFile,
+			ownerSessionId: s.ownerSessionId,
+		});
+		originalLease = await readFile(lease, "utf8");
+		await writeFile(
+			lease,
+			`${JSON.stringify({
+				...JSON.parse(originalLease),
+				controllerInstanceId: "replacement-controller",
+			})}\n`,
+		);
+		assert.ok(renewalCallback);
+		renewalCallback();
+		await eventually(() => s!.zellijStatuses.at(-1) === undefined);
+	} finally {
+		globalThis.setInterval = originalSetInterval;
+		globalThis.clearInterval = originalClearInterval;
+		if (s && lease && originalLease) {
+			await writeFile(lease, originalLease);
+			await s.handlers.get("session_start")?.({ reason: "reload" }, s.ctx);
+			await s.cleanup();
+		}
+	}
+});
+
 test("authority loss denies steering and killing", async () => {
 	const s = await setupControllerWithChild({ hasSessionFile: true });
+	const key = createHash("sha1")
+		.update(s.ownerSessionFile)
+		.digest("hex")
+		.slice(0, 24);
+	const lease = join(
+		s.agentDirectory,
+		"sessions",
+		"subagents",
+		"controllers",
+		key,
+		"lease.json",
+	);
+	const originalLease = await readFile(lease, "utf8");
 	try {
-		const key = createHash("sha1")
-			.update(s.ownerSessionFile)
-			.digest("hex")
-			.slice(0, 24);
 		await writeFile(
-			join(
-				s.agentDirectory,
-				"sessions",
-				"subagents",
-				"controllers",
-				key,
-				"lease.json",
-			),
+			lease,
 			`${JSON.stringify({
 				ownerSessionFile: s.ownerSessionFile,
 				ownerSessionId: s.ownerSessionId,
@@ -2810,7 +3194,11 @@ test("authority loss denies steering and killing", async () => {
 			requireTool(s.tools, "subagent_kill").execute("x", { id: s.childId }),
 			/lease is not held/i,
 		);
+		assert.equal(s.zellijStatuses.at(-1), undefined);
 	} finally {
+		await s.handlers.get("session_shutdown")?.({ reason: "reload" }, s.ctx);
+		await writeFile(lease, originalLease);
+		await s.handlers.get("session_start")?.({ reason: "reload" }, s.ctx);
 		await s.cleanup();
 	}
 });

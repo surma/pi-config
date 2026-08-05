@@ -4,19 +4,29 @@ This extension gives a parent Pi persistent, visible child Pi sessions inside Ze
 
 ## Requirements
 
-Zellij must be available. Inside Zellij, the extension resolves the current session from the parent pane identity.
+Zellij must be available. The extension creates one dedicated Zellij session for each persisted parent Pi session.
 
-Outside Zellij, the extension uses an explicit `ZELLIJ_SESSION_NAME` target or creates a managed detached session.
+The session name is `pi` plus a 22-character base64url encoding of 128 random bits. Its exact length is 24 characters. This compact name fits the default macOS Zellij socket path limit. The extension never routes a child through the parent Zellij session.
 
-The detached server persists independently. Its startup client gets one second to exit, then receives bounded termination signals.
+The lifecycle persists an `arming`, `active`, or `cleanup_pending` record in `managed-session.json` before it makes destructive changes. The strict schema accepts only known keys, a 32-lowercase-hex generation, the exact owner-derived prefix truncated to 24 alphanumeric characters, a 32-lowercase-hex random suffix, and a nonnegative finite integer timestamp. Empty, malformed, overlong-prefix, wrong-owner-prefix, and extra-field records fail closed. It creates the exact name with `zellij attach --create-background <name>`.
 
-The validated runtime versions are Zellij 0.44.3 and Pi 0.82.0. Revalidate lifecycle behavior and action flags after an upgrade.
+A plain Node guardian owns an EOF cleanup fence. Startup accepts only an exact 32-lowercase-hex generation and an independent 64-lowercase-hex capability. Its `ready` frame carries both values, and the manager requires both exact matches before session creation. On unexpected parent EOF, it retries `zellij delete-session --force <exact-name>` and proves absence with `zellij list-sessions --short --no-formatting`. Zellij 0.44.3 reports an empty session list with code 1 and the canonical `No active zellij sessions found.` error. The manager and guardian treat only that exact nonzero result as an empty list. Normal retirement sends the same exact generation and capability, waits for the matching acknowledgement, closes the control pipe, and reaps the guardian. A bad or missing acknowledgement escalates through pipe close, process-group `SIGTERM`, and process-group `SIGKILL`, always awaiting the guardian close and fencing descendant cleanup clients. The fallback cannot leave a hung Zellij client orphaned after the guardian leader exits.
+
+The process-global production manager is an immutable dependency-wired instance using real persistence, guardian spawning, and deadlines; tests create separate injected managers and cannot mutate production dependencies. It serializes provisioning, guardian exit, explicit retirement, recovery, and retry. It permits one active lifecycle and zero or more retiring lifecycles. Any unresolved retirement blocks every Zellij action and all new provisioning. Startup failure after the arming write enters the same exact deletion, child settlement, guardian-reap, and record-removal path.
+
+Every parent-side deletion requires a successfully persisted `cleanup_pending` record, a fresh exact comparison of owner file, owner ID, generation, name, timestamp, and state, plus current lease authority for the retiring owner immediately before deletion. Record creation, identity-checked state/error updates, and compare-remove all share the same owner-record lock. After child settlement and guardian reap, the manager rechecks the retiring owner's exact lease authority; compare-remove then holds the record lock across its final reload, comparison, and unlink. A successor generation is neither overwritten, targeted, nor unlinked.
+
+Each bounded Zellij client waits for its child process to close after TERM and KILL escalation. A timeout means that command completion is uncertain.
+
+In every persisted Pi mode—TUI, RPC, JSON, and print—the dedicated session is provisioned and retained for the owner lifecycle. TUI displays its exact name in the standard footer; guardian loss or lifecycle blockage clears it. `--no-session`, or any context without both a persisted session file and session ID, creates no lifecycle, guardian, or Zellij client.
+
+The validated runtime versions are Zellij 0.44.3 and Pi 0.83.0. Revalidate lifecycle behavior and action flags after an upgrade.
 
 ## Child launch
 
-`subagent_start` opens a tab in the current Zellij session. The tab runs a normal interactive Pi TUI.
+`subagent_start` opens a tab in the dedicated Zellij session. The tab runs a normal interactive Pi TUI.
 
-The extension resolves the current session from the parent pane identity and caches that successful resolution. It invalidates the cache after a missing-session action failure. Every action passes the resolved session through Zellij's explicit `--session` option. This prevents an old `ZELLIJ_SESSION_NAME` from redirecting actions after a session rename. An ambiguous parent pane fails closed.
+Every Zellij action passes the durable exact session name through `--session`. The extension does not inspect the parent pane or trust `ZELLIJ_SESSION_NAME`.
 
 The extension uses `devx pi` when an executable `devx` exists. Otherwise, it uses the current Pi executable.
 
@@ -46,11 +56,11 @@ Canonicalization resolves the nearest existing ancestor. Owner identity stays st
 
 The lease expires after 30 seconds. Another controller can reclaim it only after an additional 5-second grace period.
 
-The lease records a PID for diagnostics only. The extension never uses PID state as takeover authority.
+The lease records a PID for diagnostics only. The extension never uses PID state as takeover authority. Retained maintenance requires the exact lease file and exact owner/controller identity to remain present; it can extend that existing record after expiry but never recreates an absent lease.
 
-A non-holder does not load children, bind sockets, poll panes, write the owner registry, or perform destructive actions.
+A non-holder does not load children, bind sockets, poll panes, write the owner registry, or perform destructive parent actions. Failed replacement retirement and unresolved startup cleanup retain the exact old lease in a process-global authority manager that survives `/reload` and renews every unresolved retiring-owner lease independently of the current owner. Safe maintenance can extend the same controller's existing authority after its ordinary expiry window, but never recreates a missing lease or overwrites a lease elected for another controller. Later establishment first requires authority for every retained retirement, finishes old cleanup before provisioning, and releases each old lease only after compare-and-remove has removed its managed-session record. Missing or stolen old authority blocks the new owner. Final process quit stops retained renewal and releases those leases so guardian EOF semantics can take over.
 
-A replacement holder can recover live children for the same owner. It preserves each pane's original launch-controller marker during validation.
+A same-process `/reload` can reattach live children for the same owner because it preserves the active dedicated session and each pane's original launch-controller marker. A fresh process treats any durable managed-session record as cleanup work rather than adopting live panes.
 
 ## Storage
 
@@ -60,6 +70,7 @@ The extension derives `owner-key` from the canonical parent session file.
 <agent-dir>/sessions/subagents/controllers/<owner-key>/
   lease.json
   registry.json
+  managed-session.json
   children/<child-id>/<incarnation>/bridge.sock
 ```
 
@@ -120,7 +131,7 @@ Each child handle serializes its IPC mutations. This queue preserves wire order 
 
 A new connection cannot change its identity after `hello`. Delayed frames from an old incarnation cannot mutate a resumed child.
 
-Pane markers contain the full identity and socket path. Launch-time discovery validates the tab, pane, command, and markers. Later interaction and cleanup target the saved stable terminal pane directly without a pane snapshot.
+Pane markers contain the full identity and socket path. Launch-time discovery validates the tab, pane, command, and markers. Later interaction and cleanup target the saved stable terminal pane directly without a pane snapshot. If `new-tab` completion or launch-time pane discovery is ambiguous, targeted cleanup is not accepted without a pane ID: the manager retires the whole dedicated session and proves it absent, or remains blocked in durable cleanup. Whole-session settlement first closes IPC ingress and drains each handle's serialized mutation chain and persistence before writing the final registry, so no queued frame can mutate or persist after settlement.
 
 ## Results and waits
 
@@ -208,7 +219,7 @@ The registry persists pending cleanup intent before the first close action. A fa
 
 Queued registry writes capture their state when requested. An earlier write cannot duplicate a later terminal-state snapshot.
 
-A replacement controller retries pending cleanup without pane discovery.
+A same-process `/reload` controller retries pending pane cleanup without pane discovery. A fresh process instead retires the recorded whole dedicated session before provisioning.
 
 Heartbeats do not update user activity, write the registry, or refresh the UI. Status and wait return controller state without Zellij queries.
 
@@ -220,14 +231,19 @@ The extension treats parent lifecycle events as follows:
 
 | Event | Behavior |
 | --- | --- |
-| `/reload` | The same process keeps its controller ID and lease, then reattaches live children. |
-| `/new` | The new owner does not adopt the prior owner's children. |
-| `/resume` | The new owner does not adopt the prior owner's children. |
-| `/fork` or `/clone` | The new owner does not adopt the prior owner's children. |
-| Normal quit | The controller directly closes each owned stable terminal pane. |
-| Hard parent crash | The lease expires, then a same-owner controller restores IPC grace and pending cleanup. |
+| `/reload` | The same process preserves the lifecycle object, exact session, guardian object/control pipes, controller ID, lease, and child processes. The replacement extension restores the same footer and reattaches IPC. |
+| `/new` | Delete the prior owner's entire dedicated session, settle and persist its registry, reap its guardian, remove its ownership record, then allow the new owner to provision. |
+| `/resume` | Apply the same whole-session retirement before the resumed owner provisions. |
+| `/fork` or `/clone` | Apply the same whole-session retirement before the forked owner provisions. |
+| Normal quit | Delete the entire dedicated session, settle and persist every tracked child, reap the guardian, then remove `managed-session.json` and release the lease. |
+| Unexpected guardian death | Immediately clear the footer and block actions, persist `cleanup_pending`, delete and verify the exact session, settle the registry, reap the guardian, and remove the record. An unresolved step remains retryable and blocks provisioning. |
+| Abrupt Pi-parent failure, including `SIGKILL` | One abrupt Pi-parent process failure is covered by guardian control-pipe EOF when the guardian, host and pipe semantics, Zellij server, and configured executables remain operational. |
 
-A settled child remains alive and interactive. Settlement never calls `ctx.shutdown()`.
+The registry is settled durably before the managed ownership record disappears. A later establish attempt first retries every pending retirement and creates nothing until all retries succeed.
+
+The abrupt-failure guarantee covers only one failed Pi parent process. Simultaneous Pi-parent and guardian failure, host or power failure, and persistently broken Zellij are not guaranteed. A later controller performs best-effort durable recovery from `arming`, `active`, or `cleanup_pending`; this is recovery, not a guarantee that cleanup happened at crash time.
+
+A settled child remains alive and interactive during the active parent lifecycle. Settlement never calls `ctx.shutdown()`.
 
 ## Tools
 
@@ -276,7 +292,7 @@ The extension uses separate authorities for separate facts.
 Run the deterministic suite from this directory:
 
 ```sh
-PI_TEST_PACKAGE_DIR=/path/to/pi-0.82.0 ./test.sh
+PI_TEST_PACKAGE_DIR=/path/to/pi-0.83.0 ./test.sh
 ```
 
 The suite covers per-run results, settlement notifications, waits, owner isolation, lease races, strict IPC fences, reconnect state, stable pane cleanup, action bounds, resume, lifecycle, liveness, and UI behavior.
@@ -290,6 +306,7 @@ A non-TTY process cannot host this interactive gate because Zellij requires term
 ## Residual risks
 
 - Pi lifecycle and Zellij action behavior remain version-specific.
-- A hard crash can bypass shutdown callbacks. Lease expiry restores IPC grace and durable cleanup intent.
-- A Zellij action timeout leaves its result uncertain. Only idempotent pane closure retries.
+- Simultaneous parent-and-guardian failure, host or power loss, broken pipe semantics, an unavailable guardian executable, and persistently broken Zellij are outside the abrupt-parent cleanup guarantee.
+- Durable records permit later best-effort recovery, but cannot guarantee immediate cleanup under those failures.
+- A Zellij action timeout leaves its result uncertain. Exact whole-session deletion and direct pane closure are retried only through their idempotent lifecycle paths.
 - IPC assumes same-user local trust. Multi-user control requires authentication and a different protocol.

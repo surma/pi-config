@@ -13,9 +13,9 @@ tmp="$(mktemp -d)"
 cleanup() { rm -rf "$tmp"; }
 trap cleanup EXIT
 
-sources=(child.ts dispatch-event.ts index.ts ipc.ts ipc-child.ts lifecycle.ts liveness.ts live-state.ts owner.ts registry.ts result-store.ts settlement-notifications.ts ui.ts zellij.ts)
-tests=(guard.test.ts ipc.test.ts ipc-child.test.ts child-bridge.test.ts lifecycle.test.ts liveness.test.ts live-state.test.ts dispatch-event.test.ts launch.test.ts owner.test.ts registry.test.ts result-store.test.ts settlement-notifications.test.ts tools.test.ts ui.test.ts)
-cp "${sources[@]/#/$script_dir/}" "${tests[@]/#/$script_dir/}" "$tmp"/
+sources=(child.ts dispatch-event.ts index.ts ipc.ts ipc-child.ts lifecycle.ts liveness.ts live-state.ts owner.ts registry.ts result-store.ts settlement-notifications.ts ui.ts zellij.ts managed-session.ts retained-cleanup-leases.ts zellij-manager.ts)
+tests=(guard.test.ts ipc.test.ts ipc-child.test.ts child-bridge.test.ts lifecycle.test.ts liveness.test.ts live-state.test.ts dispatch-event.test.ts launch.test.ts owner.test.ts registry.test.ts result-store.test.ts settlement-notifications.test.ts tools.test.ts ui.test.ts managed-session.test.ts retained-cleanup-leases.test.ts zellij-guardian.test.ts zellij-manager.test.ts)
+cp "${sources[@]/#/$script_dir/}" "${tests[@]/#/$script_dir/}" "$script_dir/zellij-guardian.mjs" "$tmp"/
 for source in "${sources[@]}"; do ln -s "$source" "$tmp/${source%.ts}.js"; done
 mkdir -p "$tmp/node_modules/@mariozechner" "$tmp/node_modules/@sinclair"
 ln -s "$package_dir" "$tmp/node_modules/@mariozechner/pi-coding-agent"
@@ -24,4 +24,4 @@ ln -s "$package_dir/node_modules/@earendil-works" "$tmp/node_modules/@earendil-w
 ln -s "$package_dir/node_modules/typebox" "$tmp/node_modules/@sinclair/typebox"
 
 env -u ZELLIJ -u ZELLIJ_PANE_ID -u ZELLIJ_SESSION_NAME \
-	node --experimental-transform-types --test "${tests[@]/#/$tmp/}"
+	node --experimental-transform-types --test "$@" "${tests[@]/#/$tmp/}"

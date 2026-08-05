@@ -22,6 +22,7 @@ import {
 	LEASE_TTL_MS,
 	type LeaseRecord,
 	leasePath,
+	maintainLeaseAuthority,
 	ownerKey,
 	ownerRegistryPath,
 	releaseLease,
@@ -182,6 +183,51 @@ test("renewLease on an absent file returns false", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-owner-lease-"));
 	const renewed = await renewLease(dir, owner, "controller-a", 1_000);
 	assert.equal(renewed, false);
+});
+
+test("retained authority maintenance fails closed when the exact lease is absent", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-owner-lease-"));
+	assert.equal(
+		await maintainLeaseAuthority(dir, owner, "controller-a", 1_000),
+		false,
+	);
+	await assert.rejects(stat(leasePath(dir, owner)));
+});
+
+test("retained authority can be safely maintained after its normal expiry window", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-owner-lease-"));
+	const t0 = 1_000_000;
+	const first = await acquireLease(dir, owner, "controller-a", t0);
+	if (!first.held) return assert.fail("first acquire failed");
+	const delayedAt = first.lease.expiresAt + LEASE_STALE_GRACE_MS + 1;
+	assert.equal(await hasLeaseAuthority(dir, owner, "controller-a", delayedAt), false);
+	assert.equal(
+		await maintainLeaseAuthority(dir, owner, "controller-a", delayedAt),
+		true,
+	);
+	assert.equal(await hasLeaseAuthority(dir, owner, "controller-a", delayedAt), true);
+});
+
+test("retained maintenance racing stale takeover never overwrites the elected holder", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-owner-lease-"));
+	const t0 = 1_000_000;
+	const first = await acquireLease(dir, owner, "controller-a", t0);
+	if (!first.held) return assert.fail("first acquire failed");
+	const reclaimAt = first.lease.expiresAt + LEASE_STALE_GRACE_MS + 1;
+	const [reclaimed, maintained] = await Promise.all([
+		acquireLease(dir, owner, "controller-b", reclaimAt),
+		maintainLeaseAuthority(dir, owner, "controller-a", reclaimAt),
+	]);
+	const onDisk = JSON.parse(
+		await readFile(leasePath(dir, owner), "utf8"),
+	) as LeaseRecord;
+	if (maintained) {
+		assert.equal(reclaimed.conflict, true);
+		assert.equal(onDisk.controllerInstanceId, "controller-a");
+	} else {
+		assert.equal(reclaimed.held, true);
+		assert.equal(onDisk.controllerInstanceId, "controller-b");
+	}
 });
 
 test("releaseLease deletes only when the holder matches", async () => {

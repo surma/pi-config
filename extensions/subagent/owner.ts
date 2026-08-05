@@ -75,6 +75,14 @@ export function ownerRegistryPath(
 	return join(controllerDir(agentDir, owner), "registry.json");
 }
 
+/** The durable owner-scoped record for the dedicated Zellij session. */
+export function managedSessionPath(
+	agentDir: string,
+	owner: OwnerIdentity,
+): string {
+	return join(controllerDir(agentDir, owner), "managed-session.json");
+}
+
 export function incarnationSocketDir(
 	agentDir: string,
 	owner: OwnerIdentity,
@@ -216,6 +224,35 @@ export async function renewLease(
 			existing.ownerSessionId !== owner.ownerSessionId ||
 			existing.controllerInstanceId !== controllerInstanceId ||
 			now > existing.expiresAt
+		)
+			return false;
+		await writeLeaseAtomic(path, {
+			...existing,
+			expiresAt: now + LEASE_TTL_MS,
+			renewedAt: now,
+		});
+		return true;
+	});
+}
+
+/**
+ * Extends retained same-process cleanup authority even after its ordinary
+ * expiry, but never overwrites a lease elected for another controller.
+ */
+export async function maintainLeaseAuthority(
+	agentDir: string,
+	owner: OwnerIdentity,
+	controllerInstanceId: string,
+	now: number,
+): Promise<boolean> {
+	const path = leasePath(agentDir, owner);
+	return withLeaseLock(path, async () => {
+		const existing = await readLease(path);
+		if (
+			!existing ||
+			existing.ownerSessionFile !== owner.ownerSessionFile ||
+			existing.ownerSessionId !== owner.ownerSessionId ||
+			existing.controllerInstanceId !== controllerInstanceId
 		)
 			return false;
 		await writeLeaseAtomic(path, {

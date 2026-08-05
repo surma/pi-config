@@ -56,6 +56,14 @@ import {
 	saveRegistry,
 } from "./registry.js";
 import {
+	ensureRetainedCleanupLeaseAuthority,
+	releaseRetainedCleanupLeasesForQuit,
+	resolveRetainedCleanupLeases,
+	retainCleanupLease,
+	retainedCleanupLeaseExists,
+	type RetainedCleanupLease,
+} from "./retained-cleanup-leases.js";
+import {
 	persistRunResult,
 	readRunResult,
 	type SettledRunOutcome,
@@ -71,15 +79,20 @@ import {
 	sanitizeTerminalText,
 } from "./ui.js";
 import {
-	cleanupManagedSession,
 	closePaneInSession,
-	discoverPaneId,
-	ensureZellij,
-	invalidateSessionCache,
-	newTab,
+	discoverPaneIdInSession,
+	newTabInSession,
 	sendKeysInSession,
 	type SubagentPaneIdentity,
 } from "./zellij.js";
+import {
+	assertDedicatedActionsAllowed,
+	establishDedicatedLifecycle,
+	hasPendingDedicatedRetirement,
+	preserveDedicatedLifecycleForReload,
+	retireDedicatedLifecycle,
+	type DedicatedLifecycle,
+} from "./zellij-manager.js";
 import {
 	CLEANUP_RETRY_DELAYS_MS,
 	heartbeatExpired,
@@ -158,6 +171,15 @@ export async function withTerminalCleanupLock(
 	}
 }
 
+export async function closeAndDrainIpcMutations(
+	state: { ipcMutationsClosed: boolean; ipcMutationChain: Promise<void> },
+	closeTransport: () => Promise<void>,
+): Promise<void> {
+	state.ipcMutationsClosed = true;
+	await closeTransport();
+	await state.ipcMutationChain;
+}
+
 interface SubagentHandle extends SubagentDispatchHandle {
 	id: string;
 	name?: string;
@@ -206,6 +228,7 @@ interface SubagentHandle extends SubagentDispatchHandle {
 	waiters: Set<() => void>;
 	terminationPromise?: Promise<SubagentHandle>;
 	ipcMutationChain: Promise<void>;
+	ipcMutationsClosed: boolean;
 	ownerSessionFile: string;
 	ownerSessionId: string;
 	controllerInstanceId: string;
@@ -344,6 +367,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	let watchdogSweepActive = false;
 	let lastWatchdogSweepAt = monotonicNow();
 	let sessionShuttingDown = false;
+	let dedicatedLifecycle: DedicatedLifecycle | undefined;
 	let settlementNotificationEpoch = 0;
 	const settlementNotifications = new SettlementNotificationQueue(
 		(message, options) => pi.sendMessage(message, options),
@@ -378,6 +402,21 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		incarnation: handle.incarnation,
 	});
 	const requireLease = (): boolean => leaseHeld && owner !== null;
+	const requiredDedicatedSession = (): string => assertDedicatedActionsAllowed();
+	const requireHandleDedicatedSession = (handle: SubagentHandle): string => {
+		const activeSession = requiredDedicatedSession();
+		if (handle.zellijSessionName !== activeSession)
+			throw new Error(
+				`Subagent #${handle.id} does not belong to the active dedicated Zellij session.`,
+			);
+		return activeSession;
+	};
+	const setDedicatedSessionStatus = (
+		ctx: ExtensionContext | null,
+		sessionName: string | undefined,
+	): void => {
+		ctx?.ui?.setStatus("subagent-zellij", sessionName);
+	};
 	async function requireCurrentAuthority(): Promise<boolean> {
 		if (!leaseHeld || !owner || !controllerInstanceId) return false;
 		const authoritative = await hasLeaseAuthority(
@@ -390,6 +429,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			leaseHeld = false;
 			suppressAllSettlementNotifications();
 			stopTimers();
+			setDedicatedSessionStatus(latestCtx, undefined);
 			refreshUi();
 		}
 		return authoritative;
@@ -402,8 +442,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	const notifyWaiters = (handle: SubagentHandle) => {
 		for (const waiter of [...handle.waiters]) waiter();
 	};
-	const registryEntries = (): RegistryEntry[] =>
-		sorted().map((handle) => ({
+	const registryEntry = (handle: SubagentHandle): RegistryEntry => ({
 			childId: handle.id,
 			name: handle.name,
 			task: handle.task,
@@ -431,7 +470,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			controllerInstanceId: handle.controllerInstanceId,
 			incarnation: handle.incarnation,
 			resumedFrom: handle.resumedFrom,
-		}));
+		});
+	const registryEntries = (): RegistryEntry[] => sorted().map(registryEntry);
 	const persist = (): Promise<boolean> => {
 		const persistenceOwner = owner;
 		if (!persistenceOwner || !leaseHeld) return Promise.resolve(false);
@@ -739,6 +779,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			diagnostics: [],
 			waiters: new Set(),
 			ipcMutationChain: Promise.resolve(),
+			ipcMutationsClosed: false,
 			settlementPersistenceChain: Promise.resolve(),
 			reconnecting: entry.detached,
 			lastIpcFrameAt: monotonicNow(),
@@ -981,7 +1022,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 					addDiagnostic(handle, message);
 					return;
 				}
-				await closePaneInSession(handle.zellijSessionName, handle.paneId);
+				await closePaneInSession(requireHandleDedicatedSession(handle), handle.paneId);
 				handle.cleanupRequired = false;
 				handle.terminalCleanup = { status: "complete", attempts: handle.terminalCleanup.attempts };
 			} catch (error) {
@@ -1001,18 +1042,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 						monotonicNow() + CLEANUP_RETRY_DELAYS_MS[handle.terminalCleanup.attempts]!;
 					handle.terminalCleanup.lastError = message;
 					addDiagnostic(handle, `Terminal cleanup retry scheduled: ${message}`);
-					if (/session.*(not found|does not exist)|no such session/i.test(message)) {
-						invalidateSessionCache();
-						try {
-							const resolved = await ensureZellij();
-							const prior = handle.zellijSessionName;
-							for (const candidate of handles.values())
-								if (candidate.zellijSessionName === prior)
-									candidate.zellijSessionName = resolved;
-						} catch (resolveError) {
-							addDiagnostic(handle, `Zellij session re-resolution failed: ${String(resolveError)}`);
-						}
-					}
 				}
 			} finally {
 				if (shouldPersist) await persist();
@@ -1061,6 +1090,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		handle: SubagentHandle,
 		action: () => void | Promise<void>,
 	): Promise<void> {
+		if (handle.ipcMutationsClosed) return handle.ipcMutationChain;
 		handle.ipcMutationChain = handle.ipcMutationChain
 			.then(async () => {
 				if (await requireCurrentAuthority()) await action();
@@ -1286,7 +1316,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		if (!(await requireCurrentAuthority()))
 			throw new Error(leaseConflictMessage());
 		const cursor = handle.lastSettledRunId;
-		await sendKeysInSession(handle.zellijSessionName, paneId, "Esc");
+		await sendKeysInSession(requireHandleDedicatedSession(handle), paneId, "Esc");
 		if (handle.runState === "idle") return true;
 		const settled = await waitFor(
 			[{ handle, cursor }],
@@ -1348,13 +1378,40 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		return handle.terminationPromise;
 	}
 
+	async function retireAfterUncertainChildLaunch(
+		handle: SubagentHandle,
+		error: unknown,
+		removeHandleAfterSettlement: boolean,
+	): Promise<never> {
+		if (!dedicatedLifecycle) throw error;
+		setDedicatedSessionStatus(latestCtx, undefined);
+		const retiringLifecycle = dedicatedLifecycle;
+		try {
+			await retireDedicatedLifecycle(
+				getAgentDir(),
+				retiringLifecycle,
+				() => settleChildrenAfterWholeSessionDeletion(retiringLifecycle.owner),
+			);
+			dedicatedLifecycle = undefined;
+			if (removeHandleAfterSettlement && !handle.cleanupRequired)
+				handles.delete(handle.id);
+			await persist();
+		} catch (cleanupError) {
+			throw new AggregateError(
+				[error, cleanupError],
+				`Child launch was uncertain (${error instanceof Error ? error.message : String(error)}) and whole-session cleanup remains pending.`,
+			);
+		}
+		throw error;
+	}
+
 	async function launch(
 		spec: TaskSpec,
 		cwd: string,
 		requestedModel: string,
 		requestedThinking: ThinkingLevel,
 	): Promise<SubagentHandle> {
-		const zellijSessionName = await ensureZellij();
+		const zellijSessionName = requiredDedicatedSession();
 		if (!(await requireCurrentAuthority()))
 			throw new Error(leaseConflictMessage());
 		const resolvedOwner = owner;
@@ -1402,6 +1459,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		handles.set(id, handle);
 		await attachServer(handle);
 		await persist();
+		let launchPresenceUncertain = false;
 		try {
 			const command = getPiInvocation([
 				"-e",
@@ -1429,7 +1487,9 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				BRIDGE_LOG_PATH: join(sessionDir, "child-events.log"),
 				TERM: "xterm-256color",
 			};
-			const launched = await newTab(
+			launchPresenceUncertain = true;
+			const launched = await newTabInSession(
+				zellijSessionName,
 				spec.name?.trim() || `subagent-${id.slice(0, 8)}`,
 				cwd,
 				command,
@@ -1437,7 +1497,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			);
 			handle.tabId = launched.tabId;
 			handle.zellijSessionName = launched.sessionName;
-			handle.paneId = await discoverPaneId(handle.tabId, paneIdentity(handle));
+			handle.paneId = await discoverPaneIdInSession(zellijSessionName, handle.tabId, paneIdentity(handle));
+			launchPresenceUncertain = false;
 			update(handle);
 			await awaitReady(handle);
 			const before = handle.runSequence;
@@ -1452,6 +1513,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				handle,
 				`Child startup failed: ${error instanceof Error ? error.message : String(error)}`,
 			);
+			if (launchPresenceUncertain)
+				return retireAfterUncertainChildLaunch(handle, error, true);
 			await terminate(handle).catch(() => {});
 			if (!handle.cleanupRequired) handles.delete(id);
 			await persist();
@@ -1467,7 +1530,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			throw new Error(
 				`Subagent #${handle.id} has required terminal cleanup. Resume is blocked until cleanup completes.`,
 			);
-		const zellijSessionName = await ensureZellij();
+		const zellijSessionName = requiredDedicatedSession();
 		if (!(await requireCurrentAuthority()))
 			throw new Error(leaseConflictMessage());
 		const resolvedOwner = owner;
@@ -1520,8 +1583,10 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		handle.deathReason = undefined;
 		handle.terminalCleanup = { status: "none", attempts: 0 };
 		handle.terminalStateDurable = false;
+		handle.ipcMutationsClosed = false;
 		handle.lastIpcFrameAt = monotonicNow();
 		await attachServer(handle);
+		let launchPresenceUncertain = false;
 		try {
 			const command = getPiInvocation([
 				"--session",
@@ -1551,7 +1616,9 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				BRIDGE_LOG_PATH: join(handle.sessionDir, "child-events.log"),
 				TERM: "xterm-256color",
 			};
-			const launched = await newTab(
+			launchPresenceUncertain = true;
+			const launched = await newTabInSession(
+				zellijSessionName,
 				handle.name || `subagent-${handle.id.slice(0, 8)}`,
 				handle.cwd,
 				command,
@@ -1559,7 +1626,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			);
 			handle.tabId = launched.tabId;
 			handle.zellijSessionName = launched.sessionName;
-			handle.paneId = await discoverPaneId(handle.tabId, paneIdentity(handle));
+			handle.paneId = await discoverPaneIdInSession(zellijSessionName, handle.tabId, paneIdentity(handle));
+			launchPresenceUncertain = false;
 			update(handle);
 			await awaitReady(handle);
 			if (task) {
@@ -1576,6 +1644,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				handle,
 				`Child resume failed: ${error instanceof Error ? error.message : String(error)}`,
 			);
+			if (launchPresenceUncertain)
+				return retireAfterUncertainChildLaunch(handle, error, false);
 			await terminate(handle).catch(() => {});
 			throw error;
 		}
@@ -1805,6 +1875,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 					if (!ok) {
 						leaseHeld = false;
 						suppressAllSettlementNotifications();
+						setDedicatedSessionStatus(latestCtx, undefined);
 						for (const handle of handles.values())
 							addDiagnostic(handle, "Controller lease lost during renewal.");
 						stopTimers();
@@ -1819,6 +1890,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 						);
 					leaseHeld = false;
 					suppressAllSettlementNotifications();
+					setDedicatedSessionStatus(latestCtx, undefined);
 					stopTimers();
 				},
 			);
@@ -1943,12 +2015,19 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		}
 	}
 
+	const cleanupLease = (leaseOwner: OwnerIdentity): RetainedCleanupLease => ({
+		agentDir: getAgentDir(),
+		owner: leaseOwner,
+		controllerInstanceId,
+	});
+
 	async function establishController(ctx: ExtensionContext): Promise<void> {
 		const sessionFile = ctx.sessionManager?.getSessionFile();
 		const sessionId = ctx.sessionManager?.getSessionId();
 		if (!sessionFile || !sessionId) {
 			owner = null;
 			leaseHeld = false;
+			setDedicatedSessionStatus(ctx, undefined);
 			return;
 		}
 		const canonicalSessionFile = await canonicalOwnerSessionFile(sessionFile);
@@ -1956,6 +2035,16 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			ownerSessionFile: canonicalSessionFile,
 			ownerSessionId: sessionId,
 		};
+		if (!(await ensureRetainedCleanupLeaseAuthority())) {
+			owner = null;
+			leaseHeld = false;
+			setDedicatedSessionStatus(ctx, undefined);
+			throw new Error(
+				"Retiring subagent cleanup authority is unavailable; refusing to provision a new owner.",
+			);
+		}
+		const resolvedLease = cleanupLease(resolved);
+		const resolvedWasRetained = retainedCleanupLeaseExists(resolvedLease);
 		const result = await acquireLease(
 			getAgentDir(),
 			resolved,
@@ -1965,10 +2054,46 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		if (result.held) {
 			owner = resolved;
 			leaseHeld = true;
-			startLeaseRenewal();
+			try {
+				dedicatedLifecycle = await establishDedicatedLifecycle(
+					getAgentDir(),
+					resolved,
+					controllerInstanceId,
+					now(),
+					(error) => {
+						setDedicatedSessionStatus(latestCtx, undefined);
+						console.error(`Subagent Zellij guardian failed: ${error.message}`);
+					},
+					() => settleChildrenAfterWholeSessionDeletion(resolved),
+					(cleanupOwner) => hasLeaseAuthority(
+						getAgentDir(),
+						cleanupOwner,
+						controllerInstanceId,
+						now(),
+					),
+				);
+				setDedicatedSessionStatus(ctx, dedicatedLifecycle.record.sessionName);
+				await resolveRetainedCleanupLeases(resolvedLease);
+				startLeaseRenewal();
+			} catch (error) {
+				leaseHeld = false;
+				setDedicatedSessionStatus(ctx, undefined);
+				if (hasPendingDedicatedRetirement(resolved, controllerInstanceId)) {
+					const retained = await retainCleanupLease(resolvedLease);
+					if (!retained)
+						console.error(
+							"Subagent startup cleanup authority is unavailable; provisioning remains blocked.",
+						);
+				} else if (!resolvedWasRetained) {
+					await releaseLease(getAgentDir(), resolved, controllerInstanceId);
+				}
+				owner = null;
+				throw error;
+			}
 		} else {
 			owner = null;
 			leaseHeld = false;
+			setDedicatedSessionStatus(ctx, undefined);
 			console.error(
 				`Subagent controller lease held by another Pi process for this session. Wait for it to exit or expire, then reload.`,
 			);
@@ -1982,6 +2107,46 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	function releaseLeaseIfHeld() {
 		if (!owner || !leaseHeld) return Promise.resolve();
 		return releaseLease(getAgentDir(), owner, controllerInstanceId);
+	}
+
+	/** The session is absent before this runs, so every child incarnation is terminal. */
+	async function settleChildrenAfterWholeSessionDeletion(settlementOwner: OwnerIdentity): Promise<void> {
+		// Recovery may run before normal reconcile or after the extension has
+		// switched owners. Capture and write the retiring owner's registry rather
+		// than consulting mutable controller ownership.
+		const saved = registryEntriesForOwner(
+			await loadRegistry(ownerRegistryPath(getAgentDir(), settlementOwner)),
+			settlementOwner,
+		);
+		const settlementHandles = new Map(
+			saved.map((entry) => [entry.childId, createHandle(entry)]),
+		);
+		for (const handle of handles.values())
+			if (
+				handle.ownerSessionFile === settlementOwner.ownerSessionFile &&
+				handle.ownerSessionId === settlementOwner.ownerSessionId
+			)
+				settlementHandles.set(handle.id, handle);
+		for (const handle of settlementHandles.values()) {
+			rejectPendingAcks(handle, handle.ipcConn?.id || "", "Dedicated Zellij session was deleted.");
+			await closeAndDrainIpcMutations(handle, () => cleanupTransport(handle));
+			if (handle.processState !== "stopped") markStopped(handle, now());
+			handle.cleanupRequired = false;
+			handle.terminalStateDurable = true;
+			handle.terminalCleanup = {
+				status: "complete",
+				attempts: Math.max(1, handle.terminalCleanup.attempts),
+			};
+			notifyWaiters(handle);
+		}
+		await Promise.all([...settlementHandles.values()].map((handle) => handle.settlementPersistenceChain));
+		await persistenceChain;
+		await saveRegistry(
+			[...settlementHandles.values()].map(registryEntry),
+			ownerRegistryPath(getAgentDir(), settlementOwner),
+		);
+		reconcileWatchdog();
+		refreshUi();
 	}
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -1999,28 +2164,27 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		suppressAllSettlementNotifications();
 		latestCtx = ctx;
 		const reason = event?.reason || "quit";
+		if (reason !== "reload") setDedicatedSessionStatus(ctx, undefined);
 		if (reason === "quit") {
 			stopTimers();
-			if (await requireCurrentAuthority())
-				await Promise.allSettled(
-					sorted().map(async (handle) => {
-						if (active(handle)) {
-							await terminate(handle);
-							return;
-						}
-						handle.cleanupRequired = true;
-						handle.terminalStateDurable = false;
-						handle.terminalCleanup = {
-							status: "pending",
-							attempts: 0,
-							nextAttemptAt: monotonicNow(),
-						};
-						await attemptTerminalCleanup(handle);
-					}),
-				);
+			if (dedicatedLifecycle && await requireCurrentAuthority()) {
+				const retiringLifecycle = dedicatedLifecycle;
+				try {
+					await retireDedicatedLifecycle(
+						getAgentDir(),
+						retiringLifecycle,
+						() => settleChildrenAfterWholeSessionDeletion(retiringLifecycle.owner),
+					);
+					dedicatedLifecycle = undefined;
+				} catch (error) {
+					console.error(`Subagent dedicated Zellij cleanup failed: ${String(error)}`);
+				}
+			}
 			await releaseLeaseIfHeld();
+			await releaseRetainedCleanupLeasesForQuit();
 		} else if (reason === "reload") {
 			stopTimers();
+			if (owner) preserveDedicatedLifecycleForReload(owner, controllerInstanceId);
 			for (const handle of handles.values()) {
 				handle.reconnecting = true;
 				await handle.ipcServer?.close().catch(() => {});
@@ -2028,7 +2192,34 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				handle.ipcConn = undefined;
 			}
 		} else {
-			stopTimers();
+			let retirementSucceeded = !dedicatedLifecycle;
+			if (dedicatedLifecycle) {
+				const retiringLifecycle = dedicatedLifecycle;
+				// Transfer renewal to process-global retained authority before the
+				// attempt can block or the extension-local timer is stopped.
+				const retained = await retainCleanupLease(cleanupLease(retiringLifecycle.owner));
+				stopTimers();
+				if (!retained)
+					console.error(
+						"Subagent retiring-owner lease authority is unavailable; later provisioning will remain blocked.",
+					);
+				if (retained && await requireCurrentAuthority()) {
+					try {
+						await retireDedicatedLifecycle(
+							getAgentDir(),
+							retiringLifecycle,
+							() => settleChildrenAfterWholeSessionDeletion(retiringLifecycle.owner),
+						);
+						dedicatedLifecycle = undefined;
+						retirementSucceeded = true;
+						await resolveRetainedCleanupLeases();
+					} catch (error) {
+						console.error(`Subagent dedicated Zellij cleanup failed: ${String(error)}`);
+					}
+				}
+			} else {
+				stopTimers();
+			}
 			for (const handle of handles.values()) {
 				handle.reconnecting = true;
 				await handle.ipcServer?.close().catch(() => {});
@@ -2036,26 +2227,25 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				handle.ipcConn = undefined;
 			}
 			handles.clear();
-			await releaseLeaseIfHeld();
+			if (retirementSucceeded) await releaseLeaseIfHeld();
 			owner = null;
 			leaseHeld = false;
 		}
 		await persist();
-		await cleanupManagedSession();
 		if (ctx.mode === "tui") ctx.ui.setWidget("subagent", undefined);
 		latestCtx = null;
 	});
 	pi.on("before_agent_start", async (event) => ({
 		systemPrompt:
 			event.systemPrompt +
-			`\n\nSubagent extension is available. Use it only for explicit delegation. subagent_start requires an explicit provider/model and thinking level; use list_models when needed instead of guessing. Children are persistent interactive Pi TUIs in tabs of the current Zellij session. Settled-run notifications arrive automatically while children remain alive. Use subagent_result with the child ID and run ID for exact settled output. Use subagent_wait with a finite timeout only for explicit synchronization. Use subagent_status for live diagnostics. Do not poll subagent_status or subagent_wait for routine completion. Use subagent_follow_up for another turn, subagent_steer during a run, subagent_interrupt to abort a run while keeping the child alive, and subagent_kill only to terminate.`,
+			`\n\nSubagent extension is available. Use it only for explicit delegation. subagent_start requires an explicit provider/model and thinking level; use list_models when needed instead of guessing. Children are persistent interactive Pi TUIs in tabs of a dedicated Pi-owned Zellij session. Settled-run notifications arrive automatically while children remain alive. Use subagent_result with the child ID and run ID for exact settled output. Use subagent_wait with a finite timeout only for explicit synchronization. Use subagent_status for live diagnostics. Do not poll subagent_status or subagent_wait for routine completion. Use subagent_follow_up for another turn, subagent_steer during a run, subagent_interrupt to abort a run while keeping the child alive, and subagent_kill only to terminate.`,
 	}));
 
 	pi.registerTool<typeof TaskSpecSchema, unknown>({
 		name: "subagent_start",
 		label: "Subagent Start",
 		description:
-			"Start a persistent interactive Pi TUI with an explicit model and thinking level in a new tab of the current Zellij session after a bounded IPC handshake. Call subagent_kill when the child is no longer useful.",
+			"Start a persistent interactive Pi TUI with an explicit model and thinking level in a new tab of the dedicated Pi-owned Zellij session after a bounded IPC handshake. Call subagent_kill when the child is no longer useful.",
 		parameters: TaskSpecSchema,
 		async execute(_id, params, _signal, _update, ctx) {
 			latestCtx = ctx;
