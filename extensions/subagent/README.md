@@ -4,13 +4,11 @@ This extension gives a parent Pi persistent, visible child Pi sessions inside Ze
 
 ## Requirements
 
-The parent Pi must run inside Zellij. The extension does not create or select a detached Zellij session.
+Zellij must be available. Inside Zellij, the extension resolves the current session from the parent pane identity.
 
-If Zellij is unavailable, `subagent_start` returns this error:
+Outside Zellij, the extension uses an explicit `ZELLIJ_SESSION_NAME` target or creates a managed detached session.
 
-```text
-Subagent delegation requires running inside a Zellij session. Start pi inside zellij first.
-```
+The detached server persists independently. Its startup client gets one second to exit, then receives bounded termination signals.
 
 The validated runtime versions are Zellij 0.44.3 and Pi 0.82.0. Revalidate lifecycle behavior and action flags after an upgrade.
 
@@ -18,7 +16,7 @@ The validated runtime versions are Zellij 0.44.3 and Pi 0.82.0. Revalidate lifec
 
 `subagent_start` opens a tab in the current Zellij session. The tab runs a normal interactive Pi TUI.
 
-Before each Zellij action, the extension resolves the current session from the parent pane ID, command, and working directory. It passes that session through Zellij's explicit `--session` option. This prevents an old `ZELLIJ_SESSION_NAME` from redirecting actions after a session rename. An ambiguous parent pane fails closed.
+The extension resolves the current session from the parent pane identity and caches that successful resolution. It invalidates the cache after a missing-session action failure. Every action passes the resolved session through Zellij's explicit `--session` option. This prevents an old `ZELLIJ_SESSION_NAME` from redirecting actions after a session rename. An ambiguous parent pane fails closed.
 
 The extension uses `devx pi` when an executable `devx` exists. Otherwise, it uses the current Pi executable.
 
@@ -122,7 +120,7 @@ Each child handle serializes its IPC mutations. This queue preserves wire order 
 
 A new connection cannot change its identity after `hello`. Delayed frames from an old incarnation cannot mutate a resumed child.
 
-Pane markers contain the full identity and socket path. Every targeted Zellij action revalidates the tab, pane, command, and markers.
+Pane markers contain the full identity and socket path. Launch-time discovery validates the tab, pane, command, and markers. Later interaction and cleanup target the saved stable terminal pane directly without a pane snapshot.
 
 ## Results and waits
 
@@ -178,6 +176,8 @@ The extension launches Pi with this exact saved file:
 
 Resume keeps the logical child ID. It creates a new incarnation, socket, tab, pane, process, and connection.
 
+Resume is blocked while required terminal cleanup remains pending or failed. The controller must complete cleanup before it can create a new pane.
+
 The resumed child starts its run counter from the prior parent cursor. Run and settlement IDs therefore remain monotonic.
 
 Resume clears the prior kill fence and stale settlement state. It preserves the monotonic run and settlement cursors.
@@ -186,15 +186,31 @@ The full owner and incarnation fence makes logical ID reuse safe. Old frames and
 
 ## Liveness
 
-The extension uses one controller-wide timer while an owned child remains alive.
+IPC is the only authority for child liveness. Zellij performs actions, but it never proves background liveness.
 
-Each tick requests one `zellij action list-panes --json -a` snapshot. The controller reconciles every live child against that snapshot.
+One controller watchdog sweeps every 5 seconds. It sends a ping after 10 seconds without a valid current IPC frame.
 
-A successful snapshot can prove that a matching pane disappeared or exited. The controller then marks the child stopped.
+The child must return a pong with the exact ping ID on the same connection epoch. A missed matching pong after 15 seconds declares the incarnation dead.
 
-An IPC close requests the same probe immediately. The IPC close alone does not prove process death.
+A current socket close starts a 30-second reconnect grace period. A valid fenced hello clears that deadline.
 
-If the Zellij probe fails, the controller preserves the current state. A later successful probe can reconcile it.
+A clean `quit` bypasses reconnect grace. A late frame cannot revive a stopped incarnation.
+
+The watchdog uses a monotonic clock. If the controller stalls for more than 15 seconds, it resets connected observation windows and restarts disconnected grace periods.
+
+After death, the controller closes the saved stable terminal pane with `close-pane --pane-id terminal_<id>`. It never closes a reusable tab ID.
+
+Cleanup uses the saved Zellij session name. It retries direct idempotent pane closure immediately, after 2 seconds, and after 10 seconds.
+
+Each Zellij action has a 2,500-millisecond client timeout. The client receives `SIGTERM`, then `SIGKILL` after 250 milliseconds if necessary.
+
+The registry persists pending cleanup intent before the first close action. A failed write postpones cleanup until a durable retry succeeds.
+
+Queued registry writes capture their state when requested. An earlier write cannot duplicate a later terminal-state snapshot.
+
+A replacement controller retries pending cleanup without pane discovery.
+
+Heartbeats do not update user activity, write the registry, or refresh the UI. Status and wait return controller state without Zellij queries.
 
 Stopped children leave the active widget. Their metadata, history, and artifacts remain available until retention or explicit cleanup removes them.
 
@@ -208,8 +224,8 @@ The extension treats parent lifecycle events as follows:
 | `/new` | The new owner does not adopt the prior owner's children. |
 | `/resume` | The new owner does not adopt the prior owner's children. |
 | `/fork` or `/clone` | The new owner does not adopt the prior owner's children. |
-| Normal quit | The controller closes only owned, identity-matching child tabs. |
-| Hard parent crash | The lease expires, then a same-owner controller can recover after the grace period. |
+| Normal quit | The controller directly closes each owned stable terminal pane. |
+| Hard parent crash | The lease expires, then a same-owner controller restores IPC grace and pending cleanup. |
 
 A settled child remains alive and interactive. Settlement never calls `ctx.shutdown()`.
 
@@ -233,9 +249,9 @@ The extension registers ten tools.
 - `subagent_follow_up {id, message}`
   - The tool sends another child turn.
 - `subagent_interrupt {id}`
-  - The tool sends `Esc` to a revalidated pane and keeps the child process alive.
+  - The tool sends `Esc` directly to the saved stable terminal pane.
 - `subagent_kill {id}`
-  - The tool interrupts, escalates, and closes only the revalidated child tab.
+  - The tool interrupts, then declares death and closes the saved stable terminal pane.
 - `subagent_resume {id, task?}`
   - The tool reopens the exact saved child conversation in a new process incarnation.
 
@@ -249,8 +265,8 @@ The extension registers ten tools.
 
 The extension uses separate authorities for separate facts.
 
-- Companion IPC events and snapshots define live run state, output, tools, usage, and errors.
-- A successful Zellij snapshot defines process liveness.
+- Companion IPC frames define liveness, live run state, output, tools, usage, and errors.
+- Direct Zellij actions operate only on saved stable pane identities.
 - The owner lease defines control authority.
 - The Pi session JSONL defines durable conversation history.
 - `child-events.log` and `dump-screen` provide diagnostics only.
@@ -263,15 +279,17 @@ Run the deterministic suite from this directory:
 PI_TEST_PACKAGE_DIR=/path/to/pi-0.82.0 ./test.sh
 ```
 
-The suite covers per-run results, settlement notifications, waits, owner isolation, lease races, frame fences, resume, lifecycle, liveness, and UI behavior.
+The suite covers per-run results, settlement notifications, waits, owner isolation, lease races, strict IPC fences, reconnect state, stable pane cleanup, action bounds, resume, lifecycle, liveness, and UI behavior.
 
 A separate disposable integration gate must use a real Pi and a real Zellij session. It must set a disposable `PI_CODING_AGENT_DIR`.
 
 The integration gate must not use a normal user registry, session, socket, process, tab, or pane.
 
+A non-TTY process cannot host this interactive gate because Zellij requires terminal raw mode. In that environment, run the deterministic IPC suite and a disposable `close-pane` command smoke test instead.
+
 ## Residual risks
 
 - Pi lifecycle and Zellij action behavior remain version-specific.
-- A hard crash can bypass shutdown callbacks. Lease expiry and reconciliation provide recovery.
-- A small same-user race remains between pane revalidation and the following Zellij action.
+- A hard crash can bypass shutdown callbacks. Lease expiry restores IPC grace and durable cleanup intent.
+- A Zellij action timeout leaves its result uncertain. Only idempotent pane closure retries.
 - IPC assumes same-user local trust. Multi-user control requires authentication and a different protocol.

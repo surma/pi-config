@@ -88,6 +88,21 @@ test("companion stays alive, emits identity/run frames, and accepts follow-up", 
 		assert.equal(hello?.ownerSessionFile, "/tmp/owner.jsonl");
 		assert.equal(hello?.incarnation, "inc-stable");
 		assert.equal(hello?.sessionId, "session");
+		peer?.write(
+			`${JSON.stringify({
+				type: "ping",
+				id: "exact-ping-nonce",
+				ownerSessionFile: "/tmp/owner.jsonl",
+				ownerSessionId: "owner-session",
+				launchControllerInstanceId: "controller-a",
+				incarnation: "inc-stable",
+			})}\n`,
+		);
+		await eventually(() =>
+			received.some(
+				(frame) => frame.type === "pong" && frame.id === "exact-ping-nonce",
+			),
+		);
 		await handlers.get("agent_start")?.({}, ctx);
 		await handlers.get("message_end")?.(
 			{

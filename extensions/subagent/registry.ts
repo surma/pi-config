@@ -3,7 +3,6 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { RunState } from "./lifecycle.js";
 import type { OwnerIdentity } from "./owner.js";
-import { type PaneInfo, paneMatchesSubagent } from "./zellij.js";
 
 export interface RegistryEntry {
 	childId: string;
@@ -12,6 +11,9 @@ export interface RegistryEntry {
 	cwd: string;
 	tabId?: number;
 	paneId?: number;
+	zellijSessionName?: string;
+	terminalCleanupPending?: boolean;
+	terminalCleanupError?: string;
 	sessionDir: string;
 	socketPath: string;
 	sessionFile?: string;
@@ -38,9 +40,7 @@ export function registryPath(
 	return join(agentDir, "sessions", "subagents", "registry.json");
 }
 
-export async function loadRegistry(
-	path = registryPath(),
-): Promise<RegistryEntry[]> {
+export async function loadRegistry(path = registryPath()): Promise<RegistryEntry[]> {
 	try {
 		const parsed: unknown = JSON.parse(await fs.readFile(path, "utf8"));
 		if (!Array.isArray(parsed)) return [];
@@ -57,10 +57,7 @@ export async function loadRegistry(
 	}
 }
 
-export async function saveRegistry(
-	entries: RegistryEntry[],
-	path = registryPath(),
-): Promise<void> {
+export async function saveRegistry(entries: RegistryEntry[], path = registryPath()): Promise<void> {
 	await fs.mkdir(dirname(path), { recursive: true, mode: 0o700 });
 	await fs.chmod(dirname(path), 0o700).catch(() => {});
 	const temporary = `${path}.tmp-${process.pid}-${Date.now()}`;
@@ -77,76 +74,20 @@ export async function saveRegistry(
 	}
 }
 
-export function helloMatchesRegistryChild(
-	expectedChildId: string,
-	helloChildId: unknown,
-): boolean {
+export function helloMatchesRegistryChild(expectedChildId: string, helloChildId: unknown): boolean {
 	return typeof helloChildId === "string" && helloChildId === expectedChildId;
 }
 
-export function paneMatchesEntry(
-	entry: RegistryEntry,
-	pane: PaneInfo,
-): boolean {
-	if (entry.tabId === undefined || entry.paneId === undefined) return false;
-	return paneMatchesSubagent(pane, entry.tabId, entry.paneId, {
-		childId: entry.childId,
-		socketPath: entry.socketPath,
-		ownerSessionFile: entry.ownerSessionFile,
-		ownerSessionId: entry.ownerSessionId,
-		controllerInstanceId: entry.controllerInstanceId,
-		incarnation: entry.incarnation,
-	});
-}
-
-export async function reconcileRegistry(
+export function registryEntriesForOwner(
 	entries: RegistryEntry[],
-	livePanes: PaneInfo[],
-): Promise<RegistryEntry[]> {
-	return entries.map((entry) => {
-		if (entry.processState === "stopped") return { ...entry };
-		const pane = livePanes.find((candidate) =>
-			paneMatchesEntry(entry, candidate),
-		);
-		return pane
-			? { ...entry }
-			: { ...entry, processState: "stopped" as const, detached: false };
-	});
-}
-
-/**
- * Reconcile only the entries that belong to the given owner.
- *
- * Entries whose durable owner identity differs from the owner are skipped.
- * Entries missing incarnation are skipped. Same-owner entries from a
- * prior controller (crash recovery) are included so the new holder can
- * revalidate and reattach live children.
- */
-export function reconcileRegistryForOwner(
-	entries: RegistryEntry[],
-	livePanes: PaneInfo[],
 	owner: OwnerIdentity,
 ): RegistryEntry[] {
-	const managed: RegistryEntry[] = [];
-	for (const entry of entries) {
-		if (
-			entry.ownerSessionFile !== owner.ownerSessionFile ||
-			entry.ownerSessionId !== owner.ownerSessionId
+	return entries
+		.filter(
+			(entry) =>
+				entry.ownerSessionFile === owner.ownerSessionFile &&
+				entry.ownerSessionId === owner.ownerSessionId &&
+				!!entry.incarnation,
 		)
-			continue;
-		if (!entry.incarnation) continue;
-		if (entry.processState === "stopped") {
-			managed.push({ ...entry });
-			continue;
-		}
-		const pane = livePanes.find((candidate) =>
-			paneMatchesEntry(entry, candidate),
-		);
-		managed.push(
-			pane
-				? { ...entry }
-				: { ...entry, processState: "stopped" as const, detached: false },
-		);
-	}
-	return managed;
+		.map((entry) => ({ ...entry }));
 }

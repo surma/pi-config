@@ -1,5 +1,9 @@
 import { spawn } from "node:child_process";
 import { resolve } from "node:path";
+import {
+	ZELLIJ_ACTION_KILL_GRACE_MS,
+	ZELLIJ_ACTION_TIMEOUT_MS,
+} from "./liveness.js";
 
 export interface PaneInfo {
 	id: number;
@@ -28,9 +32,13 @@ export interface SubagentPaneIdentity {
 	controllerInstanceId: string;
 	incarnation: string;
 }
-
+const MANAGED_SESSION_STARTUP_TIMEOUT_MS = 1_000;
 let managedSessionName: string | undefined;
 let targetSessionName: string | undefined;
+
+export function invalidateSessionCache(): void {
+	targetSessionName = undefined;
+}
 
 function paneRunsPi(pane: PaneInfo): boolean {
 	const command = `${pane.pane_command || ""} ${pane.terminal_command || ""}`;
@@ -85,11 +93,12 @@ export function requireZellij(): void {
 }
 
 /**
- * Resolve the current Zellij session from the parent pane identity. The
- * resolver checks every action so a session rename cannot stale the target.
- * Outside Zellij, start and retain a detached session.
+ * Resolve and cache the current Zellij session from the parent pane identity.
+ * Missing-session failures invalidate the cache. Outside Zellij, start and
+ * retain a detached session.
  */
 export async function ensureZellij(cwd = process.cwd()): Promise<string> {
+	if (targetSessionName) return targetSessionName;
 	const binary = zellijBinary();
 	const paneId = Number.parseInt(process.env.ZELLIJ_PANE_ID || "", 10);
 	const isInsideZellij =
@@ -133,11 +142,34 @@ export async function ensureZellij(cwd = process.cwd()): Promise<string> {
 			detached: true,
 			shell: false,
 		});
+		let clientClosed = false;
+		let released = false;
+		let killTimer: NodeJS.Timeout | undefined;
+		const release = () => {
+			if (released) return;
+			released = true;
+			clearTimeout(startupTimer);
+			resolveSpawn();
+		};
+		const clientFinished = () => {
+			clientClosed = true;
+			if (killTimer) clearTimeout(killTimer);
+			release();
+		};
+		const startupTimer = setTimeout(() => {
+			if (!clientClosed) {
+				proc.kill("SIGTERM");
+				killTimer = setTimeout(() => {
+					if (!clientClosed) proc.kill("SIGKILL");
+				}, ZELLIJ_ACTION_KILL_GRACE_MS);
+				killTimer.unref();
+			}
+			release();
+		}, MANAGED_SESSION_STARTUP_TIMEOUT_MS);
+		startupTimer.unref();
+		proc.on("error", clientFinished);
+		proc.on("close", clientFinished);
 		proc.unref();
-		proc.on("error", () => resolveSpawn());
-		proc.on("close", () => resolveSpawn());
-		// Server may need a moment to bind its socket.
-		setTimeout(resolveSpawn, 1000);
 	});
 
 	// Verify the session exists.
@@ -155,22 +187,75 @@ export async function ensureZellij(cwd = process.cwd()): Promise<string> {
 	return targetSessionName;
 }
 
-async function listSessionNames(binary: string): Promise<string[]> {
-	return new Promise((resolve) => {
-		const proc = spawn(binary, ["list-sessions", "--short", "--no-formatting"], {
+interface ZellijClientResult {
+	stdout: string;
+	stderr: string;
+	code: number | null;
+}
+
+function runBoundedZellijClient(
+	binary: string,
+	args: string[],
+): Promise<ZellijClientResult> {
+	return new Promise((resolveResult, reject) => {
+		const proc = spawn(binary, args, {
 			stdio: ["ignore", "pipe", "pipe"],
 			shell: false,
 		});
 		let stdout = "";
+		let stderr = "";
+		let settled = false;
+		let killTimer: NodeJS.Timeout | undefined;
+		const timeout = setTimeout(() => {
+			if (settled) return;
+			settled = true;
+			proc.kill("SIGTERM");
+			killTimer = setTimeout(
+				() => proc.kill("SIGKILL"),
+				ZELLIJ_ACTION_KILL_GRACE_MS,
+			);
+			killTimer.unref();
+			reject(
+				new Error(
+					`zellij ${args[0] || "client"} timed out after ${ZELLIJ_ACTION_TIMEOUT_MS}ms`,
+				),
+			);
+		}, ZELLIJ_ACTION_TIMEOUT_MS);
+		timeout.unref();
+		const settle = (result: () => void) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timeout);
+			if (killTimer) clearTimeout(killTimer);
+			result();
+		};
 		proc.stdout.setEncoding("utf8");
+		proc.stderr.setEncoding("utf8");
 		proc.stdout.on("data", (chunk: string) => {
 			stdout += chunk;
 		});
-		proc.on("error", () => resolve([]));
-		proc.on("close", () =>
-			resolve(stdout.trim().split("\n").filter(Boolean)),
-		);
+		proc.stderr.on("data", (chunk: string) => {
+			stderr += chunk;
+		});
+		proc.on("error", (error) => settle(() => reject(error)));
+		proc.on("close", (code) => {
+			if (killTimer) clearTimeout(killTimer);
+			settle(() => resolveResult({ stdout, stderr, code }));
+		});
 	});
+}
+
+async function listSessionNames(binary: string): Promise<string[]> {
+	try {
+		const { stdout } = await runBoundedZellijClient(binary, [
+			"list-sessions",
+			"--short",
+			"--no-formatting",
+		]);
+		return stdout.trim().split("\n").filter(Boolean);
+	} catch {
+		return [];
+	}
 }
 
 /**
@@ -183,33 +268,44 @@ export async function cleanupManagedSession(): Promise<void> {
 	managedSessionName = undefined;
 	if (targetSessionName === name) targetSessionName = undefined;
 	const binary = zellijBinary();
-	await new Promise<void>((resolve) => {
-		const proc = spawn(binary, ["kill-session", name], {
-			stdio: "ignore",
-			shell: false,
-		});
-		proc.on("error", () => resolve());
-		proc.on("close", () => resolve());
-	});
+	await runBoundedZellijClient(binary, ["kill-session", name]).catch(() => {});
 }
 
-async function actionInSession(
+export async function actionInSession(
 	binary: string,
 	sessionName: string,
 	args: string[],
 ): Promise<string> {
 	return new Promise((resolveOutput, reject) => {
-		const proc = spawn(
-			binary,
-			["--session", sessionName, "action", ...args],
-			{
-				env: process.env,
-				shell: false,
-				stdio: ["ignore", "pipe", "pipe"],
-			},
-		);
+		const proc = spawn(binary, ["--session", sessionName, "action", ...args], {
+			env: process.env,
+			shell: false,
+			stdio: ["ignore", "pipe", "pipe"],
+		});
 		let stdout = "";
 		let stderr = "";
+		let settled = false;
+		let killTimer: NodeJS.Timeout | undefined;
+		const timeout = setTimeout(() => {
+			if (settled) return;
+			settled = true;
+			proc.kill("SIGTERM");
+			killTimer = setTimeout(() => proc.kill("SIGKILL"), ZELLIJ_ACTION_KILL_GRACE_MS);
+			killTimer.unref();
+			reject(
+				new Error(
+					`zellij action ${args[0]} timed out after ${ZELLIJ_ACTION_TIMEOUT_MS}ms for session ${sessionName}`,
+				),
+			);
+		}, ZELLIJ_ACTION_TIMEOUT_MS);
+		timeout.unref();
+		const settle = (result: () => void) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timeout);
+			if (killTimer) clearTimeout(killTimer);
+			result();
+		};
 		proc.stdout.setEncoding("utf8");
 		proc.stderr.setEncoding("utf8");
 		proc.stdout.on("data", (chunk: string) => {
@@ -218,22 +314,43 @@ async function actionInSession(
 		proc.stderr.on("data", (chunk: string) => {
 			stderr += chunk;
 		});
-		proc.on("error", reject);
-		proc.on("close", (code) =>
-			code === 0
-				? resolveOutput(stdout)
-				: reject(
-						new Error(
-							`zellij action ${args[0]} failed for session ${sessionName} (${code ?? "unknown"}): ${stderr.trim() || stdout.trim()}`,
-						),
+		proc.on("error", (error) => settle(() => reject(error)));
+		proc.on("close", (code) => {
+			if (killTimer) clearTimeout(killTimer);
+			settle(() => {
+				if (code === 0) {
+					resolveOutput(stdout);
+					return;
+				}
+				const output = [
+					stdout.trim() ? `stdout: ${JSON.stringify(stdout.trim())}` : undefined,
+					stderr.trim() ? `stderr: ${JSON.stringify(stderr.trim())}` : undefined,
+				]
+					.filter(Boolean)
+					.join("; ");
+				reject(
+					new Error(
+						`zellij action ${args[0]} failed for session ${sessionName} (${code ?? "unknown"}): ${output || "no output"}`,
 					),
-		);
+				);
+			});
+		});
 	});
+}
+
+function isSessionTargetError(error: unknown): boolean {
+	return /session.*(not found|does not exist)|no such session/i.test(String(error));
 }
 
 async function action(args: string[]): Promise<string> {
 	const sessionName = await ensureZellij();
-	return actionInSession(zellijBinary(), sessionName, args);
+	try {
+		return await actionInSession(zellijBinary(), sessionName, args);
+	} catch (error) {
+		if (targetSessionName === sessionName && isSessionTargetError(error))
+			targetSessionName = undefined;
+		throw error;
+	}
 }
 
 export function buildNewTabArgs(
@@ -251,14 +368,26 @@ export async function newTab(
 	cwd: string,
 	cmd: string[],
 	env: Record<string, string>,
-): Promise<number> {
-	const stdout = await action(buildNewTabArgs(name, cwd, cmd, env));
+): Promise<{ tabId: number; sessionName: string }> {
+	const sessionName = await ensureZellij();
+	let stdout: string;
+	try {
+		stdout = await actionInSession(
+			zellijBinary(),
+			sessionName,
+			buildNewTabArgs(name, cwd, cmd, env),
+		);
+	} catch (error) {
+		if (targetSessionName === sessionName && isSessionTargetError(error))
+			targetSessionName = undefined;
+		throw error;
+	}
 	const tabId = Number.parseInt(stdout.trim(), 10);
 	if (!Number.isFinite(tabId) || tabId <= 0)
 		throw new Error(
 			`zellij new-tab returned an invalid tab id: ${JSON.stringify(stdout.trim())}`,
 		);
-	return tabId;
+	return { tabId, sessionName };
 }
 
 function parsePanes(stdout: string): PaneInfo[] {
@@ -303,47 +432,21 @@ export async function listTabs(): Promise<TabInfo[]> {
 	);
 }
 
-export async function discoverPaneId(
-	tabId: number,
-	timeoutMs = 3000,
-): Promise<number> {
-	const deadline = Date.now() + timeoutMs;
-	do {
-		const pane = (await listPanes()).find(
-			(candidate) => candidate.tab_id === tabId && !candidate.exited,
-		);
-		if (pane) return pane.id;
-		await new Promise((resolve) => setTimeout(resolve, 50));
-	} while (Date.now() < deadline);
-	throw new Error(`Could not discover a live pane for Zellij tab ${tabId}.`);
-}
-
-function paneMatchesIdentity(
+function paneMatchesLaunchIdentity(
 	pane: PaneInfo,
 	tabId: number,
-	paneId: number,
-	identity: SubagentPaneIdentity | undefined,
-	allowExited: boolean,
+	identity: SubagentPaneIdentity,
 ): boolean {
-	if (
-		pane.id !== paneId ||
-		pane.tab_id !== tabId ||
-		pane.is_plugin ||
-		(!allowExited && pane.exited)
-	)
+	if (pane.tab_id !== tabId || pane.is_plugin || pane.exited || !paneRunsPi(pane))
 		return false;
 	const command = `${pane.pane_command || ""} ${pane.terminal_command || ""}`;
-	if (!paneRunsPi(pane)) return false;
-	if (!identity) return true;
 	return (
 		command.includes(`PI_SUBAGENT_CHILD_ID=${identity.childId}`) &&
 		command.includes(`BRIDGE_SOCKET_PATH=${identity.socketPath}`) &&
 		command.includes(
 			`PI_SUBAGENT_OWNER_SESSION_FILE=${identity.ownerSessionFile}`,
 		) &&
-		command.includes(
-			`PI_SUBAGENT_OWNER_SESSION_ID=${identity.ownerSessionId}`,
-		) &&
+		command.includes(`PI_SUBAGENT_OWNER_SESSION_ID=${identity.ownerSessionId}`) &&
 		command.includes(
 			`PI_SUBAGENT_CONTROLLER_INSTANCE_ID=${identity.controllerInstanceId}`,
 		) &&
@@ -351,43 +454,44 @@ function paneMatchesIdentity(
 	);
 }
 
-export function paneMatchesSubagent(
-	pane: PaneInfo,
+export async function discoverPaneId(
 	tabId: number,
-	paneId: number,
-	identity?: SubagentPaneIdentity,
-): boolean {
-	return paneMatchesIdentity(pane, tabId, paneId, identity, false);
-}
-
-export async function revalidatePane(
-	tabId: number,
-	paneId: number,
-	identity?: SubagentPaneIdentity,
-): Promise<boolean> {
-	const pane = (await listPanes()).find(
-		(candidate) => candidate.id === paneId && candidate.tab_id === tabId,
-	);
-	return pane ? paneMatchesSubagent(pane, tabId, paneId, identity) : false;
-}
-
-export async function sendKeys(paneId: number, key: string): Promise<void> {
-	await action(["send-keys", "-p", String(paneId), key]);
-}
-export async function closeTab(tabId: number): Promise<void> {
-	await action(["close-tab-by-id", String(tabId)]);
-}
-
-export async function closeValidatedSubagentTab(
-	tabId: number,
-	paneId: number,
 	identity: SubagentPaneIdentity,
-): Promise<boolean> {
-	const pane = (await listPanes()).find(
-		(candidate) => candidate.id === paneId && candidate.tab_id === tabId,
+	timeoutMs = 3000,
+): Promise<number> {
+	const deadline = Date.now() + timeoutMs;
+	do {
+		const pane = (await listPanes()).find((candidate) =>
+			paneMatchesLaunchIdentity(candidate, tabId, identity),
+		);
+		if (pane) return pane.id;
+		await new Promise((resolve) => setTimeout(resolve, 50));
+	} while (Date.now() < deadline);
+	throw new Error(
+		`Could not discover a live Pi pane with the expected identity for Zellij tab ${tabId}.`,
 	);
-	if (!pane || !paneMatchesIdentity(pane, tabId, paneId, identity, true))
-		return false;
-	await closeTab(tabId);
-	return true;
+}
+
+export async function sendKeysInSession(
+	sessionName: string,
+	paneId: number,
+	key: string,
+): Promise<void> {
+	await actionInSession(zellijBinary(), sessionName, [
+		"send-keys",
+		"-p",
+		String(paneId),
+		key,
+	]);
+}
+
+export async function closePaneInSession(
+	sessionName: string,
+	paneId: number,
+): Promise<void> {
+	await actionInSession(zellijBinary(), sessionName, [
+		"close-pane",
+		"--pane-id",
+		`terminal_${paneId}`,
+	]);
 }

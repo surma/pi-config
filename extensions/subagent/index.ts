@@ -23,6 +23,7 @@ import {
 	type IpcServer,
 	prepareIpcSocketPath,
 	type SnapshotFrame,
+	type PongFrame,
 	startIpcServer,
 } from "./ipc.js";
 import {
@@ -51,7 +52,7 @@ import {
 	helloMatchesRegistryChild,
 	loadRegistry,
 	type RegistryEntry,
-	reconcileRegistryForOwner,
+	registryEntriesForOwner,
 	saveRegistry,
 } from "./registry.js";
 import {
@@ -71,15 +72,26 @@ import {
 } from "./ui.js";
 import {
 	cleanupManagedSession,
-	closeValidatedSubagentTab,
+	closePaneInSession,
 	discoverPaneId,
 	ensureZellij,
-	listPanes,
+	invalidateSessionCache,
 	newTab,
-	paneMatchesSubagent,
-	revalidatePane,
-	sendKeys,
+	sendKeysInSession,
+	type SubagentPaneIdentity,
 } from "./zellij.js";
+import {
+	CLEANUP_RETRY_DELAYS_MS,
+	heartbeatExpired,
+	HEARTBEAT_RESPONSE_MS,
+	HEARTBEAT_SWEEP_MS,
+	parentStalled,
+	pingDue,
+	reconnectExpired,
+	RECONNECT_GRACE_MS,
+	type PendingHeartbeat,
+	type TerminalCleanupState,
+} from "./liveness.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const childExtensionPath = join(__dirname, "child.ts");
@@ -132,6 +144,20 @@ interface TaskSpec {
 	systemPrompt?: string;
 }
 
+export async function withTerminalCleanupLock(
+	state: { terminalCleanupActive?: boolean },
+	action: () => Promise<void>,
+): Promise<boolean> {
+	if (state.terminalCleanupActive) return false;
+	state.terminalCleanupActive = true;
+	try {
+		await action();
+		return true;
+	} finally {
+		state.terminalCleanupActive = false;
+	}
+}
+
 interface SubagentHandle extends SubagentDispatchHandle {
 	id: string;
 	name?: string;
@@ -150,8 +176,18 @@ interface SubagentHandle extends SubagentDispatchHandle {
 	pid?: number;
 	tabId?: number;
 	paneId?: number;
+	zellijSessionName?: string;
 	exitCode?: number;
 	reconnecting?: boolean;
+	lastIpcFrameAt: number;
+	pendingHeartbeat?: PendingHeartbeat;
+	disconnectedAt?: number;
+	disconnectDeadlineAt?: number;
+	deathReason?: "heartbeat_timeout" | "reconnect_timeout" | "quit" | "kill";
+	terminalCleanup: TerminalCleanupState;
+	cleanupRequired: boolean;
+	terminalStateDurable: boolean;
+	terminalCleanupActive?: boolean;
 	ipcServer?: IpcServer;
 	ipcConn?: IpcConnection;
 	seenHelloConnections: Set<string>;
@@ -232,6 +268,9 @@ const ResumeSchema = Type.Object({
 function now() {
 	return Date.now();
 }
+function monotonicNow() {
+	return performance.now();
+}
 function createId() {
 	return randomBytes(8).toString("hex");
 }
@@ -301,7 +340,9 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	const controllerInstanceId = processControllerInstanceId;
 	let leaseHeld = false;
 	let leaseRenewTimer: NodeJS.Timeout | undefined;
-	let livenessTimer: NodeJS.Timeout | undefined;
+	let watchdogTimer: NodeJS.Timeout | undefined;
+	let watchdogSweepActive = false;
+	let lastWatchdogSweepAt = monotonicNow();
 	let sessionShuttingDown = false;
 	let settlementNotificationEpoch = 0;
 	const settlementNotifications = new SettlementNotificationQueue(
@@ -328,7 +369,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			(a, b) => b.createdAt - a.createdAt || b.id.localeCompare(a.id),
 		);
 	const active = (handle: SubagentHandle) => handle.processState === "alive";
-	const paneIdentity = (handle: SubagentHandle) => ({
+	const paneIdentity = (handle: SubagentHandle): SubagentPaneIdentity => ({
 		childId: handle.id,
 		socketPath: handle.socketPath,
 		ownerSessionFile: handle.ownerSessionFile,
@@ -369,6 +410,9 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			cwd: handle.cwd,
 			tabId: handle.tabId,
 			paneId: handle.paneId,
+			zellijSessionName: handle.zellijSessionName,
+			terminalCleanupPending: handle.cleanupRequired,
+			terminalCleanupError: handle.terminalCleanup.lastError,
 			sessionDir: handle.sessionDir,
 			socketPath: handle.socketPath,
 			sessionFile: handle.sessionPath,
@@ -388,19 +432,33 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			incarnation: handle.incarnation,
 			resumedFrom: handle.resumedFrom,
 		}));
-	const persist = async () => {
-		if (!owner || !(await requireCurrentAuthority())) return;
-		const path = ownerRegistryPath(getAgentDir(), owner);
-		persistenceChain = persistenceChain
-			.then(() => saveRegistry(registryEntries(), path))
-			.catch((error) => {
+	const persist = (): Promise<boolean> => {
+		const persistenceOwner = owner;
+		if (!persistenceOwner || !leaseHeld) return Promise.resolve(false);
+		const path = ownerRegistryPath(getAgentDir(), persistenceOwner);
+		const entries = registryEntries();
+		const write = persistenceChain.then(async () => {
+			if (
+				!owner ||
+				owner.ownerSessionFile !== persistenceOwner.ownerSessionFile ||
+				owner.ownerSessionId !== persistenceOwner.ownerSessionId ||
+				!(await requireCurrentAuthority())
+			)
+				return false;
+			await saveRegistry(entries, path);
+			return true;
+		});
+		persistenceChain = write.then(
+			() => undefined,
+			(error) => {
 				for (const handle of handles.values())
 					addDiagnostic(
 						handle,
 						`Registry persistence failed: ${error instanceof Error ? error.message : String(error)}`,
 					);
-			});
-		await persistenceChain;
+			},
+		);
+		return write.catch(() => false);
 	};
 	const trimRetained = () => {
 		if (handles.size <= MAX_RETAINED_HANDLES) return;
@@ -409,15 +467,15 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			.sort((a, b) => a.lastActivityAt - b.lastActivityAt);
 		while (handles.size > MAX_RETAINED_HANDLES && stopped.length) {
 			const candidate = stopped.shift();
-			if (candidate) handles.delete(candidate.id);
+			if (candidate && !candidate.cleanupRequired) handles.delete(candidate.id);
 		}
 	};
-	const update = (handle: SubagentHandle) => {
+	const update = (handle: SubagentHandle, shouldPersist = true) => {
 		handle.lastActivityAt = now();
 		trimRetained();
 		refreshUi();
-		reconcileLivenessTimer();
-		void persist();
+		reconcileWatchdog();
+		if (shouldPersist) void persist();
 	};
 
 	function acceptSettlement(
@@ -545,9 +603,27 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			cwd: handle.cwd,
 			tabId: handle.tabId,
 			paneId: handle.paneId,
+			zellijSessionName: handle.zellijSessionName,
 			pid: handle.pid,
 			exitCode: handle.exitCode,
 			reconnecting: handle.reconnecting,
+			ipcLiveness: {
+				state:
+					handle.processState === "stopped"
+						? "dead"
+						: handle.reconnecting
+							? "reconnecting"
+							: handle.pendingHeartbeat
+								? "awaiting_pong"
+								: "healthy",
+				heartbeatPending: !!handle.pendingHeartbeat,
+				deathReason: handle.deathReason,
+			},
+			terminalCleanup: {
+				status: handle.terminalCleanup.status,
+				attempts: handle.terminalCleanup.attempts,
+				lastError: handle.terminalCleanup.lastError,
+			},
 			requestedModel: handle.requestedModel,
 			requestedThinking: handle.requestedThinking,
 			actualModel,
@@ -569,7 +645,10 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			isStreaming: handle.isStreaming,
 			usage: { ...handle.usage },
 			stopReason: handle.stopReason,
-			error: handle.error || handle.finalError,
+			error:
+				handle.terminalCleanup.status === "failed"
+					? handle.terminalCleanup.lastError
+					: handle.error || handle.finalError,
 			resultPreview: handle.resultText
 				? truncate(handle.resultText)
 				: undefined,
@@ -629,6 +708,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			sessionPath: entry.sessionFile,
 			tabId: entry.tabId,
 			paneId: entry.paneId,
+			zellijSessionName: entry.zellijSessionName,
 			processState: entry.processState || "alive",
 			runState: entry.runState || "idle",
 			runSequence: entry.runId || 0,
@@ -661,6 +741,18 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			ipcMutationChain: Promise.resolve(),
 			settlementPersistenceChain: Promise.resolve(),
 			reconnecting: entry.detached,
+			lastIpcFrameAt: monotonicNow(),
+			terminalCleanup: {
+				status: entry.terminalCleanupPending
+					? entry.terminalCleanupError
+						? "failed"
+						: "pending"
+					: "none",
+				attempts: 0,
+				lastError: entry.terminalCleanupError,
+			},
+			cleanupRequired: entry.terminalCleanupPending === true,
+			terminalStateDurable: entry.terminalCleanupPending === true,
 			ownerSessionFile: entry.ownerSessionFile,
 			ownerSessionId: entry.ownerSessionId,
 			controllerInstanceId: entry.controllerInstanceId,
@@ -786,6 +878,11 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		frame: HelloFrame,
 		conn: IpcConnection,
 	) {
+		if (handle.processState === "stopped") {
+			addDiagnostic(handle, "Rejected IPC hello for a stopped incarnation.");
+			conn.close();
+			return;
+		}
 		if (!helloMatchesRegistryChild(handle.id, frame.childId)) {
 			addDiagnostic(
 				handle,
@@ -834,6 +931,10 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			: handle.requestedThinking;
 		handle.ipcReadyAt ||= now();
 		handle.reconnecting = false;
+		handle.pendingHeartbeat = undefined;
+		handle.disconnectedAt = undefined;
+		handle.disconnectDeadlineAt = undefined;
+		recordCurrentFrame(handle);
 		handle.processState = "alive";
 		if (sessionChanged) {
 			resetRunViewForSession(handle);
@@ -843,53 +944,123 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		update(handle);
 		notifyWaiters(handle);
 	}
-	async function probeProcess(handle: SubagentHandle): Promise<void> {
-		if (!(await requireCurrentAuthority())) return;
-		if (
-			handle.processState === "stopped" ||
-			handle.tabId === undefined ||
-			handle.paneId === undefined
-		)
-			return;
-		try {
-			const panes = await listPanes();
-			const pane = panes.find(
-				(candidate) =>
-					candidate.id === handle.paneId && candidate.tab_id === handle.tabId,
-			);
-			const identityMatches = pane
-				? paneMatchesSubagent(
-						pane,
-						handle.tabId,
-						handle.paneId,
-						paneIdentity(handle),
-					)
-				: false;
-			if (!identityMatches) {
-				handle.exitCode = pane?.exit_status ?? undefined;
-				markStopped(handle, now(), {
-					code: pane?.exit_status,
-					error:
-						pane && !pane.exited
-							? "Tracked Zellij IDs now belong to an unrelated process."
-							: undefined,
-				});
-				handle.reconnecting = false;
-				notifyWaiters(handle);
-				await cleanupTransport(handle);
-				update(handle);
+	function recordCurrentFrame(handle: SubagentHandle): void {
+		handle.lastIpcFrameAt = monotonicNow();
+	}
+	function startReconnectGrace(handle: SubagentHandle, at = monotonicNow()): void {
+		handle.pendingHeartbeat = undefined;
+		handle.disconnectedAt = at;
+		handle.disconnectDeadlineAt = at + RECONNECT_GRACE_MS;
+		handle.reconnecting = true;
+		reconcileWatchdog();
+	}
+	async function attemptTerminalCleanup(handle: SubagentHandle): Promise<void> {
+		if (handle.terminalCleanup.status !== "pending") return;
+		await withTerminalCleanupLock(handle, async () => {
+			if (handle.terminalCleanup.status !== "pending") return;
+			let shouldPersist = false;
+			try {
+				if (!(await requireCurrentAuthority())) return;
+				if (!handle.terminalStateDurable) {
+					if (!(await persist())) {
+						handle.terminalCleanup.nextAttemptAt =
+							monotonicNow() + HEARTBEAT_SWEEP_MS;
+						return;
+					}
+					handle.terminalStateDurable = true;
+				}
+				shouldPersist = true;
+				handle.terminalCleanup.attempts++;
+				if (!handle.zellijSessionName || handle.paneId === undefined) {
+					const message = `Cannot clean up #${handle.id}: missing ${!handle.zellijSessionName ? "Zellij session name" : "terminal pane ID"}.`;
+					handle.terminalCleanup = {
+						status: "failed",
+						attempts: handle.terminalCleanup.attempts,
+						lastError: message,
+					};
+					addDiagnostic(handle, message);
+					return;
+				}
+				await closePaneInSession(handle.zellijSessionName, handle.paneId);
+				handle.cleanupRequired = false;
+				handle.terminalCleanup = { status: "complete", attempts: handle.terminalCleanup.attempts };
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				if (/pane.*(not found|does not exist)|no such pane/i.test(message)) {
+					handle.cleanupRequired = false;
+					handle.terminalCleanup = { status: "complete", attempts: handle.terminalCleanup.attempts };
+				} else if (handle.terminalCleanup.attempts >= CLEANUP_RETRY_DELAYS_MS.length) {
+					handle.terminalCleanup = {
+						status: "failed",
+						attempts: handle.terminalCleanup.attempts,
+						lastError: message,
+					};
+					addDiagnostic(handle, `Terminal cleanup failed: ${message}`);
+				} else {
+					handle.terminalCleanup.nextAttemptAt =
+						monotonicNow() + CLEANUP_RETRY_DELAYS_MS[handle.terminalCleanup.attempts]!;
+					handle.terminalCleanup.lastError = message;
+					addDiagnostic(handle, `Terminal cleanup retry scheduled: ${message}`);
+					if (/session.*(not found|does not exist)|no such session/i.test(message)) {
+						invalidateSessionCache();
+						try {
+							const resolved = await ensureZellij();
+							const prior = handle.zellijSessionName;
+							for (const candidate of handles.values())
+								if (candidate.zellijSessionName === prior)
+									candidate.zellijSessionName = resolved;
+						} catch (resolveError) {
+							addDiagnostic(handle, `Zellij session re-resolution failed: ${String(resolveError)}`);
+						}
+					}
+				}
+			} finally {
+				if (shouldPersist) await persist();
+				reconcileWatchdog();
 			}
-		} catch (error) {
-			addDiagnostic(
-				handle,
-				`Zellij liveness probe failed: ${error instanceof Error ? error.message : String(error)}`,
-			);
+		});
+	}
+	async function declareDead(
+		handle: SubagentHandle,
+		reason: "heartbeat_timeout" | "reconnect_timeout" | "quit" | "kill",
+	): Promise<void> {
+		if (!(await requireCurrentAuthority()) || handle.processState === "stopped") return;
+		handle.deathReason = reason;
+		handle.pendingHeartbeat = undefined;
+		handle.disconnectedAt = undefined;
+		handle.disconnectDeadlineAt = undefined;
+		handle.reconnecting = false;
+		rejectPendingAcks(handle, handle.ipcConn?.id || "", "Child IPC connection ended.");
+		markStopped(handle, now(), {
+			error:
+				reason === "heartbeat_timeout"
+					? "IPC heartbeat timed out."
+					: reason === "reconnect_timeout"
+						? "IPC reconnect grace expired."
+						: undefined,
+		});
+		handle.cleanupRequired = true;
+		handle.terminalStateDurable = false;
+		handle.terminalCleanup = {
+			status: "pending",
+			attempts: 0,
+			nextAttemptAt: monotonicNow(),
+		};
+		notifyWaiters(handle);
+		await cleanupTransport(handle);
+		update(handle, false);
+		if (!(await persist())) {
+			handle.terminalCleanup.nextAttemptAt = monotonicNow() + HEARTBEAT_SWEEP_MS;
+			reconcileWatchdog();
+			return;
 		}
+		handle.terminalStateDurable = true;
+		await attemptTerminalCleanup(handle);
 	}
 	function enqueueAuthorizedMutation(
 		handle: SubagentHandle,
 		action: () => void | Promise<void>,
-	): void {
+	): Promise<void> {
 		handle.ipcMutationChain = handle.ipcMutationChain
 			.then(async () => {
 				if (await requireCurrentAuthority()) await action();
@@ -900,6 +1071,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 					`Authorized IPC mutation failed: ${String(error)}`,
 				),
 			);
+		return handle.ipcMutationChain;
 	}
 	async function attachServer(handle: SubagentHandle): Promise<void> {
 		if (!(await requireCurrentAuthority()))
@@ -913,18 +1085,18 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			onSnapshot: (frame, conn) =>
 				enqueueAuthorizedMutation(handle, () => {
 					if (
-						frame.childId === handle.id &&
-						isCurrentEpochWithOwner(handle, frame, conn) &&
-						frame.sessionId === handle.sessionId &&
-						frame.runId >= handle.runSequence
+						frame.childId !== handle.id ||
+						!isCurrentEpochWithOwner(handle, frame, conn) ||
+						frame.sessionId !== handle.sessionId
 					) {
-						applySnapshot(handle, frame);
-					} else {
 						addDiagnostic(
 							handle,
 							"Ignored snapshot from a stale IPC connection or session epoch.",
 						);
+						return;
 					}
+					recordCurrentFrame(handle);
+					if (frame.runId >= handle.runSequence) applySnapshot(handle, frame);
 				}),
 			onEvent: (frame: EventFrame, conn) =>
 				enqueueAuthorizedMutation(handle, () => {
@@ -938,6 +1110,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 						);
 						return;
 					}
+					recordCurrentFrame(handle);
 					if (frame.event === "session_shutdown") return;
 					dispatchSubagentEvent(
 						handle,
@@ -947,13 +1120,17 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				}),
 			onAck: (frame, conn) =>
 				enqueueAuthorizedMutation(handle, () => {
+					if (
+						frame.childId !== handle.id ||
+						!isCurrentEpochWithOwner(handle, frame, conn)
+					) {
+						addDiagnostic(handle, "Ignored acknowledgement from a stale IPC connection epoch.");
+						return;
+					}
+					recordCurrentFrame(handle);
 					const pending = handle.pendingAcks.get(frame.id);
 					if (
 						!pending ||
-						frame.ownerSessionFile !== handle.ownerSessionFile ||
-						frame.ownerSessionId !== handle.ownerSessionId ||
-						frame.launchControllerInstanceId !== handle.controllerInstanceId ||
-						frame.incarnation !== handle.incarnation ||
 						!acknowledgementMatchesConnectionEpoch(
 							{
 								parentConnectionId: handle.ipcConn?.id,
@@ -964,10 +1141,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 							pending,
 						)
 					) {
-						addDiagnostic(
-							handle,
-							"Ignored acknowledgement from a stale IPC connection epoch.",
-						);
+						addDiagnostic(handle, "Ignored acknowledgement without a current request.");
 						return;
 					}
 					clearTimeout(pending.timer);
@@ -981,34 +1155,45 @@ export default function subagentExtension(pi: ExtensionAPI) {
 						!isCurrentEpochWithOwner(handle, frame, conn)
 					)
 						return;
-					handle.reconnecting = frame.reason !== "quit";
-					addDiagnostic(
-						handle,
-						`Child connection closing for ${frame.reason}.`,
-					);
-					update(handle);
+					recordCurrentFrame(handle);
+					addDiagnostic(handle, `Child connection closing for ${frame.reason}.`);
 				}),
-			onPong: () => {},
-			onConnectionClose: (conn, hadBye, reason) =>
+			onPong: (frame: PongFrame, conn) =>
 				enqueueAuthorizedMutation(handle, () => {
-					if (handle.ipcConn?.id !== conn.id) return;
+					if (
+						frame.childId !== handle.id ||
+						!isCurrentEpochWithOwner(handle, frame, conn)
+					)
+						return;
+					recordCurrentFrame(handle);
+					const pending = handle.pendingHeartbeat;
+					if (
+						pending &&
+						frame.id === pending.id &&
+						pending.parentConnectionId === conn.id &&
+						pending.childConnectionId === frame.connectionId
+					)
+						handle.pendingHeartbeat = undefined;
+				}),
+			onConnectionClose: (conn, hadBye, reason) =>
+				enqueueAuthorizedMutation(handle, async () => {
+					if (handle.processState === "stopped" || handle.ipcConn?.id !== conn.id)
+						return;
 					rejectPendingAcks(
 						handle,
 						conn.id,
 						"Child IPC connection closed before acknowledgement.",
 					);
 					handle.ipcConn = undefined;
-					handle.reconnecting = reason !== "quit";
+					if (hadBye && reason === "quit") {
+						await declareDead(handle, "quit");
+						return;
+					}
+					startReconnectGrace(handle);
 					addDiagnostic(
 						handle,
 						`Child IPC disconnected${hadBye ? ` (${reason})` : ""}; awaiting reconnect.`,
 					);
-					update(handle);
-					const probeTimer = setTimeout(
-						() => void probeProcess(handle),
-						reason === "quit" ? KILL_DEADLINE_MS : 0,
-					);
-					probeTimer.unref();
 				}),
 			onConnectionError: (_conn, error) =>
 				addDiagnostic(handle, `IPC connection error: ${error.message}`),
@@ -1092,31 +1277,16 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			});
 		});
 	}
-	async function safePane(handle: SubagentHandle): Promise<boolean> {
-		if (!(await requireCurrentAuthority())) return false;
-		if (handle.tabId === undefined || handle.paneId === undefined) return false;
-		if (
-			await revalidatePane(handle.tabId, handle.paneId, paneIdentity(handle))
-		) {
-			return true;
-		}
-		await probeProcess(handle);
-		return false;
-	}
 	async function interrupt(handle: SubagentHandle): Promise<boolean> {
 		if (handle.processState !== "alive")
 			throw new Error(`Subagent #${handle.id} is no longer running.`);
-		if (!(await safePane(handle)))
-			throw new Error(
-				`Subagent #${handle.id} pane identity could not be revalidated.`,
-			);
-		const cursor = handle.lastSettledRunId;
 		const paneId = handle.paneId;
-		if (paneId === undefined)
-			throw new Error(`Subagent #${handle.id} pane identity is unavailable.`);
+		if (paneId === undefined || !handle.zellijSessionName)
+			throw new Error(`Subagent #${handle.id} stable pane identity is unavailable.`);
 		if (!(await requireCurrentAuthority()))
 			throw new Error(leaseConflictMessage());
-		await sendKeys(paneId, "Esc");
+		const cursor = handle.lastSettledRunId;
+		await sendKeysInSession(handle.zellijSessionName, paneId, "Esc");
 		if (handle.runState === "idle") return true;
 		const settled = await waitFor(
 			[{ handle, cursor }],
@@ -1164,50 +1334,14 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		handle.terminationPromise = (async () => {
 			settlementNotifications.suppressChild(handle.id);
 			requestKill(handle, now());
-			update(handle);
+			update(handle, false);
 			await interrupt(handle).catch((error) =>
 				addDiagnostic(handle, `Interrupt before kill failed: ${String(error)}`),
 			);
 			await new Promise((resolve) => setTimeout(resolve, TERM_DEADLINE_MS));
-			if (
-				handle.processState === "alive" &&
-				handle.tabId !== undefined &&
-				handle.paneId !== undefined
-			) {
-				try {
-					if (!(await requireCurrentAuthority()))
-						throw new Error(leaseConflictMessage());
-					const closed = await closeValidatedSubagentTab(
-						handle.tabId,
-						handle.paneId,
-						paneIdentity(handle),
-					);
-					if (!closed) await probeProcess(handle);
-				} catch (error) {
-					addDiagnostic(
-						handle,
-						`Failed to close tracked Zellij tab: ${String(error)}`,
-					);
-				}
-			}
-			const deadline = now() + KILL_DEADLINE_MS;
-			while (handle.processState === "alive" && now() < deadline) {
-				await probeProcess(handle);
-				if (handle.processState === "alive")
-					await new Promise((resolve) => setTimeout(resolve, 100));
-			}
-			if (handle.processState === "alive") {
-				addDiagnostic(
-					handle,
-					"Termination deadline elapsed while the tracked child still appears live.",
-				);
-			} else {
-				await cleanupTransport(handle);
-			}
-			handle.completedAt ||=
-				handle.processState === "stopped" ? now() : undefined;
+			await enqueueAuthorizedMutation(handle, () => declareDead(handle, "kill"));
+			handle.completedAt ||= now();
 			await handle.settlementPersistenceChain;
-			update(handle);
 			await persistenceChain;
 			return handle;
 		})();
@@ -1220,7 +1354,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		requestedModel: string,
 		requestedThinking: ThinkingLevel,
 	): Promise<SubagentHandle> {
-		await ensureZellij();
+		const zellijSessionName = await ensureZellij();
 		if (!(await requireCurrentAuthority()))
 			throw new Error(leaseConflictMessage());
 		const resolvedOwner = owner;
@@ -1255,6 +1389,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			socketPath,
 			requestedModel,
 			requestedThinking,
+			zellijSessionName,
 			processState: "alive",
 			runState: "idle",
 			createdAt: now(),
@@ -1294,13 +1429,15 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				BRIDGE_LOG_PATH: join(sessionDir, "child-events.log"),
 				TERM: "xterm-256color",
 			};
-			handle.tabId = await newTab(
+			const launched = await newTab(
 				spec.name?.trim() || `subagent-${id.slice(0, 8)}`,
 				cwd,
 				command,
 				env,
 			);
-			handle.paneId = await discoverPaneId(handle.tabId);
+			handle.tabId = launched.tabId;
+			handle.zellijSessionName = launched.sessionName;
+			handle.paneId = await discoverPaneId(handle.tabId, paneIdentity(handle));
 			update(handle);
 			await awaitReady(handle);
 			const before = handle.runSequence;
@@ -1316,7 +1453,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				`Child startup failed: ${error instanceof Error ? error.message : String(error)}`,
 			);
 			await terminate(handle).catch(() => {});
-			handles.delete(id);
+			if (!handle.cleanupRequired) handles.delete(id);
 			await persist();
 			throw error;
 		}
@@ -1326,7 +1463,11 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		handle: SubagentHandle,
 		task?: string,
 	): Promise<void> {
-		await ensureZellij();
+		if (handle.cleanupRequired)
+			throw new Error(
+				`Subagent #${handle.id} has required terminal cleanup. Resume is blocked until cleanup completes.`,
+			);
+		const zellijSessionName = await ensureZellij();
 		if (!(await requireCurrentAuthority()))
 			throw new Error(leaseConflictMessage());
 		const resolvedOwner = owner;
@@ -1360,6 +1501,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		handle.incarnation = incarnation;
 		handle.controllerInstanceId = controllerInstanceId;
 		handle.socketPath = socketPath;
+		handle.zellijSessionName = zellijSessionName;
 		handle.resumedFrom = oldIncarnation;
 		reviveForResume(handle);
 		handle.completedAt = undefined;
@@ -1372,6 +1514,13 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		handle.ipcConn = undefined;
 		handle.ipcReadyAt = undefined;
 		handle.exitCode = undefined;
+		handle.pendingHeartbeat = undefined;
+		handle.disconnectedAt = undefined;
+		handle.disconnectDeadlineAt = undefined;
+		handle.deathReason = undefined;
+		handle.terminalCleanup = { status: "none", attempts: 0 };
+		handle.terminalStateDurable = false;
+		handle.lastIpcFrameAt = monotonicNow();
 		await attachServer(handle);
 		try {
 			const command = getPiInvocation([
@@ -1402,13 +1551,15 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				BRIDGE_LOG_PATH: join(handle.sessionDir, "child-events.log"),
 				TERM: "xterm-256color",
 			};
-			handle.tabId = await newTab(
+			const launched = await newTab(
 				handle.name || `subagent-${handle.id.slice(0, 8)}`,
 				handle.cwd,
 				command,
 				env,
 			);
-			handle.paneId = await discoverPaneId(handle.tabId);
+			handle.tabId = launched.tabId;
+			handle.zellijSessionName = launched.sessionName;
+			handle.paneId = await discoverPaneId(handle.tabId, paneIdentity(handle));
 			update(handle);
 			await awaitReady(handle);
 			if (task) {
@@ -1461,7 +1612,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				}
 				return target.handle.processState === "stopped";
 			});
-		await Promise.all(targets.map(({ handle }) => probeProcess(handle)));
 		if (done()) return "completed";
 		return new Promise((resolve) => {
 			let finished = false;
@@ -1470,7 +1620,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				if (finished) return;
 				finished = true;
 				clearTimeout(timer);
-				clearInterval(probeTimer);
 				signal?.removeEventListener("abort", abort);
 				for (const [handle, waiter] of waiters) handle.waiters.delete(waiter);
 				resolve(value);
@@ -1484,11 +1633,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				handle.waiters.add(waiter);
 			}
 			const timer = setTimeout(() => finish("timedOut"), timeoutSeconds * 1000);
-			const probeTimer = setInterval(() => {
-				void Promise.all(
-					targets.map(({ handle }) => probeProcess(handle)),
-				).then(check);
-			}, 500);
 			const abort = () => finish("canceled");
 			if (signal?.aborted) finish("canceled");
 			else signal?.addEventListener("abort", abort, { once: true });
@@ -1540,41 +1684,27 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	}
 
 	async function reconcile() {
-		if (!process.env.ZELLIJ_SESSION_NAME) return;
 		if (!owner || !(await requireCurrentAuthority())) return;
 		const path = ownerRegistryPath(getAgentDir(), owner);
-		const saved = await loadRegistry(path);
-		const panes = await listPanes();
-		const reconciled = reconcileRegistryForOwner(saved, panes, owner);
-		for (const entry of reconciled) {
+		const saved = registryEntriesForOwner(await loadRegistry(path), owner);
+		for (const entry of saved) {
 			const existing = handles.get(entry.childId);
-			if (existing) {
-				if (entry.processState === "stopped") {
-					markStopped(existing, now(), {
-						error: "Pane was not live during reconciliation.",
-					});
-					notifyWaiters(existing);
-				} else if (!existing.ipcServer) {
-					existing.reconnecting = true;
-					await attachServer(existing).catch((error) => {
-						addDiagnostic(
-							existing,
-							`Reattach listener failed: ${String(error)}`,
-						);
-					});
-				}
-				continue;
-			}
-			const handle = createHandle(entry);
-			handles.set(handle.id, handle);
-			if (handle.processState === "alive") {
-				handle.reconnecting = true;
+			const handle = existing || createHandle(entry);
+			if (!existing) handles.set(handle.id, handle);
+			if (handle.processState === "alive" && !handle.ipcServer) {
+				startReconnectGrace(handle);
 				await attachServer(handle).catch((error) => {
 					addDiagnostic(handle, `Reattach listener failed: ${String(error)}`);
 				});
 			}
+			if (handle.cleanupRequired) {
+				handle.terminalCleanup.status = "pending";
+				handle.terminalCleanup.nextAttemptAt = monotonicNow();
+				void attemptTerminalCleanup(handle);
+			}
 		}
 		await persist();
+		reconcileWatchdog();
 		refreshUi();
 	}
 	function toInspector(handle: SubagentHandle): InspectorHandle {
@@ -1620,7 +1750,10 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			isStreaming: handle.isStreaming,
 			usage: { ...handle.usage },
 			stopReason: handle.stopReason,
-			error: handle.error,
+			error:
+				handle.terminalCleanup.status === "failed"
+					? handle.terminalCleanup.lastError
+					: handle.error,
 			tentativeError: handle.tentativeError,
 			finalError: handle.finalError,
 			settledAt: handle.settledAt,
@@ -1658,9 +1791,9 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			clearInterval(leaseRenewTimer);
 			leaseRenewTimer = undefined;
 		}
-		if (livenessTimer) {
-			clearInterval(livenessTimer);
-			livenessTimer = undefined;
+		if (watchdogTimer) {
+			clearTimeout(watchdogTimer);
+			watchdogTimer = undefined;
 		}
 	}
 	function startLeaseRenewal() {
@@ -1692,68 +1825,122 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		}, LEASE_RENEW_INTERVAL_MS);
 		leaseRenewTimer.unref();
 	}
-	function anyOwnedChildAlive() {
+	function watchdogNeeded() {
 		return [...handles.values()].some(
-			(handle) => handle.processState === "alive",
+			(handle) =>
+				handle.processState === "alive" || handle.terminalCleanup.status === "pending",
 		);
 	}
-	function reconcileLivenessTimer() {
-		if (livenessTimer) {
-			clearInterval(livenessTimer);
-			livenessTimer = undefined;
+	function reconcileWatchdog() {
+		if (watchdogTimer) {
+			clearTimeout(watchdogTimer);
+			watchdogTimer = undefined;
 		}
-		if (!leaseHeld || !anyOwnedChildAlive()) return;
-		livenessTimer = setInterval(() => {
-			void livenessTick();
-		}, 1000);
-		livenessTimer.unref();
+		if (!leaseHeld || !watchdogNeeded()) return;
+		const current = monotonicNow();
+		const cleanupDelay = [...handles.values()]
+			.filter(
+				(handle) =>
+					handle.terminalCleanup.status === "pending" &&
+					handle.terminalCleanup.nextAttemptAt !== undefined,
+			)
+			.map((handle) => Math.max(0, handle.terminalCleanup.nextAttemptAt! - current))
+			.reduce((minimum, delay) => Math.min(minimum, delay), HEARTBEAT_SWEEP_MS);
+		watchdogTimer = setTimeout(
+			() => void watchdogSweep(),
+			Math.min(HEARTBEAT_SWEEP_MS, cleanupDelay),
+		);
+		watchdogTimer.unref();
 	}
-	async function livenessTick() {
-		if (!owner || !(await requireCurrentAuthority())) return;
-		let panes: Awaited<ReturnType<typeof listPanes>>;
+	async function watchdogSweep(): Promise<void> {
+		if (watchdogSweepActive) return;
+		watchdogSweepActive = true;
 		try {
-			panes = await listPanes();
-		} catch (error) {
-			for (const handle of handles.values()) {
-				if (handle.processState !== "alive") continue;
-				addDiagnostic(
-					handle,
-					`Liveness poll failed: ${error instanceof Error ? error.message : String(error)}`,
-				);
-			}
-			return;
-		}
-		for (const handle of handles.values()) {
-			if (handle.processState !== "alive") continue;
-			if (handle.tabId === undefined || handle.paneId === undefined) continue;
-			const pane = panes.find(
-				(candidate) =>
-					candidate.id === handle.paneId && candidate.tab_id === handle.tabId,
+			if (!owner || !(await requireCurrentAuthority())) return;
+			const current = monotonicNow();
+			const stalled = parentStalled(lastWatchdogSweepAt, current);
+			lastWatchdogSweepAt = current;
+			const decisions = [...handles.values()].map((handle) =>
+				enqueueAuthorizedMutation(handle, async () => {
+					const at = monotonicNow();
+					if (handle.terminalCleanup.status === "pending") {
+						if (
+							handle.terminalCleanup.nextAttemptAt === undefined ||
+							handle.terminalCleanup.nextAttemptAt <= at
+							)
+							await attemptTerminalCleanup(handle);
+						return;
+					}
+					if (handle.processState !== "alive") return;
+					if (stalled) {
+						if (handle.ipcConn) {
+							handle.pendingHeartbeat = undefined;
+							handle.lastIpcFrameAt = at;
+						} else startReconnectGrace(handle, at);
+						addDiagnostic(handle, "Watchdog stall reset the IPC observation window.");
+						return;
+					}
+					if (
+						heartbeatExpired(
+							handle.pendingHeartbeat,
+							at,
+							handle.ipcConn?.id,
+							handle.connectionId,
+						)
+					) {
+						await declareDead(handle, "heartbeat_timeout");
+						return;
+					}
+					if (reconnectExpired(handle.disconnectDeadlineAt, at, !!handle.ipcConn)) {
+						await declareDead(handle, "reconnect_timeout");
+						return;
+					}
+					if (
+						pingDue(
+							{
+								processState: handle.processState,
+								connected: !!handle.ipcConn && !!handle.connectionId,
+								lastIpcFrameAt: handle.lastIpcFrameAt,
+								pendingHeartbeat: handle.pendingHeartbeat,
+							},
+							at,
+						) &&
+						handle.ipcConn &&
+						handle.connectionId
+					) {
+						const connection = handle.ipcConn;
+						const childConnectionId = handle.connectionId;
+						const id = createId();
+						handle.pendingHeartbeat = {
+							id,
+							sentAt: at,
+							deadlineAt: at + HEARTBEAT_RESPONSE_MS,
+							parentConnectionId: connection.id,
+							childConnectionId,
+						};
+						try {
+							connection.send({
+								type: "ping",
+								id,
+								ownerSessionFile: handle.ownerSessionFile,
+								ownerSessionId: handle.ownerSessionId,
+								launchControllerInstanceId: handle.controllerInstanceId,
+								incarnation: handle.incarnation,
+							});
+						} catch {
+							if (handle.ipcConn?.id === connection.id) {
+								handle.ipcConn = undefined;
+								startReconnectGrace(handle, at);
+							}
+						}
+					}
+				}),
 			);
-			const matches = pane
-				? paneMatchesSubagent(
-						pane,
-						handle.tabId,
-						handle.paneId,
-						paneIdentity(handle),
-					)
-				: false;
-			if (!matches) {
-				handle.exitCode = pane?.exit_status ?? undefined;
-				markStopped(handle, now(), {
-					code: pane?.exit_status,
-					error:
-						pane && !pane.exited
-							? "Tracked Zellij IDs now belong to an unrelated process."
-							: undefined,
-				});
-				handle.reconnecting = false;
-				notifyWaiters(handle);
-				await cleanupTransport(handle);
-				update(handle);
-			}
+			await Promise.all(decisions);
+		} finally {
+			watchdogSweepActive = false;
+			reconcileWatchdog();
 		}
-		reconcileLivenessTimer();
 	}
 
 	async function establishController(ctx: ExtensionContext): Promise<void> {
@@ -1804,7 +1991,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		await reconcile().catch((error) =>
 			console.error(`Subagent reconcile failed: ${String(error)}`),
 		);
-		reconcileLivenessTimer();
+		reconcileWatchdog();
 		refreshUi();
 	});
 	pi.on("session_shutdown", async (event, ctx) => {
@@ -1821,13 +2008,14 @@ export default function subagentExtension(pi: ExtensionAPI) {
 							await terminate(handle);
 							return;
 						}
-						if (handle.tabId === undefined || handle.paneId === undefined)
-							return;
-						await closeValidatedSubagentTab(
-							handle.tabId,
-							handle.paneId,
-							paneIdentity(handle),
-						);
+						handle.cleanupRequired = true;
+						handle.terminalStateDurable = false;
+						handle.terminalCleanup = {
+							status: "pending",
+							attempts: 0,
+							nextAttemptAt: monotonicNow(),
+						};
+						await attemptTerminalCleanup(handle);
 					}),
 				);
 			await releaseLeaseIfHeld();
@@ -1962,7 +2150,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 					],
 					details: {},
 				};
-			await probeProcess(handle);
 			const serial = await serialize(handle);
 			return {
 				content: [{ type: "text" as const, text: await summary(handle) }],
@@ -2355,6 +2542,16 @@ export default function subagentExtension(pi: ExtensionAPI) {
 					],
 					details: { handle: await serialize(handle) },
 				};
+			if (handle.cleanupRequired)
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: `Subagent #${handle.id} has required terminal cleanup. Resume is blocked until cleanup completes.`,
+						},
+					],
+					details: { handle: await serialize(handle) },
+				};
 			if (!requireLease())
 				return {
 					content: [{ type: "text" as const, text: leaseConflictMessage() }],
@@ -2431,7 +2628,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 						clearFinished: () => {
 							let count = 0;
 							for (const handle of handles.values())
-								if (!active(handle)) {
+								if (!active(handle) && !handle.cleanupRequired) {
 									handles.delete(handle.id);
 									count++;
 								}

@@ -12,7 +12,7 @@ import type {
 } from "@mariozechner/pi-coding-agent";
 import type { TSchema } from "@sinclair/typebox";
 import { Check } from "@sinclair/typebox/value";
-import subagentExtension from "./index.ts";
+import subagentExtension, { withTerminalCleanupLock } from "./index.ts";
 import { canonicalOwnerSessionFile } from "./owner.ts";
 import { persistRunResult, runResultPaths } from "./result-store.ts";
 
@@ -455,6 +455,87 @@ async function eventually(
 	}
 }
 
+const nativeSetTimeout = globalThis.setTimeout;
+
+class FakeWatchdogScheduler {
+	private nextId = 1;
+	private readonly timers = new Map<
+		number,
+		{ at: number; callback: (...args: unknown[]) => void; args: unknown[] }
+	>();
+	private readonly originalNow = performance.now;
+	private readonly originalSetTimeout = globalThis.setTimeout;
+	private readonly originalClearTimeout = globalThis.clearTimeout;
+	now = 0;
+
+	install(): void {
+		performance.now = () => this.now;
+		globalThis.setTimeout = ((
+			callback: (...args: unknown[]) => void,
+			delay = 0,
+			...args: unknown[]
+		) => {
+			const id = this.nextId++;
+			this.timers.set(id, {
+				at: this.now + Math.max(0, Number(delay) || 0),
+				callback,
+				args,
+			});
+			return {
+				id,
+				unref() {
+					return this;
+				},
+			};
+		}) as typeof setTimeout;
+		globalThis.clearTimeout = ((timer: { id?: number } | number | undefined) => {
+			const id = typeof timer === "number" ? timer : timer?.id;
+			if (id !== undefined) this.timers.delete(id);
+		}) as typeof clearTimeout;
+	}
+
+	advanceBy(milliseconds: number): void {
+		this.now += milliseconds;
+		for (;;) {
+			const due = [...this.timers.entries()]
+				.filter(([, timer]) => timer.at <= this.now)
+				.sort((a, b) => a[1].at - b[1].at || a[0] - b[0])[0];
+			if (!due) return;
+			const [id, timer] = due;
+			this.timers.delete(id);
+			timer.callback(...timer.args);
+		}
+	}
+
+	get pendingTimers(): number {
+		return this.timers.size;
+	}
+
+	get scheduledDelays(): number[] {
+		return [...this.timers.values()]
+			.map((timer) => timer.at - this.now)
+			.sort((a, b) => a - b);
+	}
+
+	restore(): void {
+		this.timers.clear();
+		performance.now = this.originalNow;
+		globalThis.setTimeout = this.originalSetTimeout;
+		globalThis.clearTimeout = this.originalClearTimeout;
+	}
+}
+
+async function flushController(
+	predicate: () => Promise<boolean> | boolean,
+	attempts = 1_000,
+): Promise<void> {
+	for (let attempt = 0; attempt < attempts; attempt++) {
+		if (await predicate()) return;
+		await new Promise<void>((resolve) => nativeSetTimeout(resolve, 1));
+	}
+	assert.fail("controller did not reach the expected deterministic state");
+}
+
 async function setupControllerWithChild(opts: {
 	childId?: string;
 	incarnation?: string;
@@ -466,6 +547,9 @@ async function setupControllerWithChild(opts: {
 	paneIncarnation?: string;
 	runId?: number;
 	lastSettledRunId?: number;
+	cleanupRequired?: boolean;
+	childCount?: number;
+	observeUi?: boolean;
 }) {
 	const directory = await mkdtemp(join(tmpdir(), "pi-acc-"));
 	const agentDirectory = join(directory, "agent");
@@ -519,17 +603,31 @@ async function setupControllerWithChild(opts: {
 		await writeFile(sessionFilePath, `{"type":"session"}\n`, {
 			mode: 0o600,
 		});
+	const children = Array.from({ length: opts.childCount ?? 1 }, (_, index) => ({
+		childId: index === 0 ? childId : `${childId}-${index + 1}`,
+		incarnation: index === 0 ? incarnation : `${incarnation}-${index + 1}`,
+		socketPath: index === 0 ? socketPath : join(directory, `bridge-${index + 1}.sock`),
+		paneId: index + 2,
+		sessionDir:
+			index === 0
+				? sessionDir
+				: join(agentDirectory, "sessions", "subagents", `${childId}-${index + 1}`),
+	}));
+	for (const child of children) await mkdir(child.sessionDir, { recursive: true, mode: 0o700 });
 	await writeFile(
 		registryPath,
-		`${JSON.stringify([
-			{
-				childId,
+		`${JSON.stringify(
+			children.map((child) => ({
+				childId: child.childId,
 				task: "task",
 				cwd: directory,
 				tabId: 1,
-				paneId: 2,
-				sessionDir,
-				socketPath,
+				paneId: child.paneId,
+				zellijSessionName: "test",
+				terminalCleanupPending: opts.cleanupRequired,
+				terminalCleanupError: opts.cleanupRequired ? "prior cleanup failure" : undefined,
+				sessionDir: child.sessionDir,
+				socketPath: child.socketPath,
 				sessionFile: opts.hasSessionFile ? sessionFilePath : undefined,
 				requestedModel: "p/m",
 				requestedThinking: "off",
@@ -537,14 +635,14 @@ async function setupControllerWithChild(opts: {
 				runState: "idle",
 				runId: opts.runId ?? 0,
 				lastSettledRunId: opts.lastSettledRunId ?? 0,
-				createdAt: 1,
+				createdAt: 1 + child.paneId,
 				lastActivityAt: 1,
 				ownerSessionFile,
 				ownerSessionId,
 				controllerInstanceId,
-				incarnation,
-			},
-		])}\n`,
+				incarnation: child.incarnation,
+			})),
+		)}\n`,
 		{ mode: 0o600 },
 	);
 	const old = {
@@ -557,11 +655,22 @@ async function setupControllerWithChild(opts: {
 	process.env.ZELLIJ_SESSION_NAME = "test";
 	const handlers = new Map<string, TestHandler>();
 	const sentMessages: SentMessage[] = [];
+	let uiRefreshCount = 0;
 	const ctx = {
-		mode: "json",
+		mode: opts.observeUi ? "tui" : "json",
+		cwd: directory,
+		modelRegistry: {
+			getAll: () => [{ provider: "p", id: "m" }],
+			getAvailable: () => [{ provider: "p", id: "m" }],
+		},
 		sessionManager: {
 			getSessionFile: () => ownerSessionFile,
 			getSessionId: () => ownerSessionId,
+		},
+		ui: {
+			setWidget: () => {
+				uiRefreshCount++;
+			},
 		},
 	} as unknown as ExtensionContext;
 	const tools = setup(handlers, sentMessages);
@@ -583,6 +692,11 @@ async function setupControllerWithChild(opts: {
 		sessionDir,
 		sessionFilePath,
 		paneCommand,
+		children,
+		getUiRefreshCount: () => uiRefreshCount,
+		resetUiRefreshCount: () => {
+			uiRefreshCount = 0;
+		},
 		cleanup: async () => {
 			await handlers.get("session_shutdown")?.({ reason: "reload" }, ctx);
 			if (old.agentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
@@ -610,6 +724,81 @@ function makeFrame(
 	extra: Record<string, unknown> = {},
 ): string {
 	return `${JSON.stringify({ type, schemaVersion: 1, at: Date.now(), ...base, ...extra })}\n`;
+}
+
+function captureFrames(socket: net.Socket): Record<string, unknown>[] {
+	const frames: Record<string, unknown>[] = [];
+	let buffer = "";
+	socket.setEncoding("utf8");
+	socket.on("data", (chunk: string) => {
+		buffer += chunk;
+		for (;;) {
+			const newline = buffer.indexOf("\n");
+			if (newline < 0) break;
+			const line = buffer.slice(0, newline);
+			buffer = buffer.slice(newline + 1);
+			if (line.trim()) frames.push(JSON.parse(line) as Record<string, unknown>);
+		}
+	});
+	return frames;
+}
+
+function childFrameBase(
+	s: {
+		childId: string;
+		ownerSessionFile: string;
+		ownerSessionId: string;
+		controllerInstanceId: string;
+		incarnation: string;
+	},
+	connectionId: string,
+): Record<string, unknown> {
+	return {
+		childId: s.childId,
+		connectionId,
+		ownerSessionFile: s.ownerSessionFile,
+		ownerSessionId: s.ownerSessionId,
+		launchControllerInstanceId: s.controllerInstanceId,
+		incarnation: s.incarnation,
+	};
+}
+
+async function connectHello(
+	s: Awaited<ReturnType<typeof setupControllerWithChild>>,
+	connectionId: string,
+	pid = 100,
+): Promise<{ socket: net.Socket; frames: Record<string, unknown>[] }> {
+	const socket = await connectSocket(s.socketPath);
+	const frames = captureFrames(socket);
+	socket.write(
+		makeFrame("hello", childFrameBase(s, connectionId), {
+			sessionId: "child-session",
+			sessionFile: s.sessionFilePath,
+			sessionFileExists: true,
+			pid,
+			model: { provider: "p", id: "m" },
+			thinkingLevel: "off",
+			reason: "startup",
+		}),
+	);
+	await flushController(() =>
+		requireTool(s.tools, "subagent_status")
+			.execute("x", { id: s.childId })
+			.then((result) => result.details.pid === pid),
+	);
+	return { socket, frames };
+}
+
+async function finishWatchdogSweep(scheduler: FakeWatchdogScheduler): Promise<void> {
+	await flushController(() => scheduler.pendingTimers === 1);
+}
+
+async function advanceWatchdog(
+	scheduler: FakeWatchdogScheduler,
+	milliseconds = 5_000,
+): Promise<void> {
+	scheduler.advanceBy(milliseconds);
+	await finishWatchdogSweep(scheduler);
 }
 
 test("wait preserves timeout, cancellation, all-child, and stopped-process behavior", async () => {
@@ -1105,12 +1294,20 @@ test("result visibility: settled wait exposes content and details.result", async
 		assert.equal(missing.details.available, false);
 		assert.equal(missing.details.status, "missing");
 		assert.equal(missing.details.reason, "run_not_known");
-		await eventually(() => s.sentMessages.length === 2);
-		const secondNotification = s.sentMessages[1]?.message.details as {
-			settlements: { runId: number; outcome: string }[];
-		};
+		const laterSettlements = () =>
+			s.sentMessages.slice(1).flatMap((notification) => {
+				const details = notification.message.details as {
+					settlements: { runId: number; outcome: string }[];
+				};
+				return details.settlements;
+			});
+		await eventually(() =>
+			[2, 3].every((runId) =>
+				laterSettlements().some((settlement) => settlement.runId === runId),
+			),
+		);
 		assert.deepEqual(
-			secondNotification.settlements.map(({ runId, outcome }) => ({
+			laterSettlements().map(({ runId, outcome }) => ({
 				runId,
 				outcome,
 			})),
@@ -1119,6 +1316,7 @@ test("result visibility: settled wait exposes content and details.result", async
 				{ runId: 3, outcome: "aborted" },
 			],
 		);
+		const notificationsBeforeRun4 = s.sentMessages.length;
 
 		const abortedResult = await requireTool(
 			s.tools,
@@ -1134,10 +1332,12 @@ test("result visibility: settled wait exposes content and details.result", async
 				.execute("x", { id: s.childId })
 				.then((result) => result.details.lastSettledRunId === 4),
 		);
+		await eventually(() => s.sentMessages.length > notificationsBeforeRun4);
+		const notificationCount = s.sentMessages.length;
 		await s.handlers.get("session_shutdown")?.({ reason: "reload" }, s.ctx);
 		await s.handlers.get("session_start")?.({ reason: "reload" }, s.ctx);
 		await new Promise((resolve) => setTimeout(resolve, 75));
-		assert.equal(s.sentMessages.length, 2);
+		assert.equal(s.sentMessages.length, notificationCount);
 		socket.destroy();
 	} finally {
 		await s.cleanup();
@@ -1247,6 +1447,53 @@ test("foreign and legacy registries are not loaded or modified", async () => {
 		else process.env.PI_SUBAGENT_ZELLIJ_BIN = old.zellijBin;
 		if (old.session === undefined) delete process.env.ZELLIJ_SESSION_NAME;
 		else process.env.ZELLIJ_SESSION_NAME = old.session;
+	}
+});
+
+test("ambiguous new-tab failure retains durable cleanup state", async () => {
+	const s = await setupControllerWithChild({ processState: "stopped" });
+	const previousDepth = process.env.PI_SUBAGENT_DEPTH;
+	process.env.PI_SUBAGENT_DEPTH = "0";
+	try {
+		await writeFile(
+			s.zellijScript,
+			`#!${process.execPath}\nconst args = process.argv.slice(2);\nif (args.includes("new-tab")) { process.on("SIGTERM", () => process.exit(0)); setInterval(() => {}, 1_000); } else process.exit(2);\n`,
+		);
+		await chmod(s.zellijScript, 0o755);
+		const result = await requireTool(s.tools, "subagent_start").execute(
+			"x",
+			{ task: "work", model: "p/m", thinking: "off" },
+			undefined,
+			undefined,
+			s.ctx,
+		);
+		assert.match(result.content[0]?.text || "", /timed out/);
+		const entries = JSON.parse(await readFile(s.registryPath, "utf8")) as Record<string, unknown>[];
+		const retained = entries.find((entry) => entry.childId !== s.childId);
+		assert.ok(retained);
+		assert.equal(retained.terminalCleanupPending, true);
+		assert.match(String(retained.terminalCleanupError), /missing terminal pane ID/);
+	} finally {
+		if (previousDepth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
+		else process.env.PI_SUBAGENT_DEPTH = previousDepth;
+		await s.cleanup();
+	}
+});
+
+test("resume rejects a stopped child with required terminal cleanup", async () => {
+	const s = await setupControllerWithChild({
+		hasSessionFile: true,
+		processState: "stopped",
+		cleanupRequired: true,
+	});
+	try {
+		const result = await requireTool(s.tools, "subagent_resume").execute("x", {
+			id: s.childId,
+		});
+		assert.match(result.content[0]?.text || "", /required terminal cleanup/);
+		assert.equal((result.details.handle as { terminalCleanup?: { status?: string } }).terminalCleanup?.status, "pending");
+	} finally {
+		await s.cleanup();
 	}
 });
 
@@ -1454,89 +1701,1076 @@ test("new, resume, and fork session replacements do not adopt prior-owner childr
 	}
 });
 
-test("quit closes only an owned identity-validated stopped tab", async () => {
-	const s = await setupControllerWithChild({
-		hasSessionFile: true,
-		processState: "stopped",
-	});
-	const closed = join(s.agentDirectory, "closed-tab");
+test("quit closes the saved stable terminal pane without a pane listing", async () => {
+	const s = await setupControllerWithChild({ hasSessionFile: true, processState: "stopped" });
 	try {
-		const panes = JSON.stringify([
-			{
-				id: 2,
-				tab_id: 1,
-				is_plugin: false,
-				exited: true,
-				pane_command: "pi",
-				terminal_command: s.paneCommand,
-			},
-		]);
+		const record = join(s.agentDirectory, "zellij-actions");
 		await writeFile(
 			s.zellijScript,
-			`#!/bin/sh\nif [ "$4" = list-panes ]; then printf '%s\\n' ${JSON.stringify(panes)}; exit 0; fi\nif [ "$4" = close-tab-by-id ]; then printf closed > ${JSON.stringify(closed)}; exit 0; fi\nexit 2\n`,
+			`#!/bin/sh\nprintf '%s\\n' "$@" >> ${JSON.stringify(record)}\nif [ "$4" = close-pane ]; then exit 0; fi\nexit 2\n`,
 		);
+		await chmod(s.zellijScript, 0o755);
 		await s.handlers.get("session_shutdown")?.({ reason: "quit" }, s.ctx);
+		await eventually(() => readFile(record, "utf8").then((value) => value.includes("terminal_2"), () => false));
+		const actions = await readFile(record, "utf8");
+		assert.match(actions, /close-pane/);
+		assert.doesNotMatch(actions, /list-panes/);
+		const entries = JSON.parse(await readFile(s.registryPath, "utf8")) as Record<string, unknown>[];
+		assert.equal(entries[0]?.terminalCleanupPending, false);
+	} finally {
+		await s.cleanup();
+	}
+});
+
+test("controller restart retries durable cleanup after a prior final failure", async () => {
+	const s = await setupControllerWithChild({ hasSessionFile: true, processState: "stopped" });
+	const replacementHandlers = new Map<string, TestHandler>();
+	try {
+		await s.handlers.get("session_shutdown")?.({ reason: "reload" }, s.ctx);
+		const entries = JSON.parse(await readFile(s.registryPath, "utf8")) as Record<string, unknown>[];
+		entries[0]!.terminalCleanupPending = true;
+		entries[0]!.terminalCleanupError = "three prior cleanup failures";
+		await writeFile(s.registryPath, `${JSON.stringify(entries)}\n`);
+		const record = join(s.agentDirectory, "zellij-actions");
+		await writeFile(
+			s.zellijScript,
+			`#!/bin/sh\nprintf '%s\\n' "$@" >> ${JSON.stringify(record)}\nif [ "$4" = close-pane ]; then exit 0; fi\nexit 2\n`,
+		);
+		await chmod(s.zellijScript, 0o755);
+		const replacementTools = setup(replacementHandlers);
+		await replacementHandlers.get("session_start")?.({ reason: "reload" }, s.ctx);
 		await eventually(() =>
-			readFile(closed, "utf8").then(
-				(value) => value === "closed",
+			requireTool(replacementTools, "subagent_status")
+				.execute("x", { id: s.childId })
+				.then((result) => result.details.terminalCleanup?.status === "complete"),
+		);
+		await eventually(async () => {
+			const persisted = JSON.parse(await readFile(s.registryPath, "utf8")) as Record<
+				string,
+				unknown
+			>[];
+			return persisted[0]?.terminalCleanupPending === false;
+		});
+		const retried = JSON.parse(await readFile(s.registryPath, "utf8")) as Record<string, unknown>[];
+		assert.match(await readFile(record, "utf8"), /terminal_2/);
+		assert.equal(retried[0]?.terminalCleanupPending, false);
+		assert.equal((await requireTool(replacementTools, "subagent_status").execute("x", { id: s.childId })).details.terminalCleanup?.status, "complete");
+	} finally {
+		await replacementHandlers.get("session_shutdown")?.({ reason: "reload" }, s.ctx);
+		await s.cleanup();
+	}
+});
+
+test("status and wait do not query Zellij", async () => {
+	const s = await setupControllerWithChild({ hasSessionFile: true });
+	try {
+		const record = join(s.agentDirectory, "zellij-actions");
+		await writeFile(s.zellijScript, `#!/bin/sh\nprintf '%s\\n' "$@" >> ${JSON.stringify(record)}\nexit 2\n`);
+		await chmod(s.zellijScript, 0o755);
+		await requireTool(s.tools, "subagent_status").execute("x", { id: s.childId });
+		await requireTool(s.tools, "subagent_wait").execute("x", { id: s.childId, timeoutSeconds: 1 });
+		assert.doesNotMatch(await readFile(record, "utf8").catch(() => ""), /list-panes/);
+	} finally {
+		await s.cleanup();
+	}
+});
+
+test("active interrupt retains its settlement cursor after direct Esc", async () => {
+	const s = await setupControllerWithChild({ hasSessionFile: true });
+	let socket: net.Socket | undefined;
+	try {
+		const record = join(s.agentDirectory, "zellij-actions");
+		await writeFile(
+			s.zellijScript,
+			`#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(record)}\nif [ "$4" = send-keys ]; then exit 0; fi\nexit 2\n`,
+		);
+		await chmod(s.zellijScript, 0o755);
+		socket = await connectSocket(s.socketPath);
+		const frame = (type: string, extra: Record<string, unknown> = {}) =>
+			makeFrame(type, {
+				childId: s.childId,
+				connectionId: "interrupt-connection",
+				ownerSessionFile: s.ownerSessionFile,
+				ownerSessionId: s.ownerSessionId,
+				launchControllerInstanceId: s.controllerInstanceId,
+				incarnation: s.incarnation,
+			}, extra);
+		socket.write(frame("hello", {
+			sessionId: "child-session",
+			sessionFile: s.sessionFilePath,
+			sessionFileExists: true,
+			pid: 100,
+			model: { provider: "p", id: "m" },
+			thinkingLevel: "off",
+			reason: "startup",
+		}));
+		socket.write(frame("event", { event: "agent_start", runId: 1 }));
+		await eventually(() => requireTool(s.tools, "subagent_status").execute("x", { id: s.childId }).then((result) => result.details.runState === "running"));
+		const interrupted = requireTool(s.tools, "subagent_interrupt").execute("x", { id: s.childId });
+		await eventually(() => readFile(record, "utf8").then((value) => value.includes("Esc"), () => false));
+		const result = await interrupted;
+		assert.equal(result.details.interrupted, false);
+		assert.match(result.content[0]?.text || "", /settlement acknowledgement timed out/);
+	} finally {
+		socket?.destroy();
+		await s.cleanup();
+	}
+});
+
+test("a socket closure starts reconnect grace without a Zellij query", async () => {
+	const s = await setupControllerWithChild({ hasSessionFile: true });
+	let socket: net.Socket | undefined;
+	try {
+		const record = join(s.agentDirectory, "zellij-actions");
+		await writeFile(s.zellijScript, `#!/bin/sh\nprintf '%s\\n' "$@" >> ${JSON.stringify(record)}\nexit 2\n`);
+		await chmod(s.zellijScript, 0o755);
+		socket = await connectSocket(s.socketPath);
+		socket.write(makeFrame("hello", {
+			childId: s.childId,
+			connectionId: "connection-a",
+			ownerSessionFile: s.ownerSessionFile,
+			ownerSessionId: s.ownerSessionId,
+			launchControllerInstanceId: s.controllerInstanceId,
+			incarnation: s.incarnation,
+		}, {
+			sessionId: "child-session",
+			sessionFile: s.sessionFilePath,
+			sessionFileExists: true,
+			pid: 100,
+			model: { provider: "p", id: "m" },
+			thinkingLevel: "off",
+			reason: "startup",
+		}));
+		await eventually(() => requireTool(s.tools, "subagent_status").execute("x", { id: s.childId }).then((result) => result.details.pid === 100));
+		socket.destroy();
+		await eventually(() => requireTool(s.tools, "subagent_status").execute("x", { id: s.childId }).then((result) => result.details.ipcLiveness?.state === "reconnecting"));
+		const status = await requireTool(s.tools, "subagent_status").execute("x", { id: s.childId });
+		assert.equal(status.details.processState, "alive");
+		assert.equal(status.details.ipcLiveness?.state, "reconnecting");
+		assert.doesNotMatch(await readFile(record, "utf8").catch(() => ""), /list-panes/);
+	} finally {
+		socket?.destroy();
+		await s.cleanup();
+	}
+});
+
+test("controller watchdog sends fenced heartbeats without activity, persistence, UI, or Zellij polling", async () => {
+	const scheduler = new FakeWatchdogScheduler();
+	scheduler.install();
+	let s: Awaited<ReturnType<typeof setupControllerWithChild>> | undefined;
+	let socket: net.Socket | undefined;
+	const originalRename = nodeFs.rename.bind(nodeFs);
+	let registryWrites = 0;
+	try {
+		s = await setupControllerWithChild({ hasSessionFile: true, observeUi: true });
+		const connected = await connectHello(s, "heartbeat-connection");
+		socket = connected.socket;
+		const frames = connected.frames;
+		const actionLog = join(s.agentDirectory, "watchdog-zellij-actions");
+		await writeFile(
+			s.zellijScript,
+			`#!/bin/sh\nprintf '%s\\n' "$@" >> ${JSON.stringify(actionLog)}\nexit 2\n`,
+		);
+		await chmod(s.zellijScript, 0o755);
+		for (let turn = 0; turn < 20; turn++)
+			await new Promise<void>((resolve) => setImmediate(resolve));
+		const before = await requireTool(s.tools, "subagent_status").execute("x", {
+			id: s.childId,
+		});
+		s.resetUiRefreshCount();
+		nodeFs.rename = (async (from: string, to: string) => {
+			if (to === s?.registryPath) registryWrites++;
+			return originalRename(from, to);
+		}) as typeof nodeFs.rename;
+
+		await advanceWatchdog(scheduler);
+		await advanceWatchdog(scheduler);
+		await flushController(() => frames.some((frame) => frame.type === "ping"));
+		const pings = frames.filter((frame) => frame.type === "ping");
+		assert.equal(pings.length, 1);
+		const ping = pings[0]!;
+		assert.equal(typeof ping.id, "string");
+		assert.equal(ping.ownerSessionFile, s.ownerSessionFile);
+		assert.equal(ping.ownerSessionId, s.ownerSessionId);
+		assert.equal(ping.launchControllerInstanceId, s.controllerInstanceId);
+		assert.equal(ping.incarnation, s.incarnation);
+		let status = await requireTool(s.tools, "subagent_status").execute("x", {
+			id: s.childId,
+		});
+		assert.equal(status.details.ipcLiveness?.state, "awaiting_pong");
+		assert.equal(status.details.lastActivityAt, before.details.lastActivityAt);
+
+		socket.write(
+			makeFrame("pong", childFrameBase(s, "heartbeat-connection"), {
+				id: ping.id,
+			}),
+		);
+		await flushController(() =>
+			requireTool(s!.tools, "subagent_status")
+				.execute("x", { id: s!.childId })
+				.then((result) => result.details.ipcLiveness?.state === "healthy"),
+		);
+		status = await requireTool(s.tools, "subagent_status").execute("x", {
+			id: s.childId,
+		});
+		assert.equal(status.details.processState, "alive");
+		assert.equal(status.details.lastActivityAt, before.details.lastActivityAt);
+
+		const answered = new Set([String(ping.id)]);
+		for (let interval = 0; interval < 6; interval++) {
+			await advanceWatchdog(scheduler);
+			const next = frames.find(
+				(frame) => frame.type === "ping" && !answered.has(String(frame.id)),
+			);
+			if (next) {
+				answered.add(String(next.id));
+				socket.write(
+					makeFrame("pong", childFrameBase(s, "heartbeat-connection"), {
+						id: next.id,
+					}),
+				);
+				await flushController(() =>
+					requireTool(s!.tools, "subagent_status")
+						.execute("x", { id: s!.childId })
+						.then((result) => result.details.ipcLiveness?.state === "healthy"),
+				);
+			}
+		}
+		assert.equal(registryWrites, 0);
+		assert.equal(s.getUiRefreshCount(), 0);
+		assert.equal(
+			(await requireTool(s.tools, "subagent_status").execute("x", { id: s.childId }))
+				.details.lastActivityAt,
+			before.details.lastActivityAt,
+		);
+		assert.doesNotMatch(await readFile(actionLog, "utf8").catch(() => ""), /list-panes/);
+	} finally {
+		nodeFs.rename = originalRename;
+		socket?.destroy();
+		if (s) await s.cleanup();
+		scheduler.restore();
+	}
+});
+
+test("wrong and missing pong identifiers expire once and directly close the stable pane", async () => {
+	const scheduler = new FakeWatchdogScheduler();
+	scheduler.install();
+	let s: Awaited<ReturnType<typeof setupControllerWithChild>> | undefined;
+	let socket: net.Socket | undefined;
+	const originalRename = nodeFs.rename.bind(nodeFs);
+	let terminalStateWrites = 0;
+	try {
+		s = await setupControllerWithChild({ hasSessionFile: true });
+		const connected = await connectHello(s, "expiry-connection");
+		socket = connected.socket;
+		const actionLog = join(s.agentDirectory, "heartbeat-death-actions");
+		await writeFile(
+			s.zellijScript,
+			`#!/bin/sh\nprintf '%s\\n' "$@" >> ${JSON.stringify(actionLog)}\nif [ "$4" = close-pane ]; then exit 0; fi\nexit 2\n`,
+		);
+		await chmod(s.zellijScript, 0o755);
+		nodeFs.rename = (async (from: string, to: string) => {
+			if (to === s?.registryPath) {
+				const entries = JSON.parse(await readFile(from, "utf8")) as Record<
+					string,
+					unknown
+				>[];
+				if (
+					entries[0]?.processState === "stopped" &&
+					entries[0]?.terminalCleanupPending === true
+				)
+					terminalStateWrites++;
+			}
+			return originalRename(from, to);
+		}) as typeof nodeFs.rename;
+		await advanceWatchdog(scheduler);
+		await advanceWatchdog(scheduler);
+		await flushController(() => connected.frames.some((frame) => frame.type === "ping"));
+		const ping = connected.frames.find((frame) => frame.type === "ping")!;
+		socket.write(makeFrame("pong", childFrameBase(s, "expiry-connection"), { id: "wrong" }));
+		socket.write(makeFrame("pong", childFrameBase(s, "expiry-connection")));
+		socket.write(
+			makeFrame(
+				"pong",
+				{ ...childFrameBase(s, "expiry-connection"), connectionId: "wrong-connection" },
+				{ id: ping.id },
+			),
+		);
+		socket.write(
+			makeFrame(
+				"pong",
+				{ ...childFrameBase(s, "expiry-connection"), incarnation: "wrong-incarnation" },
+				{ id: ping.id },
+			),
+		);
+		socket.write(
+			makeFrame("event", childFrameBase(s, "expiry-connection"), {
+				event: "session_shutdown",
+			}),
+		);
+		for (let turn = 0; turn < 20; turn++)
+			await new Promise<void>((resolve) => setImmediate(resolve));
+		assert.equal(
+			(await requireTool(s.tools, "subagent_status").execute("x", { id: s.childId }))
+				.details.ipcLiveness?.heartbeatPending,
+			true,
+		);
+		await advanceWatchdog(scheduler);
+		await advanceWatchdog(scheduler);
+		const waitForDeath = requireTool(s.tools, "subagent_wait").execute("x", {
+			id: s.childId,
+			timeoutSeconds: 60,
+		});
+		scheduler.advanceBy(5_000);
+		await flushController(async () => {
+			const status = await requireTool(s!.tools, "subagent_status").execute("x", {
+				id: s!.childId,
+			});
+			const actions = await readFile(actionLog, "utf8").catch(() => "");
+			return (
+				status.details.processState === "stopped" &&
+				status.details.terminalCleanup?.status === "complete" &&
+				actions.includes("terminal_2")
+			);
+		});
+		const waitResult = await waitForDeath;
+		assert.equal(waitResult.details.outcome, "completed");
+		const status = await requireTool(s.tools, "subagent_status").execute("x", {
+			id: s.childId,
+		});
+		assert.equal(status.details.ipcLiveness?.deathReason, "heartbeat_timeout");
+		assert.equal(status.details.terminalCleanup?.status, "complete");
+		assert.equal(terminalStateWrites, 1);
+		assert.deepEqual((await readFile(actionLog, "utf8")).trim().split("\n"), [
+			"--session",
+			"test",
+			"action",
+			"close-pane",
+			"--pane-id",
+			"terminal_2",
+		]);
+		assert.doesNotMatch(await readFile(actionLog, "utf8"), /list-panes/);
+		socket.write(
+			makeFrame("hello", childFrameBase(s, "expiry-connection"), {
+				sessionId: "late-session",
+				sessionFile: s.sessionFilePath,
+				sessionFileExists: true,
+				pid: 999,
+				model: { provider: "p", id: "m" },
+				thinkingLevel: "off",
+				reason: "startup",
+			}),
+		);
+		for (let turn = 0; turn < 10; turn++)
+			await new Promise<void>((resolve) => setImmediate(resolve));
+		const late = await requireTool(s.tools, "subagent_status").execute("x", {
+			id: s.childId,
+		});
+		assert.equal(late.details.processState, "stopped");
+		assert.notEqual(late.details.pid, 999);
+	} finally {
+		nodeFs.rename = originalRename;
+		socket?.destroy();
+		if (s) await s.cleanup();
+		scheduler.restore();
+	}
+});
+
+test("reconnect grace accepts a new fenced hello, then expires and rejects a late hello", async () => {
+	const scheduler = new FakeWatchdogScheduler();
+	scheduler.install();
+	let s: Awaited<ReturnType<typeof setupControllerWithChild>> | undefined;
+	let first: net.Socket | undefined;
+	let second: net.Socket | undefined;
+	let late: net.Socket | undefined;
+	try {
+		s = await setupControllerWithChild({ hasSessionFile: true });
+		const initial = await connectHello(s, "reconnect-a", 100);
+		first = initial.socket;
+		const actionLog = join(s.agentDirectory, "reconnect-death-actions");
+		await writeFile(
+			s.zellijScript,
+			`#!/bin/sh\nprintf '%s\\n' "$@" >> ${JSON.stringify(actionLog)}\nif [ "$4" = close-pane ]; then exit 0; fi\nexit 2\n`,
+		);
+		await chmod(s.zellijScript, 0o755);
+		first.destroy();
+		await flushController(() =>
+			requireTool(s!.tools, "subagent_status")
+				.execute("x", { id: s!.childId })
+				.then((result) => result.details.ipcLiveness?.state === "reconnecting"),
+		);
+		await advanceWatchdog(scheduler);
+		await advanceWatchdog(scheduler);
+		const reconnected = await connectHello(s, "reconnect-b", 101);
+		second = reconnected.socket;
+		assert.equal(
+			(await requireTool(s.tools, "subagent_status").execute("x", { id: s.childId }))
+				.details.ipcLiveness?.state,
+			"healthy",
+		);
+		const answered = new Set<string>();
+		for (let interval = 0; interval < 4; interval++) {
+			await advanceWatchdog(scheduler);
+			const ping = reconnected.frames.find(
+				(frame) => frame.type === "ping" && !answered.has(String(frame.id)),
+			);
+			if (ping) {
+				answered.add(String(ping.id));
+				second.write(
+					makeFrame("pong", childFrameBase(s, "reconnect-b"), { id: ping.id }),
+				);
+				await flushController(() =>
+					requireTool(s!.tools, "subagent_status")
+						.execute("x", { id: s!.childId })
+						.then((result) => result.details.ipcLiveness?.state === "healthy"),
+				);
+			}
+		}
+		assert.equal(
+			(await requireTool(s.tools, "subagent_status").execute("x", { id: s.childId }))
+				.details.processState,
+			"alive",
+		);
+		assert.equal(await readFile(actionLog, "utf8").catch(() => ""), "");
+
+		second.destroy();
+		await flushController(() =>
+			requireTool(s!.tools, "subagent_status")
+				.execute("x", { id: s!.childId })
+				.then((result) => result.details.ipcLiveness?.state === "reconnecting"),
+		);
+		late = await connectSocket(s.socketPath);
+		for (let interval = 0; interval < 5; interval++) await advanceWatchdog(scheduler);
+		scheduler.advanceBy(5_000);
+		await flushController(async () => {
+			const status = await requireTool(s!.tools, "subagent_status").execute("x", {
+				id: s!.childId,
+			});
+			return (
+				status.details.ipcLiveness?.deathReason === "reconnect_timeout" &&
+				(await readFile(actionLog, "utf8").catch(() => "")).includes("terminal_2")
+			);
+		});
+		late.on("error", () => {});
+		late.write(
+			makeFrame("hello", childFrameBase(s, "late-reconnect"), {
+				sessionId: "late-session",
+				sessionFile: s.sessionFilePath,
+				sessionFileExists: true,
+				pid: 999,
+				model: { provider: "p", id: "m" },
+				thinkingLevel: "off",
+				reason: "startup",
+			}),
+		);
+		for (let turn = 0; turn < 10; turn++)
+			await new Promise<void>((resolve) => setImmediate(resolve));
+		const status = await requireTool(s.tools, "subagent_status").execute("x", {
+			id: s.childId,
+		});
+		assert.equal(status.details.processState, "stopped");
+		assert.equal(status.details.ipcLiveness?.deathReason, "reconnect_timeout");
+		assert.notEqual(status.details.pid, 999);
+		assert.doesNotMatch(await readFile(actionLog, "utf8"), /list-panes/);
+	} finally {
+		first?.destroy();
+		second?.destroy();
+		late?.destroy();
+		if (s) await s.cleanup();
+		scheduler.restore();
+	}
+});
+
+test("a controller stall resets the heartbeat observation window", async () => {
+	const scheduler = new FakeWatchdogScheduler();
+	scheduler.install();
+	let s: Awaited<ReturnType<typeof setupControllerWithChild>> | undefined;
+	let socket: net.Socket | undefined;
+	try {
+		s = await setupControllerWithChild({ hasSessionFile: true });
+		const connected = await connectHello(s, "stall-connection");
+		socket = connected.socket;
+		await advanceWatchdog(scheduler);
+		scheduler.advanceBy(20_000);
+		await finishWatchdogSweep(scheduler);
+		let status = await requireTool(s.tools, "subagent_status").execute("x", {
+			id: s.childId,
+		});
+		assert.equal(status.details.processState, "alive");
+		assert.equal(status.details.ipcLiveness?.state, "healthy");
+		assert.equal(connected.frames.filter((frame) => frame.type === "ping").length, 0);
+		assert.ok(
+			(status.details.diagnostics as string[]).some((message) =>
+				message.includes("Watchdog stall reset"),
+			),
+		);
+		await advanceWatchdog(scheduler);
+		assert.equal(connected.frames.filter((frame) => frame.type === "ping").length, 0);
+		await advanceWatchdog(scheduler);
+		await flushController(() => connected.frames.some((frame) => frame.type === "ping"));
+		status = await requireTool(s.tools, "subagent_status").execute("x", {
+			id: s.childId,
+		});
+		assert.equal(status.details.ipcLiveness?.state, "awaiting_pong");
+	} finally {
+		socket?.destroy();
+		if (s) await s.cleanup();
+		scheduler.restore();
+	}
+});
+
+test("a delayed authority check cannot overlap watchdog sweeps", async () => {
+	const scheduler = new FakeWatchdogScheduler();
+	scheduler.install();
+	let s: Awaited<ReturnType<typeof setupControllerWithChild>> | undefined;
+	let socket: net.Socket | undefined;
+	const originalReadFile = nodeFs.readFile.bind(nodeFs);
+	let releaseAuthority!: () => void;
+	const authorityGate = new Promise<void>((resolve) => {
+		releaseAuthority = resolve;
+	});
+	let delayAuthority = false;
+	let authorityReads = 0;
+	let activeReads = 0;
+	let maximumActiveReads = 0;
+	try {
+		s = await setupControllerWithChild({ hasSessionFile: true });
+		const connected = await connectHello(s, "overlap-connection");
+		socket = connected.socket;
+		const leaseFile = join(s.registryPath, "..", "lease.json");
+		nodeFs.readFile = (async (path: string, ...args: unknown[]) => {
+			if (delayAuthority && String(path) === leaseFile) {
+				authorityReads++;
+				activeReads++;
+				maximumActiveReads = Math.max(maximumActiveReads, activeReads);
+				await authorityGate;
+				activeReads--;
+			}
+			return (originalReadFile as (...values: unknown[]) => Promise<unknown>)(path, ...args);
+		}) as typeof nodeFs.readFile;
+		delayAuthority = true;
+		scheduler.advanceBy(5_000);
+		await flushController(() => authorityReads === 1);
+		assert.equal(scheduler.pendingTimers, 0);
+		scheduler.advanceBy(25_000);
+		for (let turn = 0; turn < 20; turn++)
+			await new Promise<void>((resolve) => setImmediate(resolve));
+		assert.equal(authorityReads, 1);
+		assert.equal(maximumActiveReads, 1);
+		releaseAuthority();
+		await finishWatchdogSweep(scheduler);
+		assert.equal(scheduler.pendingTimers, 1);
+	} finally {
+		delayAuthority = false;
+		releaseAuthority();
+		nodeFs.readFile = originalReadFile;
+		socket?.destroy();
+		if (s) await s.cleanup();
+		scheduler.restore();
+	}
+});
+
+test("one controller watchdog serves multiple handles", async () => {
+	const scheduler = new FakeWatchdogScheduler();
+	scheduler.install();
+	let s: Awaited<ReturnType<typeof setupControllerWithChild>> | undefined;
+	try {
+		s = await setupControllerWithChild({ hasSessionFile: true, childCount: 3 });
+		const listed = await requireTool(s.tools, "subagent_list").execute("x", {});
+		const handles = listed.details.handles as Array<{
+			ipcLiveness?: { state?: string };
+		}>;
+		assert.equal(handles.length, 3);
+		assert.ok(handles.every((handle) => handle.ipcLiveness?.state === "reconnecting"));
+		assert.equal(scheduler.pendingTimers, 1);
+		await advanceWatchdog(scheduler);
+		assert.equal(scheduler.pendingTimers, 1);
+		assert.doesNotMatch(
+			await readFile(join(s.agentDirectory, "watchdog-actions"), "utf8").catch(() => ""),
+			/list-panes/,
+		);
+	} finally {
+		if (s) await s.cleanup();
+		scheduler.restore();
+	}
+});
+
+test("concurrent cleanup callers reserve the lock before an authority await", async () => {
+	const state: { terminalCleanupActive?: boolean } = {};
+	let releaseAuthority!: () => void;
+	const authorityGate = new Promise<void>((resolve) => {
+		releaseAuthority = resolve;
+	});
+	let authorityChecks = 0;
+	let actions = 0;
+	const cleanup = () =>
+		withTerminalCleanupLock(state, async () => {
+			authorityChecks++;
+			await authorityGate;
+			actions++;
+		});
+
+	const first = cleanup();
+	await flushController(() => authorityChecks === 1);
+	const second = cleanup();
+	assert.equal(await second, false);
+	assert.equal(authorityChecks, 1);
+	assert.equal(actions, 0);
+
+	releaseAuthority();
+	assert.equal(await first, true);
+	assert.equal(actions, 1);
+	assert.equal(state.terminalCleanupActive, false);
+});
+
+test("cleanup retries at 0ms, 2000ms, and 10000ms, then retains final failure", async () => {
+	const scheduler = new FakeWatchdogScheduler();
+	scheduler.install();
+	let s: Awaited<ReturnType<typeof setupControllerWithChild>> | undefined;
+	let socket: net.Socket | undefined;
+	try {
+		s = await setupControllerWithChild({ hasSessionFile: true });
+		const connected = await connectHello(s, "cleanup-retry-connection");
+		socket = connected.socket;
+		const actionLog = join(s.agentDirectory, "cleanup-retry-actions");
+		await writeFile(
+			s.zellijScript,
+			`#!/bin/sh\nif [ "$4" = close-pane ]; then printf 'close-pane\\n' >> ${JSON.stringify(actionLog)}; printf 'close failed\\n' >&2; exit 9; fi\nexit 2\n`,
+		);
+		await chmod(s.zellijScript, 0o755);
+		await advanceWatchdog(scheduler);
+		await advanceWatchdog(scheduler);
+		await flushController(() => connected.frames.some((frame) => frame.type === "ping"));
+		await advanceWatchdog(scheduler);
+		await advanceWatchdog(scheduler);
+		scheduler.advanceBy(5_000);
+		await flushController(async () => {
+			const status = await requireTool(s!.tools, "subagent_status").execute("x", {
+				id: s!.childId,
+			});
+			const actions = await readFile(actionLog, "utf8").catch(() => "");
+			return (
+				status.details.terminalCleanup?.status === "pending" &&
+				status.details.terminalCleanup?.attempts === 1 &&
+				String(status.details.terminalCleanup?.lastError).includes("close failed") &&
+				actions.trim().split("\n").length === 1 &&
+				scheduler.scheduledDelays.length === 1 &&
+				scheduler.scheduledDelays[0] === 2_000
+			);
+		});
+
+		scheduler.advanceBy(1_999);
+		assert.equal((await readFile(actionLog, "utf8")).trim().split("\n").length, 1);
+		scheduler.advanceBy(1);
+		await flushController(async () => {
+			const status = await requireTool(s!.tools, "subagent_status").execute("x", {
+				id: s!.childId,
+			});
+			return (
+				status.details.terminalCleanup?.status === "pending" &&
+				status.details.terminalCleanup?.attempts === 2 &&
+				(await readFile(actionLog, "utf8")).trim().split("\n").length === 2 &&
+				scheduler.scheduledDelays.length === 1 &&
+				scheduler.scheduledDelays[0] === 5_000
+			);
+		});
+
+		scheduler.advanceBy(9_999);
+		assert.equal((await readFile(actionLog, "utf8")).trim().split("\n").length, 2);
+		scheduler.advanceBy(1);
+		await flushController(async () => {
+			const status = await requireTool(s!.tools, "subagent_status").execute("x", {
+				id: s!.childId,
+			});
+			const entries = JSON.parse(
+				await readFile(s!.registryPath, "utf8"),
+			) as Record<string, unknown>[];
+			return (
+				status.details.terminalCleanup?.status === "failed" &&
+				status.details.terminalCleanup?.attempts === 3 &&
+				entries[0]?.terminalCleanupPending === true &&
+				String(entries[0]?.terminalCleanupError).includes("close failed") &&
+				scheduler.pendingTimers === 0
+			);
+		});
+		const final = await requireTool(s.tools, "subagent_status").execute("x", {
+			id: s.childId,
+		});
+		assert.equal(final.details.processState, "stopped");
+		assert.equal(final.details.terminalCleanup?.status, "failed");
+		assert.equal(final.details.terminalCleanup?.attempts, 3);
+		assert.match(String(final.details.terminalCleanup?.lastError), /close failed/);
+		assert.match(String(final.details.error), /close failed/);
+		assert.equal((await readFile(actionLog, "utf8")).trim().split("\n").length, 3);
+		assert.doesNotMatch(await readFile(actionLog, "utf8"), /list-panes/);
+	} finally {
+		socket?.destroy();
+		if (s) await s.cleanup();
+		scheduler.restore();
+	}
+});
+
+test("explicit kill closes the stable pane after a failed cooperative interrupt", async () => {
+	const scheduler = new FakeWatchdogScheduler();
+	scheduler.install();
+	let s: Awaited<ReturnType<typeof setupControllerWithChild>> | undefined;
+	try {
+		s = await setupControllerWithChild({ hasSessionFile: true });
+		const actionLog = join(s.agentDirectory, "explicit-kill-actions");
+		await writeFile(
+			s.zellijScript,
+			`#!/bin/sh\nprintf '%s\\n' "$@" >> ${JSON.stringify(actionLog)}\nif [ "$4" = send-keys ]; then printf 'interrupt failed\\n' >&2; exit 8; fi\nif [ "$4" = close-pane ]; then exit 0; fi\nexit 2\n`,
+		);
+		await chmod(s.zellijScript, 0o755);
+		let result: TestResult | undefined;
+		const killing = requireTool(s.tools, "subagent_kill")
+			.execute("x", { id: s.childId })
+			.then((value) => {
+				result = value;
+			});
+		await flushController(async () => {
+			const actions = await readFile(actionLog, "utf8").catch(() => "");
+			return (
+				actions.includes("send-keys") &&
+				scheduler.scheduledDelays.length === 2 &&
+				scheduler.scheduledDelays[0] === 1_500 &&
+				scheduler.scheduledDelays[1] === 5_000
+			);
+		});
+		scheduler.advanceBy(1_500);
+		await flushController(() => result !== undefined);
+		await killing;
+		assert.equal(result?.details.terminated, true);
+		assert.equal(
+			(result?.details.handle as { terminalCleanup?: { status?: string } })
+				.terminalCleanup?.status,
+			"complete",
+		);
+		const actions = await readFile(actionLog, "utf8");
+		assert.match(actions, /send-keys/);
+		assert.match(actions, /close-pane/);
+		assert.match(actions, /terminal_2/);
+		assert.doesNotMatch(actions, /list-panes/);
+	} finally {
+		if (s) await s.cleanup();
+		scheduler.restore();
+	}
+});
+
+test("failed terminal-state persistence prevents cleanup until a durable retry", async () => {
+	const scheduler = new FakeWatchdogScheduler();
+	scheduler.install();
+	let s: Awaited<ReturnType<typeof setupControllerWithChild>> | undefined;
+	const originalRename = nodeFs.rename.bind(nodeFs);
+	let rejectTerminalWrites = true;
+	try {
+		s = await setupControllerWithChild({ hasSessionFile: true });
+		const actionLog = join(s.agentDirectory, "failed-terminal-persistence-actions");
+		await writeFile(
+			s.zellijScript,
+			`#!/bin/sh\nprintf '%s\\n' "$@" >> ${JSON.stringify(actionLog)}\nif [ "$4" = send-keys ] || [ "$4" = close-pane ]; then exit 0; fi\nexit 2\n`,
+		);
+		await chmod(s.zellijScript, 0o755);
+		nodeFs.rename = (async (from: string, to: string) => {
+			if (rejectTerminalWrites && to === s?.registryPath) {
+				const entries = JSON.parse(await readFile(from, "utf8")) as Record<
+					string,
+					unknown
+				>[];
+				const entry = entries.find((candidate) => candidate.childId === s?.childId);
+				if (
+					entry?.processState === "stopped" &&
+					entry.terminalCleanupPending === true
+				)
+					throw new Error("terminal registry unavailable");
+			}
+			return originalRename(from, to);
+		}) as typeof nodeFs.rename;
+
+		const killing = requireTool(s.tools, "subagent_kill").execute("x", {
+			id: s.childId,
+		});
+		await flushController(() =>
+			readFile(actionLog, "utf8").then(
+				(actions) =>
+					actions.includes("send-keys") &&
+					scheduler.scheduledDelays.includes(1_500),
 				() => false,
 			),
 		);
-	} finally {
-		await s.cleanup();
-	}
-});
-
-test("periodic liveness detects a manual close or hard kill without tool activity", async () => {
-	const s = await setupControllerWithChild({ hasSessionFile: true });
-	try {
-		await writeFile(
-			s.zellijScript,
-			`#!/bin/sh\nif [ "$4" = list-panes ]; then printf '[]\\n'; exit 0; fi\nexit 2\n`,
+		scheduler.advanceBy(1_500);
+		const result = await killing;
+		const pending = await requireTool(s.tools, "subagent_status").execute("x", {
+			id: s.childId,
+		});
+		assert.equal(result.details.terminated, true);
+		assert.equal(pending.details.terminalCleanup?.status, "pending");
+		assert.doesNotMatch(
+			await readFile(actionLog, "utf8"),
+			/close-pane/,
+			"cleanup started after terminal-state persistence failed",
 		);
-		await chmod(s.zellijScript, 0o755);
-		await eventually(async () => {
-			const result = await requireTool(s.tools, "subagent_list").execute(
-				"x",
-				{},
-			);
-			const handle = (result.details.handles as SerializedHandle[])[0];
-			return handle?.processState === "stopped";
-		}, 4000);
-	} finally {
-		await s.cleanup();
-	}
-});
-
-test("a failed periodic Zellij probe preserves a live child", async () => {
-	const s = await setupControllerWithChild({ hasSessionFile: true });
-	try {
-		await writeFile(s.zellijScript, "#!/bin/sh\nexit 2\n");
-		await chmod(s.zellijScript, 0o755);
-		await new Promise((resolve) => setTimeout(resolve, 1300));
-		const failed = await requireTool(s.tools, "subagent_list").execute("x", {});
-		const live = (failed.details.handles as SerializedHandle[])[0];
-		assert.equal(live?.processState, "alive");
 		assert.ok(
-			live?.diagnostics?.some((value) =>
-				value.includes("Liveness poll failed"),
+			(pending.details.diagnostics as string[]).some((message) =>
+				message.includes("terminal registry unavailable"),
 			),
 		);
+
+		rejectTerminalWrites = false;
+		scheduler.advanceBy(5_000);
+		await flushController(async () => {
+			const status = await requireTool(s!.tools, "subagent_status").execute("x", {
+				id: s!.childId,
+			});
+			return (
+				status.details.terminalCleanup?.status === "complete" &&
+				(await readFile(actionLog, "utf8")).includes("close-pane")
+			);
+		});
+	} finally {
+		rejectTerminalWrites = false;
+		nodeFs.rename = originalRename;
+		scheduler.advanceBy(60_000);
+		if (s) await s.cleanup();
+		scheduler.restore();
+	}
+});
+
+test("queued registry writes keep their invocation snapshots before terminal persistence", async () => {
+	const scheduler = new FakeWatchdogScheduler();
+	scheduler.install();
+	let s: Awaited<ReturnType<typeof setupControllerWithChild>> | undefined;
+	let socket: net.Socket | undefined;
+	let killing: Promise<TestResult> | undefined;
+	const originalRename = nodeFs.rename.bind(nodeFs);
+	let releaseFirstWrite!: () => void;
+	const firstWriteGate = new Promise<void>((resolve) => {
+		releaseFirstWrite = resolve;
+	});
+	let firstWriteBlocked = false;
+	let terminalStateWrites = 0;
+	try {
+		s = await setupControllerWithChild({ hasSessionFile: true });
+		const connected = await connectHello(s, "queued-persistence-connection");
+		socket = connected.socket;
+		for (let turn = 0; turn < 20; turn++)
+			await new Promise<void>((resolve) => setImmediate(resolve));
+		const actionLog = join(s.agentDirectory, "queued-persistence-actions");
 		await writeFile(
 			s.zellijScript,
-			`#!/bin/sh\nif [ "$4" = list-panes ]; then printf '[]\\n'; exit 0; fi\nexit 2\n`,
+			`#!/bin/sh\nprintf '%s\\n' "$@" >> ${JSON.stringify(actionLog)}\nif [ "$4" = send-keys ] || [ "$4" = close-pane ]; then exit 0; fi\nexit 2\n`,
 		);
-		await eventually(async () => {
-			const result = await requireTool(s.tools, "subagent_list").execute(
-				"x",
-				{},
+		await chmod(s.zellijScript, 0o755);
+		nodeFs.rename = (async (from: string, to: string) => {
+			if (to === s?.registryPath) {
+				const entries = JSON.parse(await readFile(from, "utf8")) as Record<
+					string,
+					unknown
+				>[];
+				const entry = entries.find((candidate) => candidate.childId === s?.childId);
+				if (
+					entry?.processState === "stopped" &&
+					entry.terminalCleanupPending === true
+				)
+					terminalStateWrites++;
+				if (!firstWriteBlocked) {
+					firstWriteBlocked = true;
+					await firstWriteGate;
+				}
+			}
+			return originalRename(from, to);
+		}) as typeof nodeFs.rename;
+
+		const snapshot = (assistantTail: string) =>
+			makeFrame(
+				"snapshot",
+				childFrameBase(s!, "queued-persistence-connection"),
+				{
+					sessionId: "child-session",
+					sessionFile: s!.sessionFilePath,
+					runState: "idle",
+					runId: 0,
+					runOutcome: "pending",
+					isStreaming: false,
+					assistantTail,
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						cost: 0,
+						turns: 0,
+					},
+					updatedAt: Date.now(),
+				},
 			);
-			return (
-				(result.details.handles as SerializedHandle[])[0]?.processState ===
-				"stopped"
-			);
-		}, 4000);
+		socket.write(snapshot("first"));
+		await flushController(() => firstWriteBlocked);
+		socket.write(snapshot("second"));
+		await flushController(() =>
+			requireTool(s!.tools, "subagent_status")
+				.execute("x", { id: s!.childId })
+				.then((status) => status.details.currentAssistantText === "second"),
+		);
+
+		killing = requireTool(s.tools, "subagent_kill").execute("x", {
+			id: s.childId,
+		});
+		await flushController(() =>
+			readFile(actionLog, "utf8").then(
+				(actions) =>
+					actions.includes("send-keys") &&
+					scheduler.scheduledDelays.includes(1_500),
+				() => false,
+			),
+		);
+		scheduler.advanceBy(1_500);
+		await flushController(() =>
+			requireTool(s!.tools, "subagent_status")
+				.execute("x", { id: s!.childId })
+				.then((status) => status.details.processState === "stopped"),
+		);
+		for (let turn = 0; turn < 20; turn++)
+			await new Promise<void>((resolve) => setImmediate(resolve));
+		releaseFirstWrite();
+		const result = await killing;
+		assert.equal(result.details.terminated, true);
+		assert.equal(terminalStateWrites, 1);
+		assert.match(await readFile(actionLog, "utf8"), /close-pane/);
 	} finally {
+		releaseFirstWrite();
+		scheduler.advanceBy(60_000);
+		await killing?.catch(() => {});
+		nodeFs.rename = originalRename;
+		socket?.destroy();
+		if (s) await s.cleanup();
+		scheduler.restore();
+	}
+});
+
+test("explicit kill persists terminal cleanup before watchdog cleanup", async () => {
+	const scheduler = new FakeWatchdogScheduler();
+	scheduler.install();
+	let s: Awaited<ReturnType<typeof setupControllerWithChild>> | undefined;
+	let killing: Promise<TestResult> | undefined;
+	const originalRename = nodeFs.rename.bind(nodeFs);
+	let releaseFirstWrite!: () => void;
+	const firstWriteGate = new Promise<void>((resolve) => {
+		releaseFirstWrite = resolve;
+	});
+	let firstWriteBlocked = false;
+	let terminalStateWrites = 0;
+	try {
+		s = await setupControllerWithChild({ hasSessionFile: true });
+		const actionLog = join(s.agentDirectory, "serialized-kill-actions");
+		await writeFile(
+			s.zellijScript,
+			`#!/bin/sh\nprintf '%s\\n' "$@" >> ${JSON.stringify(actionLog)}\nif [ "$4" = send-keys ] || [ "$4" = close-pane ]; then exit 0; fi\nexit 2\n`,
+		);
+		await chmod(s.zellijScript, 0o755);
+		nodeFs.rename = (async (from: string, to: string) => {
+			if (to === s?.registryPath) {
+				const entries = JSON.parse(await readFile(from, "utf8")) as Record<
+					string,
+					unknown
+				>[];
+				const entry = entries.find((candidate) => candidate.childId === s?.childId);
+				if (
+					entry?.processState === "stopped" &&
+					entry.terminalCleanupPending === true
+				)
+					terminalStateWrites++;
+				if (!firstWriteBlocked) {
+					firstWriteBlocked = true;
+					await firstWriteGate;
+				}
+			}
+			return originalRename(from, to);
+		}) as typeof nodeFs.rename;
+
+		killing = requireTool(s.tools, "subagent_kill").execute("x", {
+			id: s.childId,
+		});
+		await flushController(() =>
+			readFile(actionLog, "utf8").then(
+				(actions) =>
+					actions.includes("send-keys") &&
+					scheduler.scheduledDelays.includes(1_500),
+				() => false,
+			),
+		);
+		scheduler.advanceBy(1_500);
+		await flushController(() => firstWriteBlocked);
+		await flushController(() =>
+			requireTool(s!.tools, "subagent_status")
+				.execute("x", { id: s!.childId })
+				.then((result) => result.details.processState === "stopped"),
+		);
+		scheduler.advanceBy(0);
+		for (let turn = 0; turn < 20; turn++)
+			await new Promise<void>((resolve) => nativeSetTimeout(resolve, 1));
+		assert.doesNotMatch(
+			await readFile(actionLog, "utf8"),
+			/close-pane/,
+			"cleanup started before the terminal state became durable",
+		);
+
+		releaseFirstWrite();
+		const result = await killing;
+		assert.equal(result.details.terminated, true);
+		assert.equal(terminalStateWrites, 1);
+		assert.match(await readFile(actionLog, "utf8"), /close-pane/);
+	} finally {
+		releaseFirstWrite();
+		scheduler.advanceBy(60_000);
+		await killing?.catch(() => {});
+		nodeFs.rename = originalRename;
+		if (s) await s.cleanup();
+		scheduler.restore();
+	}
+});
+
+test("a clean child quit stops immediately and completes status and wait", async () => {
+	const s = await setupControllerWithChild({ hasSessionFile: true });
+	let socket: net.Socket | undefined;
+	try {
+		const connected = await connectHello(s, "clean-quit-connection");
+		socket = connected.socket;
+		const actionLog = join(s.agentDirectory, "clean-quit-actions");
+		await writeFile(
+			s.zellijScript,
+			`#!/bin/sh\nprintf '%s\\n' "$@" >> ${JSON.stringify(actionLog)}\nif [ "$4" = close-pane ]; then exit 0; fi\nexit 2\n`,
+		);
+		await chmod(s.zellijScript, 0o755);
+		const waiting = requireTool(s.tools, "subagent_wait").execute("x", {
+			id: s.childId,
+			timeoutSeconds: 5,
+		});
+		socket.end(
+			makeFrame("bye", childFrameBase(s, "clean-quit-connection"), {
+				reason: "quit",
+			}),
+		);
+		await flushController(async () => {
+			const status = await requireTool(s.tools, "subagent_status").execute("x", {
+				id: s.childId,
+			});
+			return (
+				status.details.ipcLiveness?.deathReason === "quit" &&
+				status.details.terminalCleanup?.status === "complete" &&
+				(await readFile(actionLog, "utf8").catch(() => "")).includes("terminal_2")
+			);
+		});
+		assert.equal((await waiting).details.outcome, "completed");
+		const status = await requireTool(s.tools, "subagent_status").execute("x", {
+			id: s.childId,
+		});
+		assert.equal(status.details.processState, "stopped");
+		assert.equal(status.details.ipcLiveness?.deathReason, "quit");
+		assert.equal(status.details.terminalCleanup?.status, "complete");
+		assert.doesNotMatch(await readFile(actionLog, "utf8"), /list-panes/);
+	} finally {
+		socket?.destroy();
 		await s.cleanup();
 	}
 });
