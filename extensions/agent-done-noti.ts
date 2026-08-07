@@ -6,31 +6,26 @@
  * only momentarily idle between
  * auto-continuations or busy compacting.
  *
- * The hard part is deciding what "done" means. Two things keep the agent going
- * after an `agent_end` event, and neither should trigger a notification:
+ * The hard part is deciding what "done" means. Two things can keep the agent
+ * active near an `agent_end` event, and neither should trigger a notification:
  *
- *   1. The `goal` extension re-fires the loop on every `agent_end` (it schedules
- *      a continuation as soon as pi goes idle). So `agent_end` alone never means
- *      "done" while a goal is active.
+ *   1. A successful `compaction_handoff` can queue one follow-up user message
+ *      before settlement. So `agent_end` alone does not always mean "done".
  *   2. Auto-compaction runs at a run boundary (after `agent_end`). During
  *      compaction `ctx.isIdle()` returns true — compaction is tracked
  *      separately and does not count as streaming — so a plain idle check would
- *      mistake a mid-goal compaction for completion.
+ *      mistake compaction for completion.
  *
  * Strategy: arm a short idle-grace timer on `agent_end`; when it fires, notify
  * only if the agent is genuinely idle with nothing queued.
  *
- *   - Goal case: the continuation re-fires the loop within milliseconds, so by
- *     the time the timer fires the agent is busy again and the idle guard
- *     suppresses it. (The full-length continuation turn usually outlasts the
- *     grace window, so the timer DOES fire mid-goal — the idle guard, not the
- *     debounce, is what suppresses it. Re-arming only matters for the rare
- *     turn shorter than the grace window.)
+ *   - Handoff case: the follow-up message queues before the agent settles, so
+ *     the agent is busy again and the idle guard suppresses notification.
  *   - Compaction case: pause the timer when compaction starts and re-arm it
- *     when compaction finishes. After compaction either a goal continuation
- *     resumes (idle guard suppresses) or the agent is genuinely done (notify).
+ *     when compaction finishes. After compaction the agent is either busy or
+ *     genuinely done.
  *   - Abort case: if the user pressed Escape (`ctx.signal.aborted` at
- *     `agent_end`), the agent was interrupted, not done — don't arm at all.
+ *     `agent_end`), the agent was interrupted, not done — do not arm at all.
  */
 
 import { execFile } from "node:child_process";
@@ -42,9 +37,8 @@ type NotiTarget = "local" | "mobile";
 const NOTI_MESSAGE = "Agent is done";
 const STATUS_KEY = "agent-done-noti";
 
-// How long the agent must stay idle after agent_end / compaction before we
-// consider it done. Must comfortably exceed the gap between goal
-// auto-continuations (sub-second).
+// How long the agent must stay idle after agent_end or compaction before we
+// consider it done. The delay covers queued handoff continuations.
 const IDLE_GRACE_MS = 2000;
 
 function formatStatus(mobileEnabled: boolean): string {
@@ -139,7 +133,7 @@ export default function agentDoneNoti(pi: ExtensionAPI) {
 			cancel();
 			return;
 		}
-		// Re-arm on every agent_end. A pending goal continuation will produce
+		// Re-arm on every agent_end. A pending handoff continuation produces
 		// another agent_end shortly, resetting this before it can fire.
 		arm(ctx);
 	});

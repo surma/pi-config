@@ -14,8 +14,8 @@
  *   - a periodic state poller (slow, only logs when state changes),
  *   - a /escape-debug command for runtime control / status.
  *
- * Pair with the logging added to bash-jobs.ts and goal.ts to get full
- * timelines of "what happened around the escape key press".
+ * Pair with the logging added to bash-jobs.ts to get full timelines of
+ * "what happened around the escape key press".
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
