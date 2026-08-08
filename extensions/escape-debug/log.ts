@@ -6,7 +6,6 @@
  * It is consumed by:
  *   - extensions/escape-debug/index.ts   (the diagnostic extension itself)
  *   - extensions/bash-jobs.ts            (logs signal/abort lifecycle)
- *   - extensions/goal.ts                 (logs scheduling/continuation lifecycle)
  *
  * Logs go to a single file so timelines from different modules can be
  * correlated by timestamp. Path: $PI_ESCAPE_DEBUG_LOG or ~/.pi/agent/escape-debug.log.

@@ -145,6 +145,7 @@ type HandoffParams = {
 	work_in_progress?: unknown;
 	next_steps?: unknown;
 	key_context?: unknown;
+	continue?: unknown;
 };
 
 type HandoffNotes = {
@@ -191,6 +192,7 @@ function normalizeHandoff(args: HandoffParams): HandoffNotes {
 type HandoffToolCall = {
 	id: string;
 	notes: HandoffNotes;
+	continue: boolean;
 };
 
 type HandoffBoundary = HandoffToolCall & {
@@ -198,6 +200,10 @@ type HandoffBoundary = HandoffToolCall & {
 	tailStart: number;
 	timestamp: number;
 };
+
+function shouldContinueHandoff(value: unknown): boolean {
+	return value !== false;
+}
 
 function handoffToolCalls(message: unknown): HandoffToolCall[] {
 	if (!message || typeof message !== "object") return [];
@@ -217,9 +223,11 @@ function handoffToolCalls(message: unknown): HandoffToolCall[] {
 		) {
 			continue;
 		}
+		const args = toolCall.arguments as HandoffParams;
 		calls.push({
 			id: toolCall.id,
-			notes: normalizeHandoff(toolCall.arguments as HandoffParams),
+			notes: normalizeHandoff(args),
+			continue: shouldContinueHandoff(args.continue),
 		});
 	}
 	return calls;
@@ -357,6 +365,10 @@ export default function tokenWindowReminder(pi: ExtensionAPI) {
 	// response has been generated from the trimmed context. Suppress reminders in
 	// that interval so stale usage cannot immediately re-fire the ladder.
 	let handoffAwaitingFreshUsage = false;
+	// Successful handoffs dispatch one continuation at most once. Keep IDs across
+	// branch resets so restoration and duplicate lifecycle events cannot replay them.
+	const processedHandoffCallIds = new Set<string>();
+	let continuationLifecycleActive = true;
 
 	function persistConfig(nextEnabled: boolean): void {
 		enabled = nextEnabled;
@@ -411,6 +423,7 @@ export default function tokenWindowReminder(pi: ExtensionAPI) {
 				) {
 					pendingHandoffCallIds.delete(message.toolCallId);
 					if (!message.isError) {
+						processedHandoffCallIds.add(message.toolCallId);
 						recoveryPending = recoveryPending || lastWarnedRung !== undefined;
 						lastWarnedRung = undefined;
 						handoffAwaitingFreshUsage = true;
@@ -529,6 +542,12 @@ export default function tokenWindowReminder(pi: ExtensionAPI) {
 				description:
 					"Key decisions and their rationale, constraints, file paths, commands, findings, and any other facts needed to resume. Be exhaustive.",
 			}),
+			continue: Type.Optional(
+				Type.Boolean({
+					default: true,
+					description: "Whether Pi should automatically send `continue` after the virtual reset.",
+				}),
+			),
 		}),
 		renderCall(args, theme) {
 			return new Text(renderHandoffForUser(theme, args), 0, 0);
@@ -537,12 +556,16 @@ export default function tokenWindowReminder(pi: ExtensionAPI) {
 			const message = result.content.find((content) => content.type === "text")?.text ?? "End your turn now.";
 			return new Text(`${theme.fg("success", "✓ Hand-off recorded")}\n${theme.fg("muted", message)}`, 0, 0);
 		},
-		async execute(_id, _params, _signal, _onUpdate, _ctx) {
+		async execute(_id, params, _signal, _onUpdate, _ctx) {
+			const continueAfterHandoff = params.continue ?? true;
+			const nextTurnText = continueAfterHandoff
+				? "The next model call will resume from these notes."
+				: "Pi will remain idle after this hand-off until you start another turn.";
 			return {
 				content: [
 					{
 						type: "text",
-						text: "Hand-off recorded. End your turn now — do not call any more tools or keep working. The next model call will resume from these notes.",
+						text: `Hand-off recorded. End your turn now — do not call any more tools or keep working. ${nextTurnText}`,
 					},
 				],
 				details: undefined,
@@ -618,6 +641,18 @@ export default function tokenWindowReminder(pi: ExtensionAPI) {
 			recoveryPending = recoveryPending || lastWarnedRung !== undefined;
 			lastWarnedRung = undefined;
 			handoffAwaitingFreshUsage = true;
+
+			if (assistantResponseSucceeded(event.message) && !processedHandoffCallIds.has(completedHandoff.id)) {
+				processedHandoffCallIds.add(completedHandoff.id);
+				if (continuationLifecycleActive && completedHandoff.continue && !ctx.signal?.aborted) {
+					try {
+						pi.sendUserMessage("continue", { deliverAs: "followUp" });
+					} catch (error) {
+						const reason = error instanceof Error ? error.message : String(error);
+						if (ctx.hasUI) ctx.ui.notify(`Compaction hand-off continuation failed: ${reason}`, "warning");
+					}
+				}
+			}
 			return;
 		}
 
@@ -644,10 +679,16 @@ export default function tokenWindowReminder(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		continuationLifecycleActive = true;
 		rebuildFromBranch(ctx);
 	});
 
 	pi.on("session_tree", async (_event, ctx) => {
+		continuationLifecycleActive = true;
 		rebuildFromBranch(ctx);
+	});
+
+	pi.on("session_shutdown", async () => {
+		continuationLifecycleActive = false;
 	});
 }

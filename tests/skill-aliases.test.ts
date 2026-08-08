@@ -81,14 +81,14 @@ test("does not create aliases that conflict with prompts or extension commands",
 	const harness = createHarness([
 		command("skill:review", "skill"),
 		command("review", "prompt"),
-		command("skill:goal", "skill"),
-		command("goal", "extension"),
+		command("skill:ctxwarn", "skill"),
+		command("ctxwarn", "extension"),
 		command("skill:music", "skill"),
 	]);
 	await harness.start();
 
 	assert.deepEqual(await harness.input("/review"), { action: "continue" });
-	assert.deepEqual(await harness.input("/goal keep working"), { action: "continue" });
+	assert.deepEqual(await harness.input("/ctxwarn status"), { action: "continue" });
 	assert.deepEqual(await harness.input("/music"), {
 		action: "transform",
 		text: "/skill:music",
