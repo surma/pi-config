@@ -201,6 +201,15 @@ test("all ten tool schemas accept valid parameters and reject invalid parameters
 	const startSchema = requireTool(tools, "subagent_start")
 		.parameters as TSchema;
 	assert.equal(
+		Check(startSchema, {
+			task: "work",
+			model: "p/m",
+			thinking: "max",
+		}),
+		true,
+		"subagent_start accepts max thinking",
+	);
+	assert.equal(
 		Check(startSchema, { task: "work", model: "p/m" }),
 		false,
 		"subagent_start rejects missing thinking",
@@ -248,7 +257,7 @@ test("start fails clearly outside Zellij", async () => {
 	try {
 		const result = await requireTool(setup(), "subagent_start").execute(
 			"x",
-			{ task: "work", model: "p/m", thinking: "high" },
+			{ task: "work", model: "p/m", thinking: "max" },
 			undefined,
 			undefined,
 			context,

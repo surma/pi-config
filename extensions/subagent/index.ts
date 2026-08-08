@@ -126,7 +126,14 @@ const processControllerInstanceId =
 	controllerGlobal[controllerInstanceKey] ?? createControllerInstanceId();
 controllerGlobal[controllerInstanceKey] = processControllerInstanceId;
 
-type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+type ThinkingLevel =
+	| "off"
+	| "minimal"
+	| "low"
+	| "medium"
+	| "high"
+	| "xhigh"
+	| "max";
 type ResultKind = "none" | "final" | "partial";
 interface ActualModel {
 	provider: string;
@@ -243,6 +250,7 @@ const ThinkingSchema = StringEnum([
 	"medium",
 	"high",
 	"xhigh",
+	"max",
 ] as const);
 const TaskSpecSchema = Type.Object(
 	{
@@ -311,7 +319,7 @@ function formatModel(model: ActualModel) {
 	return `${model.provider}/${model.id}`;
 }
 function isThinking(value: unknown): value is ThinkingLevel {
-	return ["off", "minimal", "low", "medium", "high", "xhigh"].includes(
+	return ["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(
 		String(value),
 	);
 }
