@@ -54,7 +54,7 @@ test("new-tab launch is interactive, additive, marked, and has no task argument"
 			"--model",
 			"p/m",
 			"--thinking",
-			"high",
+			"max",
 		],
 		{
 			PI_SUBAGENT_CHILD: "1",
@@ -83,6 +83,7 @@ test("new-tab launch is interactive, additive, marked, and has no task argument"
 	assert.match(joined, /PI_SUBAGENT_CONTROLLER_INSTANCE_ID=controller-a/);
 	assert.match(joined, /PI_SUBAGENT_INCARNATION=inc-a/);
 	assert.match(joined, /devx pi --offline -e \/ext\/child\.ts/);
+	assert.match(joined, /--thinking max/);
 	assert.doesNotMatch(
 		joined,
 		/--mode rpc|--no-extensions|--close-on-exit|the task text/,
