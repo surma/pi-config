@@ -30,7 +30,7 @@ Every Zellij action passes the durable exact session name through `--session`. T
 
 The extension uses `devx pi` when an executable `devx` exists. Otherwise, it uses the current Pi executable.
 
-Every child starts with `--offline`. The command loads `child.ts` through `-e`, so other extensions and provider proxies remain available.
+Every child starts with `--offline` and `--approve`. The approval trusts project-local resources for the child run. The command loads `child.ts` through `-e`, so other extensions and provider proxies remain available.
 
 The parent creates the listener before it opens the tab. The child connects to that listener and sends a fenced `hello` frame.
 

@@ -1865,6 +1865,7 @@ test("resume opens the exact child session with a new fenced incarnation", async
 		const sessionIndex = launchArgs.lastIndexOf("--session");
 		assert.equal(launchArgs[sessionIndex + 1], s.sessionFilePath);
 		assert.ok(launchArgs.includes("--offline"));
+		assert.ok(launchArgs.includes("--approve"));
 		const envIndex = launchArgs.indexOf("env");
 		const commandIndex = launchArgs.findIndex(
 			(value, index) => index > envIndex && !value.includes("="),

@@ -341,7 +341,7 @@ function executableOnPath(name: string): string | undefined {
 }
 
 export function getPiInvocation(args: string[]): string[] {
-	const offlineArgs = ["--offline", ...args];
+	const offlineArgs = ["--offline", "--approve", ...args];
 	if (process.env.PI_SUBAGENT_PI_BIN)
 		return [process.env.PI_SUBAGENT_PI_BIN, ...offlineArgs];
 	const devx = process.env.PI_SUBAGENT_DEVX_BIN || executableOnPath("devx");

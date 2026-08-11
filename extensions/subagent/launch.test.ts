@@ -47,6 +47,7 @@ test("new-tab launch is interactive, additive, marked, and has no task argument"
 			"devx",
 			"pi",
 			"--offline",
+			"--approve",
 			"-e",
 			"/ext/child.ts",
 			"--session-dir",
@@ -82,7 +83,7 @@ test("new-tab launch is interactive, additive, marked, and has no task argument"
 	assert.match(joined, /PI_SUBAGENT_OWNER_SESSION_ID=owner-session/);
 	assert.match(joined, /PI_SUBAGENT_CONTROLLER_INSTANCE_ID=controller-a/);
 	assert.match(joined, /PI_SUBAGENT_INCARNATION=inc-a/);
-	assert.match(joined, /devx pi --offline -e \/ext\/child\.ts/);
+	assert.match(joined, /devx pi --offline --approve -e \/ext\/child\.ts/);
 	assert.match(joined, /--thinking max/);
 	assert.doesNotMatch(
 		joined,
@@ -90,7 +91,7 @@ test("new-tab launch is interactive, additive, marked, and has no task argument"
 	);
 });
 
-test("child invocation prefers devx and is always offline", async () => {
+test("child invocation prefers devx and always approves offline projects", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "fake-devx-"));
 	const devx = join(directory, "devx");
 	await writeFile(devx, "#!/bin/sh\nexit 0\n");
@@ -108,6 +109,7 @@ test("child invocation prefers devx and is always offline", async () => {
 			devx,
 			"pi",
 			"--offline",
+			"--approve",
 			"--model",
 			"p/m",
 		]);
@@ -115,12 +117,15 @@ test("child invocation prefers devx and is always offline", async () => {
 		assert.deepEqual(getPiInvocation(["--model", "p/m"]), [
 			"/test/pi",
 			"--offline",
+			"--approve",
 			"--model",
 			"p/m",
 		]);
 		delete process.env.PI_SUBAGENT_PI_BIN;
 		process.env.PATH = "";
-		assert.ok(getPiInvocation(["--model", "p/m"]).includes("--offline"));
+		const fallback = getPiInvocation(["--model", "p/m"]);
+		assert.ok(fallback.includes("--offline"));
+		assert.ok(fallback.includes("--approve"));
 	} finally {
 		if (previous.path === undefined) delete process.env.PATH;
 		else process.env.PATH = previous.path;
