@@ -98,8 +98,23 @@ function sameOwner(a: OwnerIdentity, b: OwnerIdentity): boolean {
 function guardFailure(lifecycle: DedicatedLifecycle): Error {
 	return new Error(`Dedicated Zellij session ${lifecycle.record.sessionName} is unavailable because its guardian exited. Cleanup must finish before Zellij actions continue.`);
 }
-function cleanupBlockedError(): Error {
-	return new Error("Dedicated Zellij cleanup is pending. New Zellij actions are blocked.");
+function errorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+function cleanupBlockedError(state: ManagerState): Error {
+	const lifecycle =
+		state.retiring.find((candidate) => candidate.record.cleanupError) ??
+		state.retiring[0] ??
+		state.provisioning;
+	const details = [
+		`provisioning=${state.provisioning ? "true" : "false"}`,
+		`retiring=${state.retiring.length}`,
+		lifecycle ? `session=${lifecycle.record.sessionName}` : undefined,
+		lifecycle?.record.cleanupError
+			? `lastError=${JSON.stringify(lifecycle.record.cleanupError)}`
+			: undefined,
+	].filter((detail): detail is string => detail !== undefined);
+	return new Error(`Dedicated Zellij cleanup is pending (${details.join(", ")}). New Zellij actions are blocked.`);
 }
 function delay(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
@@ -358,7 +373,21 @@ export function createDedicatedLifecycleManager(
 			lifecycle.retiring = false;
 			removeRetiring(lifecycle);
 		} catch (error) {
-			try { await persistCleanupError(lifecycle, error); } catch {}
+			try {
+				await persistCleanupError(lifecycle, error);
+			} catch (persistenceError) {
+				const cleanupMessage = errorMessage(error);
+				const persistenceMessage = errorMessage(persistenceError);
+				lifecycle.record = {
+					...lifecycle.record,
+					state: "cleanup_pending",
+					cleanupError: `${cleanupMessage}; diagnostic persistence failed: ${persistenceMessage}`,
+				};
+				throw new AggregateError(
+					[error, persistenceError],
+					`Dedicated Zellij cleanup failed for ${lifecycle.record.sessionName}: ${cleanupMessage}. Persisting its error also failed: ${persistenceMessage}`,
+				);
+			}
 			throw error;
 		}
 	}
@@ -375,7 +404,7 @@ export function createDedicatedLifecycleManager(
 		for (const lifecycle of [...state.retiring]) {
 			try { await cleanupLifecycle(lifecycle); }
 			catch (error) {
-				throw new Error(`${cleanupBlockedError().message} Retirement retry failed: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+				throw new Error(`${cleanupBlockedError(state).message} Retirement retry failed: ${errorMessage(error)}`, { cause: error });
 			}
 		}
 	}
@@ -401,7 +430,7 @@ export function createDedicatedLifecycleManager(
 			return state.active.record.sessionName;
 		},
 		assertActionsAllowed(): string {
-			if (state.provisioning || state.retiring.length) throw cleanupBlockedError();
+			if (state.provisioning || state.retiring.length) throw cleanupBlockedError(state);
 			if (!state.active) throw new Error("Dedicated Zellij lifecycle is not active.");
 			if (state.active.guardianExited) throw guardFailure(state.active);
 			return state.active.record.sessionName;
@@ -423,7 +452,7 @@ export function createDedicatedLifecycleManager(
 					return state.active;
 				}
 				if (state.active) throw new Error("A different dedicated Zellij lifecycle remains active.");
-				if (state.provisioning) throw cleanupBlockedError();
+				if (state.provisioning) throw cleanupBlockedError(state);
 				const path = managedSessionPath(agentDir, owner);
 				const stale = await deps.loadRecord(path);
 				if (stale) {

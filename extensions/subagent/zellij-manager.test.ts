@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { chmod, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -185,6 +185,22 @@ async function eventually(predicate: () => Promise<boolean> | boolean, timeoutMs
 		await new Promise((resolve) => setTimeout(resolve, 10));
 	}
 }
+function captureError(action: () => unknown): Error {
+	try {
+		action();
+	} catch (error) {
+		return error instanceof Error ? error : new Error(String(error));
+	}
+	assert.fail("expected an error");
+}
+async function captureRejected(promise: Promise<unknown>): Promise<Error> {
+	try {
+		await promise;
+	} catch (error) {
+		return error instanceof Error ? error : new Error(String(error));
+	}
+	assert.fail("expected a rejected promise");
+}
 async function pidAbsent(pid: number | undefined): Promise<boolean> {
 	if (pid === undefined) return true;
 	try { process.kill(pid, 0); return false; }
@@ -354,7 +370,11 @@ test("failed retirement remains blocked, then establish retries it and clears st
 			f.manager.hasPendingRetirement(lifecycle.owner, lifecycle.controllerInstanceId),
 			true,
 		);
-		assert.throws(() => f.manager.assertActionsAllowed(), /cleanup is pending/);
+		const blocked = captureError(() => f.manager.assertActionsAllowed());
+		assert.match(blocked.message, /cleanup is pending/);
+		assert.match(blocked.message, /provisioning=false/);
+		assert.match(blocked.message, /retiring=1/);
+		assert.match(blocked.message, new RegExp(`session=${lifecycle.record.sessionName}`));
 		assert.ok((await loadManagedSession(managedSessionPath(f.directory, lifecycle.owner)))?.cleanupError);
 		await assert.rejects(f.establish("blocked-owner"), /cleanup is pending.*retry failed/i);
 		await writeFile(f.deleteMode, "ok");
@@ -504,7 +524,12 @@ test("cleanup_pending persistence failure prevents deletion", async () => {
 	});
 	const lifecycle = await f.establishWith(manager, "pending-save");
 	try {
-		await assert.rejects(manager.retire(f.directory, lifecycle, async () => {}), /cleanup_pending save failure/);
+		const error = await captureRejected(manager.retire(f.directory, lifecycle, async () => {}));
+		assert.match(error.message, /cleanup_pending save failure/);
+		assert.match(error.message, /Persisting its error also failed/);
+		const blocked = captureError(() => manager.assertActionsAllowed());
+		assert.match(blocked.message, /cleanup is pending/);
+		assert.match(blocked.message, /lastError=.*cleanup_pending save failure/);
 		assert.doesNotMatch(await readFile(f.calls, "utf8"), /delete-session/);
 		assert.equal((await loadManagedSession(managedSessionPath(f.directory, lifecycle.owner)))?.state, "active");
 	} finally {
@@ -552,10 +577,15 @@ test("fresh recovery handles guardian PID absence and deletes before new creatio
 	const path = managedSessionPath(f.directory, owner);
 	await writeFile(f.state, `${staleName}\n`);
 	await saveManagedSession(path, createManagedSessionRecord(owner, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", staleName, 1, "cleanup_pending"));
+	const staleLock = `${path}.lock`;
+	await mkdir(staleLock);
+	const staleAt = new Date(Date.now() - 60_000);
+	await utimes(staleLock, staleAt, staleAt);
 	try {
 		const lifecycle = await f.establish("stale");
 		const calls = await readFile(f.calls, "utf8");
 		assert.ok(calls.indexOf(`delete-session --force ${staleName}`) < calls.lastIndexOf("attach --create-background"));
+		await assert.rejects(stat(staleLock), { code: "ENOENT" });
 		await f.retire(lifecycle);
 	} finally { f.close(); }
 });

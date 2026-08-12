@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { dirname } from "node:path";
 import type { OwnerIdentity } from "./owner.js";
+import { withDirectoryLock } from "./lock.js";
 
 export type ManagedSessionState = "arming" | "active" | "cleanup_pending";
 
@@ -18,8 +19,6 @@ export interface ManagedSessionRecord extends OwnerIdentity {
 	cleanupError?: string;
 }
 
-const RECORD_LOCK_RETRY_MS = 10;
-const RECORD_LOCK_RETRIES = 200;
 const RECORD_KEYS = new Set([
 	"version",
 	"ownerSessionFile",
@@ -82,28 +81,6 @@ export function createManagedSessionRecord(
 	return record;
 }
 
-async function withManagedSessionLock<T>(
-	path: string,
-	action: () => Promise<T>,
-): Promise<T> {
-	const lockPath = `${path}.lock`;
-	await fs.mkdir(dirname(path), { recursive: true, mode: 0o700 });
-	for (let attempt = 0; attempt < RECORD_LOCK_RETRIES; attempt++) {
-		try {
-			await fs.mkdir(lockPath, { mode: 0o700 });
-			try {
-				return await action();
-			} finally {
-				await fs.rmdir(lockPath).catch(() => {});
-			}
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-			await new Promise((resolve) => setTimeout(resolve, RECORD_LOCK_RETRY_MS));
-		}
-	}
-	throw new Error(`Managed Zellij record operation timed out for ${path}.`);
-}
-
 async function writeAtomic(path: string, record: ManagedSessionRecord): Promise<void> {
 	await fs.mkdir(dirname(path), { recursive: true, mode: 0o700 });
 	await fs.chmod(dirname(path), 0o700).catch(() => {});
@@ -120,7 +97,7 @@ async function writeAtomic(path: string, record: ManagedSessionRecord): Promise<
 
 export async function saveManagedSession(path: string, record: ManagedSessionRecord): Promise<void> {
 	if (!isManagedSessionRecord(record)) throw new Error("Refusing to persist an invalid managed Zellij session record.");
-	await withManagedSessionLock(path, () => writeAtomic(path, record));
+	await withDirectoryLock(path, () => writeAtomic(path, record), "Managed Zellij record");
 }
 
 export async function saveManagedSessionIfMatches(
@@ -131,12 +108,12 @@ export async function saveManagedSessionIfMatches(
 ): Promise<void> {
 	if (!isManagedSessionRecord(next))
 		throw new Error("Refusing to persist an invalid managed Zellij session record.");
-	await withManagedSessionLock(path, async () => {
+	await withDirectoryLock(path, async () => {
 		const current = await loadManagedSession(path);
 		if (!current || !managedSessionIdentityMatches(current, expected, requiredState))
 			throw new Error("Managed Zellij session record changed before update; refusing to overwrite it.");
 		await writeAtomic(path, next);
-	});
+	}, "Managed Zellij record");
 }
 
 /** Invalid or empty durable data is not safe to use for destructive cleanup. */
@@ -169,11 +146,11 @@ export function managedSessionIdentityMatches(
 }
 
 export async function removeManagedSession(path: string): Promise<void> {
-	await withManagedSessionLock(path, async () => {
+	await withDirectoryLock(path, async () => {
 		await fs.unlink(path).catch((error: NodeJS.ErrnoException) => {
 			if (error.code !== "ENOENT") throw error;
 		});
-	});
+	}, "Managed Zellij record");
 }
 
 /** Reload, compare exact cleanup ownership, then unlink. */
@@ -181,10 +158,10 @@ export async function removeManagedSessionIfMatches(
 	path: string,
 	expected: ManagedSessionRecord,
 ): Promise<void> {
-	await withManagedSessionLock(path, async () => {
+	await withDirectoryLock(path, async () => {
 		const current = await loadManagedSession(path);
 		if (!current || !managedSessionIdentityMatches(current, expected, "cleanup_pending"))
 			throw new Error("Managed Zellij session record changed before removal; refusing to unlink it.");
 		await fs.unlink(path);
-	});
+	}, "Managed Zellij record");
 }

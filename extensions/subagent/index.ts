@@ -411,6 +411,17 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	});
 	const requireLease = (): boolean => leaseHeld && owner !== null;
 	const requiredDedicatedSession = (): string => assertDedicatedActionsAllowed();
+	async function ensureDedicatedSession(ctx?: ExtensionContext): Promise<string> {
+		try {
+			return requiredDedicatedSession();
+		} catch (error) {
+			if (!(error instanceof Error) || !error.message.includes("cleanup is pending")) throw error;
+			const retryContext = ctx ?? latestCtx;
+			if (!retryContext) throw error;
+			await establishController(retryContext);
+			return requiredDedicatedSession();
+		}
+	}
 	const requireHandleDedicatedSession = (handle: SubagentHandle): string => {
 		const activeSession = requiredDedicatedSession();
 		if (handle.zellijSessionName !== activeSession)
@@ -1418,8 +1429,9 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		cwd: string,
 		requestedModel: string,
 		requestedThinking: ThinkingLevel,
+		ctx: ExtensionContext,
 	): Promise<SubagentHandle> {
-		const zellijSessionName = requiredDedicatedSession();
+		const zellijSessionName = await ensureDedicatedSession(ctx);
 		if (!(await requireCurrentAuthority()))
 			throw new Error(leaseConflictMessage());
 		const resolvedOwner = owner;
@@ -1532,13 +1544,14 @@ export default function subagentExtension(pi: ExtensionAPI) {
 
 	async function resumeChild(
 		handle: SubagentHandle,
-		task?: string,
+		task: string | undefined,
+		ctx?: ExtensionContext,
 	): Promise<void> {
 		if (handle.cleanupRequired)
 			throw new Error(
 				`Subagent #${handle.id} has required terminal cleanup. Resume is blocked until cleanup completes.`,
 			);
-		const zellijSessionName = requiredDedicatedSession();
+		const zellijSessionName = await ensureDedicatedSession(ctx);
 		if (!(await requireCurrentAuthority()))
 			throw new Error(leaseConflictMessage());
 		const resolvedOwner = owner;
@@ -2285,6 +2298,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 					spec.cwd || ctx.cwd,
 					choice.model,
 					choice.thinking,
+					ctx,
 				);
 				return {
 					content: [
@@ -2718,7 +2732,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		description:
 			"Resume a stopped child from its saved Pi session file in a new process incarnation. The child reopens its prior conversation in a new tab with a new socket and pane. Use this only for stopped children that have a persisted session file.",
 		parameters: ResumeSchema,
-		async execute(_id, params) {
+		async execute(_id, params, _signal, _update, ctx) {
 			const handle = handles.get(params.id);
 			if (!handle)
 				return {
@@ -2773,7 +2787,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 					details: { handle: await serialize(handle) },
 				};
 			try {
-				await resumeChild(handle, params.task);
+				await resumeChild(handle, params.task, ctx);
 				return {
 					content: [
 						{

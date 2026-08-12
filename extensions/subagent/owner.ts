@@ -1,9 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
-
-const LEASE_READ_RETRY_MS = 10;
-const LEASE_READ_RETRIES = 200;
+import { withDirectoryLock } from "./lock.js";
 
 export interface OwnerIdentity {
 	ownerSessionFile: string;
@@ -160,26 +158,11 @@ async function writeLeaseAtomic(
 	}
 }
 
-async function withLeaseLock<T>(
+function withLeaseLock<T>(
 	path: string,
 	action: () => Promise<T>,
 ): Promise<T> {
-	const lockPath = `${path}.lock`;
-	await fs.mkdir(dirname(path), { recursive: true, mode: 0o700 });
-	for (let attempt = 0; attempt < LEASE_READ_RETRIES; attempt++) {
-		try {
-			await fs.mkdir(lockPath, { mode: 0o700 });
-			try {
-				return await action();
-			} finally {
-				await fs.rmdir(lockPath).catch(() => {});
-			}
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-			await new Promise((resolve) => setTimeout(resolve, LEASE_READ_RETRY_MS));
-		}
-	}
-	throw new Error(`Controller lease operation timed out for ${path}.`);
+	return withDirectoryLock(path, action, "Controller lease");
 }
 
 export async function acquireLease(
