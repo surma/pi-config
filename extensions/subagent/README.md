@@ -133,18 +133,13 @@ A new connection cannot change its identity after `hello`. Delayed frames from a
 
 Pane markers contain the full identity and socket path. Launch-time discovery validates the tab, pane, command, and markers. Later interaction and cleanup target the saved stable terminal pane directly without a pane snapshot. If `new-tab` completion or launch-time pane discovery is ambiguous, targeted cleanup is not accepted without a pane ID: the manager retires the whole dedicated session and proves it absent, or remains blocked in durable cleanup. Whole-session settlement first closes IPC ingress and drains each handle's serialized mutation chain and persistence before writing the final registry, so no queued frame can mutate or persist after settlement.
 
-## Results and waits
+## Results and notifications
 
 The child streams structured lifecycle events to the parent. Existing assistant events provide the final response.
 
-A successful settled `subagent_wait` returns the exact response for its resolved run in both locations:
-
-```text
-content[0].text
-details.result
-```
-
 The extension saves each response in an immutable `runs/<run-id>` artifact pair. A later run never overwrites that pair.
+
+Settlement notifications arrive automatically after a run settles. Each notification includes the child ID and exact run ID. It starts a parent follow-up turn while the child remains alive.
 
 `subagent_result` retrieves one exact run by child ID and run ID. It never falls back to the latest result.
 
@@ -163,17 +158,13 @@ The tool returns these stable status and reason combinations:
 
 Only an `available` result includes `outcome`. Empty output remains an available result with its actual outcome.
 
-Settlement notifications report completed runs while their child processes remain alive. Notifications batch nearby settlements and direct the parent to `subagent_result`.
+Notifications batch nearby settlements and direct the parent to `subagent_result`.
 
-Use `subagent_wait` only when the parent requires explicit synchronization with a finite deadline. Do not poll it for routine completion.
+After `subagent_start`, continue other work or end the current turn. Do not poll for routine completion.
 
-Use `subagent_status` for live lifecycle and diagnostic information. Do not poll it for routine completion.
+Use `subagent_status` for live lifecycle and diagnostic information.
 
-`subagent_wait` uses settlement cursors. An explicit `afterRunId` requires a later settled run.
-
-Without a cursor, an existing successful result returns immediately. Otherwise, the wait starts from the current settlement cursor.
-
-A completed wait does not terminate the child. The child remains available for later turns.
+A settled child remains available for later turns. The child remains interactive during the active parent lifecycle.
 
 ## Resume
 
@@ -221,7 +212,7 @@ Queued registry writes capture their state when requested. An earlier write cann
 
 A same-process `/reload` controller retries pending pane cleanup without pane discovery. A fresh process instead retires the recorded whole dedicated session before provisioning.
 
-Heartbeats do not update user activity, write the registry, or refresh the UI. Status and wait return controller state without Zellij queries.
+Heartbeats do not update user activity, write the registry, or refresh the UI. Status and result return controller state without Zellij queries.
 
 Stopped children leave the active widget. Their metadata, history, and artifacts remain available until retention or explicit cleanup removes them.
 
@@ -247,7 +238,7 @@ A settled child remains alive and interactive during the active parent lifecycle
 
 ## Tools
 
-The extension registers ten tools.
+The extension registers nine tools.
 
 - `subagent_start {task, model, thinking, name?, cwd?, systemPrompt?}`
   - The model and thinking level are mandatory.
@@ -258,8 +249,6 @@ The extension registers ten tools.
   - The tool returns lifecycle, activity, identity, usage, diagnostics, and artifact paths.
 - `subagent_result {id, runId}`
   - The tool returns the exact persisted output and actual outcome for one settled run.
-- `subagent_wait {id?|all?, timeoutSeconds, afterRunId?}`
-  - The tool waits for a settlement cursor or a stopped process.
 - `subagent_steer {id, message}`
   - The tool sends guidance during the current child turn.
 - `subagent_follow_up {id, message}`
@@ -295,7 +284,7 @@ Run the deterministic suite from this directory:
 PI_TEST_PACKAGE_DIR=/path/to/pi-0.83.0 ./test.sh
 ```
 
-The suite covers per-run results, settlement notifications, waits, owner isolation, lease races, strict IPC fences, reconnect state, stable pane cleanup, action bounds, resume, lifecycle, liveness, and UI behavior.
+The suite covers per-run results, settlement notifications, owner isolation, lease races, strict IPC fences, reconnect state, stable pane cleanup, action bounds, resume, lifecycle, liveness, and UI behavior.
 
 A separate disposable integration gate must use a real Pi and a real Zellij session. It must set a disposable `PI_CODING_AGENT_DIR`.
 
