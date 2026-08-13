@@ -92,7 +92,7 @@ const context = {
 	},
 } as unknown as ExtensionContext;
 
-test("exactly ten public tools are registered", () => {
+test("exactly nine public tools are registered", () => {
 	const tools = setup();
 	assert.deepEqual(
 		[...tools.keys()],
@@ -101,7 +101,6 @@ test("exactly ten public tools are registered", () => {
 			"subagent_list",
 			"subagent_status",
 			"subagent_result",
-			"subagent_wait",
 			"subagent_steer",
 			"subagent_follow_up",
 			"subagent_interrupt",
@@ -109,9 +108,6 @@ test("exactly ten public tools are registered", () => {
 			"subagent_resume",
 		],
 	);
-	const waitParameters = requireTool(tools, "subagent_wait").parameters as {
-		properties: { afterRunId?: unknown };
-	};
 	const startParameters = requireTool(tools, "subagent_start").parameters as {
 		properties: {
 			task: { minLength?: number };
@@ -120,7 +116,6 @@ test("exactly ten public tools are registered", () => {
 		};
 		required?: string[];
 	};
-	assert.ok(waitParameters.properties.afterRunId);
 	assert.equal(startParameters.properties.task.minLength, 1);
 	assert.equal(startParameters.properties.model.minLength, 1);
 	assert.deepEqual(
@@ -149,7 +144,7 @@ test("start and kill descriptions guide child cleanup", () => {
 	);
 });
 
-test("prompt guidance distinguishes notifications, results, waits, and status", async () => {
+test("prompt guidance prefers settlement notifications and exact results", async () => {
 	const handlers = new Map<string, TestHandler>();
 	const tools = setup(handlers);
 	const prompt = (await handlers.get("before_agent_start")?.({
@@ -157,13 +152,14 @@ test("prompt guidance distinguishes notifications, results, waits, and status", 
 	})) as { systemPrompt: string };
 	assert.match(prompt.systemPrompt, /notifications arrive automatically/);
 	assert.match(prompt.systemPrompt, /subagent_result/);
-	assert.match(prompt.systemPrompt, /finite timeout only for explicit synchronization/);
+	assert.match(prompt.systemPrompt, /start a follow-up turn/);
 	assert.match(prompt.systemPrompt, /subagent_status for live diagnostics/);
-	assert.match(prompt.systemPrompt, /Do not poll/);
+	assert.match(prompt.systemPrompt, /Do not poll for routine completion/);
+	assert.doesNotMatch(prompt.systemPrompt, /subagent_wait/);
 	assert.match(requireTool(tools, "subagent_result").description, /never falls back/);
 });
 
-test("all ten tool schemas accept valid parameters and reject invalid parameters", () => {
+test("all nine tool schemas accept valid parameters and reject invalid parameters", () => {
 	const tools = setup();
 	const cases: [string, unknown, unknown][] = [
 		[
@@ -174,11 +170,6 @@ test("all ten tool schemas accept valid parameters and reject invalid parameters
 		["subagent_list", {}, { includeFinished: "yes" }],
 		["subagent_status", { id: "child" }, {}],
 		["subagent_result", { id: "child", runId: 1 }, { id: "child" }],
-		[
-			"subagent_wait",
-			{ id: "child", timeoutSeconds: 1 },
-			{ id: "child", timeoutSeconds: 0 },
-		],
 		[
 			"subagent_steer",
 			{ id: "child", message: "guidance" },
@@ -349,21 +340,6 @@ exit 2
 		if (old.zellij === undefined) delete process.env.PI_SUBAGENT_ZELLIJ_BIN;
 		else process.env.PI_SUBAGENT_ZELLIJ_BIN = old.zellij;
 	}
-});
-
-test("wait validates target and timeout", async () => {
-	const wait = requireTool(setup(), "subagent_wait");
-	const badTarget = await wait.execute("x", {
-		id: "a",
-		all: true,
-		timeoutSeconds: 1,
-	});
-	assert.match(badTarget.content[0]?.text ?? "", /exactly one/);
-	const badTimeout = await wait.execute("x", {
-		id: "a",
-		timeoutSeconds: Number.POSITIVE_INFINITY,
-	});
-	assert.match(badTimeout.content[0]?.text ?? "", /finite/);
 });
 
 test("follow-up and interrupt reject unknown or stopped handles", async () => {
@@ -1028,43 +1004,6 @@ async function advanceWatchdog(
 	await finishWatchdogSweep(scheduler);
 }
 
-test("wait preserves timeout, cancellation, all-child, and stopped-process behavior", async () => {
-	const live = await setupControllerWithChild({ hasSessionFile: true });
-	try {
-		const timedOut = await requireTool(live.tools, "subagent_wait").execute(
-			"x",
-			{ id: live.childId, timeoutSeconds: 1 },
-		);
-		assert.equal(timedOut.details.outcome, "timedOut");
-		const controller = new AbortController();
-		controller.abort();
-		const canceled = await requireTool(live.tools, "subagent_wait").execute(
-			"x",
-			{ id: live.childId, timeoutSeconds: 1 },
-			controller.signal,
-		);
-		assert.equal(canceled.details.outcome, "canceled");
-	} finally {
-		await live.cleanup();
-	}
-
-	const stopped = await setupControllerWithChild({ processState: "stopped" });
-	try {
-		const stoppedResult = await requireTool(
-			stopped.tools,
-			"subagent_wait",
-		).execute("x", { id: stopped.childId, timeoutSeconds: 1 });
-		assert.equal(stoppedResult.details.outcome, "completed");
-		const allResult = await requireTool(stopped.tools, "subagent_wait").execute(
-			"x",
-			{ all: true, timeoutSeconds: 1 },
-		);
-		assert.equal(allResult.details.outcome, "completed");
-	} finally {
-		await stopped.cleanup();
-	}
-});
-
 test("subagent_result returns stable structured artifact states", async () => {
 	const unknown = await requireTool(setup(), "subagent_result").execute("x", {
 		id: "missing-child",
@@ -1292,7 +1231,7 @@ test("an older settlement cannot repopulate a newer run fallback", async () => {
 	}
 });
 
-test("result visibility: settled wait exposes content and details.result", async () => {
+test("result visibility: settlement notifications expose exact output", async () => {
 	const s = await setupControllerWithChild({ hasSessionFile: true });
 	try {
 		const socket = await connectSocket(s.socketPath);
@@ -1407,26 +1346,20 @@ test("result visibility: settled wait exposes content and details.result", async
 					),
 				),
 		);
-		const waitResult = await requireTool(s.tools, "subagent_wait").execute(
-			"x",
-			{ id: s.childId, timeoutSeconds: 2 },
-		);
-		assert.equal(waitResult.details.outcome, "completed");
-		assert.equal(waitResult.content[0]?.text, "final answer");
-		assert.equal(waitResult.details.result, "final answer");
-		assert.equal(waitResult.details.runId, 1);
-		const allWaitResult = await requireTool(
-			s.tools,
-			"subagent_wait",
-		).execute("x", { all: true, timeoutSeconds: 1 });
-		assert.equal(allWaitResult.details.outcome, "completed");
-		assert.equal(allWaitResult.details.result, "final answer");
+		await eventually(async () => {
+			const result = await requireTool(s.tools, "subagent_result").execute(
+				"x",
+				{ id: s.childId, runId: 1 },
+			);
+			return result.details.status === "available";
+		});
 		const firstResult = await requireTool(
 			s.tools,
 			"subagent_result",
 		).execute("x", { id: s.childId, runId: 1 });
 		assert.equal(firstResult.content[0]?.text, "final answer");
 		assert.equal(firstResult.details.outcome, "succeeded");
+		assert.equal(firstResult.details.runId, 1);
 		assert.equal(
 			await readFile(join(s.sessionDir, "result.md"), "utf8"),
 			"final answer",
@@ -1478,16 +1411,21 @@ test("result visibility: settled wait exposes content and details.result", async
 				runId,
 			});
 		};
-		const secondWait = requireTool(s.tools, "subagent_wait").execute(
-			"x",
-			{ id: s.childId, timeoutSeconds: 2, afterRunId: 1 },
-		);
-		await new Promise((resolve) => setTimeout(resolve, 50));
 		settleRun(2, "", "failed");
-		const secondWaitResult = await secondWait;
-		assert.equal(secondWaitResult.details.runId, 2);
-		assert.equal(secondWaitResult.details.runOutcome, "failed");
-		assert.equal(secondWaitResult.content[0]?.text, "");
+		await eventually(async () => {
+			const result = await requireTool(s.tools, "subagent_result").execute(
+				"x",
+				{ id: s.childId, runId: 2 },
+			);
+			return result.details.status === "available";
+		});
+		const secondResult = await requireTool(s.tools, "subagent_result").execute(
+			"x",
+			{ id: s.childId, runId: 2 },
+		);
+		assert.equal(secondResult.details.runId, 2);
+		assert.equal(secondResult.details.outcome, "failed");
+		assert.equal(secondResult.content[0]?.text, "");
 		assert.equal(await readFile(join(s.sessionDir, "result.md"), "utf8"), "");
 		settleRun(3, "", "aborted");
 		await eventually(() =>
@@ -2084,14 +2022,17 @@ test("controller restart retries durable cleanup after a prior final failure", a
 	}
 });
 
-test("status and wait do not query Zellij", async () => {
+test("status and result do not query Zellij", async () => {
 	const s = await setupControllerWithChild({ hasSessionFile: true });
 	try {
 		const record = join(s.agentDirectory, "zellij-actions");
 		await writeFile(s.zellijScript, `#!/bin/sh\nprintf '%s\\n' "$@" >> ${JSON.stringify(record)}\nexit 2\n`);
 		await chmod(s.zellijScript, 0o755);
 		await requireTool(s.tools, "subagent_status").execute("x", { id: s.childId });
-		await requireTool(s.tools, "subagent_wait").execute("x", { id: s.childId, timeoutSeconds: 1 });
+		await requireTool(s.tools, "subagent_result").execute("x", {
+			id: s.childId,
+			runId: 1,
+		});
 		assert.doesNotMatch(await readFile(record, "utf8").catch(() => ""), /list-panes/);
 	} finally {
 		await s.cleanup();
@@ -2340,10 +2281,6 @@ test("wrong and missing pong identifiers expire once and directly close the stab
 		);
 		await advanceWatchdog(scheduler);
 		await advanceWatchdog(scheduler);
-		const waitForDeath = requireTool(s.tools, "subagent_wait").execute("x", {
-			id: s.childId,
-			timeoutSeconds: 60,
-		});
 		scheduler.advanceBy(5_000);
 		await flushController(async () => {
 			const status = await requireTool(s!.tools, "subagent_status").execute("x", {
@@ -2356,8 +2293,6 @@ test("wrong and missing pong identifiers expire once and directly close the stab
 				actions.includes("terminal_2")
 			);
 		});
-		const waitResult = await waitForDeath;
-		assert.equal(waitResult.details.outcome, "completed");
 		const status = await requireTool(s.tools, "subagent_status").execute("x", {
 			id: s.childId,
 		});
@@ -3076,7 +3011,7 @@ test("explicit kill persists terminal cleanup before watchdog cleanup", async ()
 	}
 });
 
-test("a clean child quit stops immediately and completes status and wait", async () => {
+test("a clean child quit stops immediately and completes status", async () => {
 	const s = await setupControllerWithChild({ hasSessionFile: true });
 	let socket: net.Socket | undefined;
 	try {
@@ -3088,10 +3023,6 @@ test("a clean child quit stops immediately and completes status and wait", async
 			`#!/bin/sh\nprintf '%s\\n' "$@" >> ${JSON.stringify(actionLog)}\nif [ "$4" = close-pane ]; then exit 0; fi\nexit 2\n`,
 		);
 		await chmod(s.zellijScript, 0o755);
-		const waiting = requireTool(s.tools, "subagent_wait").execute("x", {
-			id: s.childId,
-			timeoutSeconds: 5,
-		});
 		socket.end(
 			makeFrame("bye", childFrameBase(s, "clean-quit-connection"), {
 				reason: "quit",
@@ -3107,7 +3038,6 @@ test("a clean child quit stops immediately and completes status and wait", async
 				(await readFile(actionLog, "utf8").catch(() => "")).includes("terminal_2")
 			);
 		});
-		assert.equal((await waiting).details.outcome, "completed");
 		const status = await requireTool(s.tools, "subagent_status").execute("x", {
 			id: s.childId,
 		});

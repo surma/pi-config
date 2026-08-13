@@ -274,12 +274,6 @@ const ResultSchema = Type.Object(
 	},
 	{ additionalProperties: false },
 );
-const WaitSchema = Type.Object({
-	id: Type.Optional(Type.String()),
-	all: Type.Optional(Type.Boolean()),
-	timeoutSeconds: Type.Number({ minimum: 1 }),
-	afterRunId: Type.Optional(Type.Number({ minimum: 0 })),
-});
 const MessageSchema = Type.Object({
 	id: Type.String(),
 	message: Type.String({ minLength: 1 }),
@@ -2259,14 +2253,14 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	pi.on("before_agent_start", async (event) => ({
 		systemPrompt:
 			event.systemPrompt +
-			`\n\nSubagent extension is available. Use it only for explicit delegation. subagent_start requires an explicit provider/model and thinking level; use list_models when needed instead of guessing. Children are persistent interactive Pi TUIs in tabs of a dedicated Pi-owned Zellij session. Settled-run notifications arrive automatically while children remain alive. Use subagent_result with the child ID and run ID for exact settled output. Use subagent_wait with a finite timeout only for explicit synchronization. Use subagent_status for live diagnostics. Do not poll subagent_status or subagent_wait for routine completion. Use subagent_follow_up for another turn, subagent_steer during a run, subagent_interrupt to abort a run while keeping the child alive, and subagent_kill only to terminate.`,
+			`\n\nSubagent extension is available. Use it only for explicit delegation. subagent_start requires an explicit provider/model and thinking level; use list_models when needed instead of guessing. Children are persistent interactive Pi TUIs in tabs of a dedicated Pi-owned Zellij session. Start a child, then continue other work or end the current turn. Settlement notifications arrive automatically while children remain alive and start a follow-up turn. Use subagent_result with the child ID and run ID from the notification for exact settled output. Do not poll for routine completion. Use subagent_status for live diagnostics. Use subagent_follow_up for another turn, subagent_steer during a run, subagent_interrupt to abort a run while keeping the child alive, and subagent_kill only to terminate.`,
 	}));
 
 	pi.registerTool<typeof TaskSpecSchema, unknown>({
 		name: "subagent_start",
 		label: "Subagent Start",
 		description:
-			"Start a persistent interactive Pi TUI with an explicit model and thinking level in a new tab of the dedicated Pi-owned Zellij session after a bounded IPC handshake. Call subagent_kill when the child is no longer useful.",
+			"Start a persistent interactive Pi TUI with an explicit model and thinking level in a new tab of the dedicated Pi-owned Zellij session after a bounded IPC handshake. Settlement notifications start a follow-up turn when the child finishes. Do not poll for completion. Call subagent_kill when the child is no longer useful.",
 		parameters: TaskSpecSchema,
 		async execute(_id, params, _signal, _update, ctx) {
 			latestCtx = ctx;
@@ -2459,97 +2453,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 					runId: params.runId,
 					resultPath: exact.resultPath,
 					metadataPath: exact.metadataPath,
-				},
-			};
-		},
-	});
-	pi.registerTool<typeof WaitSchema, unknown>({
-		name: "subagent_wait",
-		label: "Subagent Wait",
-		description:
-			"Bounded wait for a run settlement cursor or stopped process. Completion does not terminate the child.",
-		parameters: WaitSchema,
-		async execute(_id, params, signal) {
-			if (!Number.isFinite(params.timeoutSeconds) || params.timeoutSeconds < 1)
-				return {
-					content: [
-						{
-							type: "text" as const,
-							text: "timeoutSeconds must be finite and at least 1.",
-						},
-					],
-					details: { outcome: "timedOut", handles: [] },
-				};
-			const hasId = !!params.id;
-			const hasAll = params.all === true;
-			if (hasId === hasAll)
-				return {
-					content: [
-						{
-							type: "text" as const,
-							text: "Provide exactly one of id or all:true.",
-						},
-					],
-					details: { outcome: "timedOut", handles: [] },
-				};
-			let chosen: SubagentHandle[];
-			if (hasId) {
-				const handle = params.id ? handles.get(params.id) : undefined;
-				if (!handle)
-					return {
-						content: [
-							{
-								type: "text" as const,
-								text: `Unknown subagent id: ${params.id}`,
-							},
-						],
-						details: { outcome: "timedOut", handles: [] },
-					};
-				chosen = [handle];
-			} else chosen = sorted().filter(active);
-			const targets = chosen.map((handle) => ({
-				handle,
-				cursor:
-					params.afterRunId ??
-					(handle.lastSettledRunId > 0 &&
-					handle.runState === "idle" &&
-					handle.runOutcome === "succeeded"
-						? 0
-						: handle.lastSettledRunId),
-			}));
-			const waited = await waitFor(targets, params.timeoutSeconds, signal);
-			await Promise.all(
-				targets.map(({ handle }) => handle.settlementPersistenceChain),
-			);
-			const exactResults = await Promise.all(
-				targets.map(async (target) =>
-					target.settledRunId
-						? readRunResult(target.handle.sessionDir, target.settledRunId)
-						: undefined,
-				),
-			);
-			const exact = exactResults.find(
-				(result) => result?.status === "available",
-			);
-			const record = exact?.status === "available" ? exact.record : undefined;
-			const settledHandles = await Promise.all(chosen.map(serialize));
-			const outcome = waited;
-			return {
-				content: [
-					{
-						type: "text" as const,
-						text:
-							record?.result ??
-							`Wait ${outcome}. Child processes remain ${chosen.every(active) ? "alive" : "unchanged"}.`,
-					},
-				],
-				details: {
-					outcome,
-					result: record?.result,
-					runId: record?.runId,
-					runOutcome: record?.outcome,
-					resultPath: record?.resultPath,
-					handles: settledHandles,
 				},
 			};
 		},
