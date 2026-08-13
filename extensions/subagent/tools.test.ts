@@ -38,6 +38,7 @@ interface TestTool {
 	description: string;
 	parameters: unknown;
 	execute(...args: unknown[]): Promise<TestResult>;
+	renderResult?: (...args: unknown[]) => { render(width: number): string[] };
 }
 
 type TestHandler = (...args: unknown[]) => unknown;
@@ -1003,6 +1004,32 @@ async function advanceWatchdog(
 	scheduler.advanceBy(milliseconds);
 	await finishWatchdogSweep(scheduler);
 }
+
+test("subagent_result previews collapsed output and expands it on demand", () => {
+	const renderer = requireTool(setup(), "subagent_result").renderResult;
+	assert.ok(renderer);
+	const result = {
+		content: [
+			{
+				type: "text",
+				text: ["line 1", "line 2", "line 3", "line 4", "line 5", "line 6"].join("\n"),
+			},
+		],
+	};
+	const theme = { fg: (_color: string, text: string) => text };
+
+	const collapsed = renderer(result, { expanded: false }, theme, {});
+	assert.equal(
+		collapsed.render(120).map((line) => line.trimEnd()).join("\n"),
+		"line 1\nline 2\nline 3\nline 4\nline 5\n...",
+	);
+
+	const expanded = renderer(result, { expanded: true }, theme, {});
+	assert.equal(
+		expanded.render(120).map((line) => line.trimEnd()).join("\n"),
+		"line 1\nline 2\nline 3\nline 4\nline 5\nline 6",
+	);
+});
 
 test("subagent_result returns stable structured artifact states", async () => {
 	const unknown = await requireTool(setup(), "subagent_result").execute("x", {

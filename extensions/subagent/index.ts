@@ -8,6 +8,7 @@ import {
 	type ExtensionContext,
 	getAgentDir,
 } from "@mariozechner/pi-coding-agent";
+import { Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import {
 	dispatchSubagentEvent,
@@ -118,6 +119,7 @@ const TOOL_OUTPUT_TAIL_MAX = 16 * 1024;
 const MAX_RECENT_TOOLS = 8;
 const MAX_RETAINED_HANDLES = 24;
 const MAX_DIAGNOSTICS = 20;
+const SUBAGENT_RESULT_PREVIEW_LINES = 5;
 const controllerInstanceKey = Symbol.for("pi.subagent.controllerInstanceId");
 const controllerGlobal = globalThis as typeof globalThis & {
 	[controllerInstanceKey]?: string;
@@ -2383,6 +2385,18 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		description:
 			"Return the exact persisted output and outcome for one child run. This retrieval is idempotent and never falls back to another run.",
 		parameters: ResultSchema,
+		renderResult(result, options, theme) {
+			const text = result.content
+				.filter((item) => item.type === "text")
+				.map((item) => item.text)
+				.join("\n");
+			const lines = text.split("\n");
+			const visibleText =
+				options.expanded || lines.length <= SUBAGENT_RESULT_PREVIEW_LINES
+					? text
+					: `${lines.slice(0, SUBAGENT_RESULT_PREVIEW_LINES).join("\n")}\n${theme.fg("dim", "...")}`;
+			return new Text(visibleText, 0, 0);
+		},
 		async execute(_id, params) {
 			const handle = handles.get(params.id);
 			if (!handle)
