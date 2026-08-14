@@ -37,6 +37,7 @@ import {
 	type SessionLifecycle,
 	type SubagentRun,
 } from "./lifecycle.js";
+import { isProcessAlive } from "./lock.js";
 import {
 	acquireLease,
 	canonicalOwnerSessionFile,
@@ -44,8 +45,10 @@ import {
 	hasLeaseAuthority,
 	incarnationSocketDir,
 	LEASE_RENEW_INTERVAL_MS,
+	leasePath,
 	type OwnerIdentity,
 	ownerRegistryPath,
+	readLeaseRecord,
 	releaseLease,
 	renewLease,
 } from "./owner.js";
@@ -432,14 +435,34 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	): void => {
 		ctx?.ui?.setStatus("subagent-zellij", sessionName);
 	};
-	async function requireCurrentAuthority(): Promise<boolean> {
-		if (!leaseHeld || !owner || !controllerInstanceId) return false;
-		const authoritative = await hasLeaseAuthority(
-			getAgentDir(),
-			owner,
+	/**
+	 * Wall-clock expiry can lapse without any competing controller, most visibly
+	 * across host suspend. Re-extend our own record before concluding that
+	 * authority was lost; only a missing or foreign record is a real loss.
+	 */
+	async function ensureLeaseAuthority(
+		authorityOwner: OwnerIdentity,
+	): Promise<boolean> {
+		const agentDir = getAgentDir();
+		if (
+			await hasLeaseAuthority(
+				agentDir,
+				authorityOwner,
+				controllerInstanceId,
+				now(),
+			)
+		)
+			return true;
+		return renewLease(
+			agentDir,
+			authorityOwner,
 			controllerInstanceId,
 			now(),
-		);
+		).catch(() => false);
+	}
+	async function requireCurrentAuthority(): Promise<boolean> {
+		if (!leaseHeld || !owner || !controllerInstanceId) return false;
+		const authoritative = await ensureLeaseAuthority(owner);
 		if (!authoritative) {
 			leaseHeld = false;
 			suppressAllSettlementNotifications();
@@ -1120,7 +1143,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	}
 	async function attachServer(handle: SubagentHandle): Promise<void> {
 		if (!(await requireCurrentAuthority()))
-			throw new Error(leaseConflictMessage());
+			throw new Error(await leaseConflictMessage());
 		await handle.ipcServer?.close().catch(() => {});
 		handle.ipcServer = await startIpcServer(handle.socketPath, {
 			onHello: (frame, conn) =>
@@ -1275,7 +1298,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		content: string,
 	): Promise<AckFrame> {
 		if (!(await requireCurrentAuthority()))
-			throw new Error(leaseConflictMessage());
+			throw new Error(await leaseConflictMessage());
 		if (handle.processState !== "alive")
 			return Promise.reject(
 				new Error(`Subagent #${handle.id} is no longer running.`),
@@ -1329,7 +1352,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		if (paneId === undefined || !handle.zellijSessionName)
 			throw new Error(`Subagent #${handle.id} stable pane identity is unavailable.`);
 		if (!(await requireCurrentAuthority()))
-			throw new Error(leaseConflictMessage());
+			throw new Error(await leaseConflictMessage());
 		const cursor = handle.lastSettledRunId;
 		await sendKeysInSession(requireHandleDedicatedSession(handle), paneId, "Esc");
 		if (handle.runState === "idle") return true;
@@ -1373,7 +1396,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	}
 	async function terminate(handle: SubagentHandle): Promise<SubagentHandle> {
 		if (!(await requireCurrentAuthority()))
-			throw new Error(leaseConflictMessage());
+			throw new Error(await leaseConflictMessage());
 		if (handle.processState === "stopped") return handle;
 		if (handle.terminationPromise) return handle.terminationPromise;
 		handle.terminationPromise = (async () => {
@@ -1429,7 +1452,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	): Promise<SubagentHandle> {
 		const zellijSessionName = await ensureDedicatedSession(ctx);
 		if (!(await requireCurrentAuthority()))
-			throw new Error(leaseConflictMessage());
+			throw new Error(await leaseConflictMessage());
 		const resolvedOwner = owner;
 		if (!resolvedOwner)
 			throw new Error("Controller owner identity is not established.");
@@ -1549,7 +1572,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			);
 		const zellijSessionName = await ensureDedicatedSession(ctx);
 		if (!(await requireCurrentAuthority()))
-			throw new Error(leaseConflictMessage());
+			throw new Error(await leaseConflictMessage());
 		const resolvedOwner = owner;
 		if (!resolvedOwner)
 			throw new Error("Controller owner identity is not established.");
@@ -1894,7 +1917,10 @@ export default function subagentExtension(pi: ExtensionAPI) {
 						suppressAllSettlementNotifications();
 						setDedicatedSessionStatus(latestCtx, undefined);
 						for (const handle of handles.values())
-							addDiagnostic(handle, "Controller lease lost during renewal.");
+							addDiagnostic(
+								handle,
+								"Controller lease lost during renewal: the lease record is missing or now belongs to another controller. Run /reload to re-establish it.",
+							);
 						stopTimers();
 						refreshUi();
 					}
@@ -2082,12 +2108,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 						console.error(`Subagent Zellij guardian failed: ${error.message}`);
 					},
 					() => settleChildrenAfterWholeSessionDeletion(resolved),
-					(cleanupOwner) => hasLeaseAuthority(
-						getAgentDir(),
-						cleanupOwner,
-						controllerInstanceId,
-						now(),
-					),
+					(cleanupOwner) => ensureLeaseAuthority(cleanupOwner),
 				);
 				setDedicatedSessionStatus(ctx, dedicatedLifecycle.record.sessionName);
 				await resolveRetainedCleanupLeases(resolvedLease);
@@ -2111,14 +2132,33 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			owner = null;
 			leaseHeld = false;
 			setDedicatedSessionStatus(ctx, undefined);
+			const { existing } = result;
 			console.error(
-				`Subagent controller lease held by another Pi process for this session. Wait for it to exit or expire, then reload.`,
+				`Subagent controller lease for this session file is held by controller ${existing.controllerInstanceId} (pid ${existing.pid}, ${isProcessAlive(existing.pid) ? "running" : "not running"}), expiring ${new Date(existing.expiresAt).toISOString()}. Quit that Pi process, then reload here.`,
 			);
 		}
 	}
 
-	function leaseConflictMessage(): string {
-		return "Controller lease is not held; another Pi process may own this session. Wait for it to exit or expire, then reload.";
+	/**
+	 * Distinguishes an unreclaimable-but-ours record, a foreign live holder, and
+	 * a foreign dead holder, because "wait for it to expire" is useless advice
+	 * for every case except an actively held lease.
+	 */
+	async function leaseConflictMessage(): Promise<string> {
+		const base = "Subagent controller lease is not held.";
+		if (!owner)
+			return `${base} This Pi session has no persisted session file, so no controller was established.`;
+		const path = leasePath(getAgentDir(), owner);
+		const existing = await readLeaseRecord(getAgentDir(), owner).catch(
+			() => undefined,
+		);
+		if (!existing)
+			return `${base} No lease record exists at ${path}. Run /reload to re-establish this controller.`;
+		if (existing.controllerInstanceId === controllerInstanceId)
+			return `${base} The record at ${path} still belongs to this process (pid ${existing.pid}), but this controller stopped holding it (expired ${new Date(existing.expiresAt).toISOString()}). Waiting will not help. Run /reload to reclaim it.`;
+		return isProcessAlive(existing.pid)
+			? `${base} Another live Pi process (pid ${existing.pid}) owns session ${existing.ownerSessionId} and holds ${path}. Quit that process, then run /reload here.`
+			: `${base} The record at ${path} names pid ${existing.pid}, which is no longer running (expired ${new Date(existing.expiresAt).toISOString()}). Run /reload to take it over.`;
 	}
 
 	function releaseLeaseIfHeld() {
@@ -2683,7 +2723,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				};
 			if (!requireLease())
 				return {
-					content: [{ type: "text" as const, text: leaseConflictMessage() }],
+					content: [{ type: "text" as const, text: await leaseConflictMessage() }],
 					details: {},
 				};
 			const sessionFile = handle.sessionPath;

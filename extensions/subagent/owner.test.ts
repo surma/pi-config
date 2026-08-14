@@ -25,6 +25,7 @@ import {
 	maintainLeaseAuthority,
 	ownerKey,
 	ownerRegistryPath,
+	readLeaseRecord,
 	releaseLease,
 	renewLease,
 } from "./owner.ts";
@@ -177,6 +178,56 @@ test("renewLease fails when the holder changed", async () => {
 		await readFile(leasePath(dir, owner), "utf8"),
 	) as LeaseRecord;
 	assert.equal(onDisk.controllerInstanceId, "controller-b");
+});
+
+test("renewLease reclaims this controller's own record after a suspend-length lapse", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-owner-lease-"));
+	const t0 = 1_000_000;
+	const first = await acquireLease(dir, owner, "controller-a", t0);
+	if (!first.held) return assert.fail("first acquire failed");
+	const afterSuspend = first.lease.expiresAt + 7 * 60 * 60 * 1_000;
+	assert.equal(
+		await hasLeaseAuthority(dir, owner, "controller-a", afterSuspend),
+		false,
+	);
+	assert.equal(await renewLease(dir, owner, "controller-a", afterSuspend), true);
+	assert.equal(
+		await hasLeaseAuthority(dir, owner, "controller-a", afterSuspend),
+		true,
+	);
+	const onDisk = JSON.parse(
+		await readFile(leasePath(dir, owner), "utf8"),
+	) as LeaseRecord;
+	assert.equal(onDisk.controllerInstanceId, "controller-a");
+	assert.equal(onDisk.acquiredAt, t0);
+	assert.equal(onDisk.expiresAt, afterSuspend + LEASE_TTL_MS);
+});
+
+test("renewLease still refuses after another controller legitimately took over", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-owner-lease-"));
+	const t0 = 1_000_000;
+	const first = await acquireLease(dir, owner, "controller-a", t0);
+	if (!first.held) return assert.fail("first acquire failed");
+	const afterSuspend = first.lease.expiresAt + 7 * 60 * 60 * 1_000;
+	const takeover = await acquireLease(dir, owner, "controller-b", afterSuspend);
+	assert.equal(takeover.held, true);
+	assert.equal(
+		await renewLease(dir, owner, "controller-a", afterSuspend + 1),
+		false,
+	);
+	const onDisk = JSON.parse(
+		await readFile(leasePath(dir, owner), "utf8"),
+	) as LeaseRecord;
+	assert.equal(onDisk.controllerInstanceId, "controller-b");
+});
+
+test("readLeaseRecord reports the current record and absence", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-owner-lease-"));
+	assert.equal(await readLeaseRecord(dir, owner), undefined);
+	await acquireLease(dir, owner, "controller-a", 1_000_000);
+	const record = await readLeaseRecord(dir, owner);
+	assert.equal(record?.controllerInstanceId, "controller-a");
+	assert.equal(record?.pid, process.pid);
 });
 
 test("renewLease on an absent file returns false", async () => {

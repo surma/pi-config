@@ -192,37 +192,16 @@ export async function acquireLease(
 	});
 }
 
-export async function renewLease(
-	agentDir: string,
-	owner: OwnerIdentity,
-	controllerInstanceId: string,
-	now: number,
-): Promise<boolean> {
-	const path = leasePath(agentDir, owner);
-	return withLeaseLock(path, async () => {
-		const existing = await readLease(path);
-		if (
-			!existing ||
-			existing.ownerSessionFile !== owner.ownerSessionFile ||
-			existing.ownerSessionId !== owner.ownerSessionId ||
-			existing.controllerInstanceId !== controllerInstanceId ||
-			now > existing.expiresAt
-		)
-			return false;
-		await writeLeaseAtomic(path, {
-			...existing,
-			expiresAt: now + LEASE_TTL_MS,
-			renewedAt: now,
-		});
-		return true;
-	});
-}
-
 /**
- * Extends retained same-process cleanup authority even after its ordinary
- * expiry, but never overwrites a lease elected for another controller.
+ * Extends an existing record that still names this exact owner and controller,
+ * even after its ordinary expiry, but never recreates an absent lease and never
+ * overwrites a lease elected for another controller. Expiry only authorizes a
+ * *takeover* by someone else; it must not force the recorded holder to abandon
+ * a record that is demonstrably still its own. Wall-clock expiry is unavoidably
+ * observed across host suspend, so a strict expiry check here would strand a
+ * live controller that no other process ever replaced.
  */
-export async function maintainLeaseAuthority(
+async function extendOwnLease(
 	agentDir: string,
 	owner: OwnerIdentity,
 	controllerInstanceId: string,
@@ -245,6 +224,29 @@ export async function maintainLeaseAuthority(
 		});
 		return true;
 	});
+}
+
+/** Periodic and on-demand renewal for the current controller. */
+export function renewLease(
+	agentDir: string,
+	owner: OwnerIdentity,
+	controllerInstanceId: string,
+	now: number,
+): Promise<boolean> {
+	return extendOwnLease(agentDir, owner, controllerInstanceId, now);
+}
+
+/**
+ * Extends retained same-process cleanup authority even after its ordinary
+ * expiry, but never overwrites a lease elected for another controller.
+ */
+export function maintainLeaseAuthority(
+	agentDir: string,
+	owner: OwnerIdentity,
+	controllerInstanceId: string,
+	now: number,
+): Promise<boolean> {
+	return extendOwnLease(agentDir, owner, controllerInstanceId, now);
 }
 
 export async function releaseLease(
@@ -282,6 +284,14 @@ export async function hasLeaseAuthority(
 		existing.controllerInstanceId === controllerInstanceId &&
 		now <= existing.expiresAt
 	);
+}
+
+/** Diagnostics-only read of the current record. Never a takeover authority. */
+export function readLeaseRecord(
+	agentDir: string,
+	owner: OwnerIdentity,
+): Promise<LeaseRecord | undefined> {
+	return readLease(leasePath(agentDir, owner));
 }
 
 export function createControllerInstanceId(): string {

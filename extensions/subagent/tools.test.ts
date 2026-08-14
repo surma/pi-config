@@ -1930,6 +1930,41 @@ test("new, resume, and fork session replacements do not adopt prior-owner childr
 	}
 });
 
+test("a suspend-expired own lease is reclaimed on demand instead of blocking every tool", async () => {
+	const s = await setupControllerWithChild({ hasSessionFile: true });
+	const ownLeasePath = leasePath(s.agentDirectory, {
+		ownerSessionFile: s.ownerSessionFile,
+		ownerSessionId: s.ownerSessionId,
+	});
+	try {
+		const lease = JSON.parse(await readFile(ownLeasePath, "utf8")) as Record<
+			string,
+			unknown
+		>;
+		const suspendedFor = 7 * 60 * 60 * 1_000;
+		lease.renewedAt = Date.now() - suspendedFor - LEASE_TTL_MS;
+		lease.expiresAt = Date.now() - suspendedFor;
+		await writeFile(ownLeasePath, `${JSON.stringify(lease)}\n`, { mode: 0o600 });
+
+		const result = await requireTool(s.tools, "subagent_follow_up").execute("x", {
+			id: s.childId,
+			message: "ping",
+		});
+		assert.doesNotMatch(result.content[0]?.text ?? "", /controller lease/i);
+
+		const reclaimed = JSON.parse(
+			await readFile(ownLeasePath, "utf8"),
+		) as Record<string, number | string>;
+		assert.equal(reclaimed.controllerInstanceId, lease.controllerInstanceId);
+		assert.ok(
+			Number(reclaimed.expiresAt) > Date.now(),
+			"the controller re-extended its own expired record",
+		);
+	} finally {
+		await s.cleanup();
+	}
+});
+
 test("failed replacement retirement renews old authority after the lease-expiry window before retry", async () => {
 	const s = await setupControllerWithChild({ hasSessionFile: true });
 	const sessions = join(dirname(s.zellijScript), "zellij-sessions");
