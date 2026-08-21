@@ -162,9 +162,11 @@ Only an `available` result includes `outcome`. Empty output remains an available
 
 Notifications batch nearby settlements and direct the parent to `subagent_result`.
 
-After `subagent_start`, continue other work or end the current turn. Do not poll for routine completion.
+After `subagent_start`, continue other work or end the current turn. Rely on settlement notifications for completion.
 
-Use `subagent_status` for live lifecycle and diagnostic information.
+Do not poll `subagent_status` or use sleep loops to wait for completion.
+
+Use `subagent_status` only for live lifecycle and diagnostic information. Never use it as a completion check.
 
 A settled child remains available for later turns. The child remains interactive during the active parent lifecycle.
 

@@ -2295,14 +2295,14 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	pi.on("before_agent_start", async (event) => ({
 		systemPrompt:
 			event.systemPrompt +
-			`\n\nSubagent extension is available. Use it only for explicit delegation. subagent_start requires an explicit provider/model and thinking level; use list_models when needed instead of guessing. Children are persistent interactive Pi TUIs in tabs of a dedicated Pi-owned Zellij session. Start a child, then continue other work or end the current turn. Settlement notifications arrive automatically while children remain alive and start a follow-up turn. Use subagent_result with the child ID and run ID from the notification for exact settled output. Do not poll for routine completion. Use subagent_status for live diagnostics. Use subagent_follow_up for another turn, subagent_steer during a run, subagent_interrupt to abort a run while keeping the child alive, and subagent_kill only to terminate.`,
+			`\n\nSubagent extension is available. Use it only for explicit delegation. subagent_start requires an explicit provider/model and thinking level; use list_models when needed instead of guessing. Children are persistent interactive Pi TUIs in tabs of a dedicated Pi-owned Zellij session. Start a child, then continue other work or end the current turn. Settlement notifications arrive automatically while children remain alive. These notifications start a follow-up turn. Rely on these notifications for completion. Do not poll subagent_status or use sleep commands to wait for completion. Use subagent_result with the child ID and run ID from the notification for exact settled output. Use subagent_status only for live diagnostics, never as a completion check. Use subagent_follow_up for another turn, subagent_steer during a run, subagent_interrupt to abort a run while keeping the child alive, and subagent_kill only to terminate.`,
 	}));
 
 	pi.registerTool<typeof TaskSpecSchema, unknown>({
 		name: "subagent_start",
 		label: "Subagent Start",
 		description:
-			"Start a persistent interactive Pi TUI with an explicit model and thinking level in a new tab of the dedicated Pi-owned Zellij session after a bounded IPC handshake. Settlement notifications start a follow-up turn when the child finishes. Do not poll for completion. Call subagent_kill when the child is no longer useful.",
+			"Start a persistent interactive Pi TUI with an explicit model and thinking level in a new tab of the dedicated Pi-owned Zellij session after a bounded IPC handshake. Settlement notifications start a follow-up turn when the child finishes. Rely on these notifications. Do not poll subagent_status or use sleep commands to wait for completion. Call subagent_kill when the child is no longer useful.",
 		parameters: TaskSpecSchema,
 		async execute(_id, params, _signal, _update, ctx) {
 			latestCtx = ctx;
@@ -2384,7 +2384,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		name: "subagent_status",
 		label: "Subagent Status",
 		description:
-			"Return process/run lifecycle, live activity, Zellij identity, and artifacts.",
+			"Return process/run lifecycle, live activity, Zellij identity, and artifacts. Use this tool only for live diagnostics. Do not poll this tool for completion.",
 		parameters: StatusSchema,
 		async execute(_id, params) {
 			const handle = handles.get(params.id);
