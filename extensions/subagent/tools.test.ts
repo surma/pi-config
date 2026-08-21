@@ -145,7 +145,7 @@ test("start and kill descriptions guide child cleanup", () => {
 	);
 });
 
-test("prompt guidance prefers settlement notifications and exact results", async () => {
+test("prompt guidance requires notification-driven completion", async () => {
 	const handlers = new Map<string, TestHandler>();
 	const tools = setup(handlers);
 	const prompt = (await handlers.get("before_agent_start")?.({
@@ -154,9 +154,20 @@ test("prompt guidance prefers settlement notifications and exact results", async
 	assert.match(prompt.systemPrompt, /notifications arrive automatically/);
 	assert.match(prompt.systemPrompt, /subagent_result/);
 	assert.match(prompt.systemPrompt, /start a follow-up turn/);
-	assert.match(prompt.systemPrompt, /subagent_status for live diagnostics/);
-	assert.match(prompt.systemPrompt, /Do not poll for routine completion/);
+	assert.match(prompt.systemPrompt, /Rely on these notifications for completion/);
+	assert.match(prompt.systemPrompt, /Do not poll subagent_status/);
+	assert.match(prompt.systemPrompt, /use sleep commands to wait for completion/);
+	assert.match(prompt.systemPrompt, /subagent_status only for live diagnostics/);
+	assert.match(prompt.systemPrompt, /never as a completion check/);
 	assert.doesNotMatch(prompt.systemPrompt, /subagent_wait/);
+	assert.match(
+		requireTool(tools, "subagent_start").description,
+		/Do not poll subagent_status or use sleep commands/,
+	);
+	assert.match(
+		requireTool(tools, "subagent_status").description,
+		/Do not poll this tool for completion/,
+	);
 	assert.match(requireTool(tools, "subagent_result").description, /never falls back/);
 });
 
