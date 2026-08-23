@@ -29,6 +29,7 @@ test("agent settlement is non-terminal idle and a second run can start", () => {
 	assert.equal(isLifecycleTerminal(state), false);
 	assert.equal(state.lastSettledRunId, 1);
 	assert.equal(startRun(state, 4)?.id, 2);
+	assert.equal(state.settlementStatus, "pending");
 	assert.equal(currentRunId(state), 2);
 });
 

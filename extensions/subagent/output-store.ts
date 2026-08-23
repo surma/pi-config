@@ -19,6 +19,9 @@ export type OutputStatus =
 
 export type OutputWriteStatus = Exclude<OutputStatus, "pending">;
 
+export const MAX_OUTPUT_ERROR_BYTES = 2 * 1024;
+const OUTPUT_ERROR_TRUNCATION_MARKER = "… [caller output error truncated] …";
+
 export type OutputWriteResult =
 	| { status: "not_requested" }
 	| { status: "written"; path: string }
@@ -29,8 +32,44 @@ function temporaryName(): string {
 	return `.pi-output.${process.pid}.${randomBytes(12).toString("hex")}.tmp`;
 }
 
+function utf8Width(codePoint: number): number {
+	if (codePoint <= 0x7f) return 1;
+	if (codePoint <= 0x7ff) return 2;
+	if (codePoint <= 0xffff) return 3;
+	return 4;
+}
+
+function boundedUtf8Prefix(value: string, maxBytes: number): string {
+	if (maxBytes <= 0) return "";
+	const characters: string[] = [];
+	let bytes = 0;
+	for (const character of value) {
+		const width = utf8Width(character.codePointAt(0) ?? 0xfffd);
+		if (bytes + width > maxBytes) break;
+		characters.push(character);
+		bytes += width;
+	}
+	return characters.join("");
+}
+
+/** Bound caller-visible errors without splitting a UTF-8 code point. */
+export function boundOutputError(value: unknown): string {
+	const text = value instanceof Error ? value.message : String(value);
+	if (Buffer.byteLength(text, "utf8") <= MAX_OUTPUT_ERROR_BYTES) return text;
+	const markerBytes = Buffer.byteLength(
+		OUTPUT_ERROR_TRUNCATION_MARKER,
+		"utf8",
+	);
+	if (MAX_OUTPUT_ERROR_BYTES <= markerBytes)
+		return boundedUtf8Prefix(text, MAX_OUTPUT_ERROR_BYTES);
+	return `${boundedUtf8Prefix(
+		text,
+		MAX_OUTPUT_ERROR_BYTES - markerBytes,
+	)}${OUTPUT_ERROR_TRUNCATION_MARKER}`;
+}
+
 function errorMessage(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
+	return boundOutputError(error);
 }
 
 async function removeTemporary(path: string): Promise<void> {

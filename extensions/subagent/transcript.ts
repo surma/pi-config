@@ -1,4 +1,5 @@
 import { promises as fs } from "node:fs";
+import { StringDecoder } from "node:string_decoder";
 
 /** The health of the child session snapshot. */
 export type TranscriptStatus =
@@ -31,8 +32,11 @@ export interface TranscriptResult {
 
 const DEFAULT_MESSAGE_COUNT = 3;
 const MAX_MESSAGE_COUNT = 20;
-const MAX_MESSAGE_TEXT = 8 * 1024;
-const MAX_TOTAL_TEXT = 32 * 1024;
+const MAX_MESSAGE_BYTES = 8 * 1024;
+const MAX_TOTAL_TEXT_BYTES = 32 * 1024;
+const MAX_RECORD_BYTES = 256 * 1024;
+const READ_CHUNK_BYTES = 64 * 1024;
+const STRING_SCAN_CHUNK_CHARS = 16 * 1024;
 const TRUNCATION_MARKER = "\n… [transcript text truncated] …\n";
 const ERROR_FALLBACK = "Assistant response failed";
 
@@ -106,17 +110,6 @@ function textFromContent(content: unknown): string {
 		.join("\n");
 }
 
-function boundedText(text: string, max: number): string {
-	if (text.length <= max) return text;
-	if (max <= TRUNCATION_MARKER.length) return text.slice(0, max);
-	const remaining = max - TRUNCATION_MARKER.length;
-	const prefixLength = Math.ceil(remaining / 2);
-	const suffixLength = remaining - prefixLength;
-	return `${text.slice(0, prefixLength)}${TRUNCATION_MARKER}${
-		suffixLength > 0 ? text.slice(-suffixLength) : ""
-	}`;
-}
-
 function withTimestamp(
 	role: TranscriptMessageRole,
 	text: string,
@@ -179,47 +172,224 @@ function messageFromEntry(
 		: { malformed: false };
 }
 
-function page(
-	candidates: TranscriptMessage[],
-	status: TranscriptStatus,
-	options: { messageOffset: number; numMessages: number },
-): TranscriptResult {
-	const start = options.messageOffset;
-	const messages: TranscriptMessage[] = [];
-	let totalText = 0;
-	let nextMessageOffset = start;
-	while (
-		nextMessageOffset < candidates.length &&
-		messages.length < options.numMessages &&
-		totalText < MAX_TOTAL_TEXT
-	) {
-		const candidate = candidates[nextMessageOffset];
-		if (!candidate) break;
-		const remaining = MAX_TOTAL_TEXT - totalText;
-		const text = boundedText(
-			candidate.text,
-			Math.min(MAX_MESSAGE_TEXT, remaining),
-		);
-		if (!text) break;
-		messages.push({
-			...candidate,
-			text,
-		});
-		totalText += text.length;
-		nextMessageOffset++;
-	}
-	return { status, messages, nextMessageOffset };
+function utf8Width(codePoint: number): number {
+	if (codePoint <= 0x7f) return 1;
+	if (codePoint <= 0x7ff) return 2;
+	if (codePoint <= 0xffff) return 3;
+	return 4;
 }
 
-function emptyResult(
+function utf8ByteLength(text: string): number {
+	let bytes = 0;
+	for (const character of text)
+		bytes += utf8Width(character.codePointAt(0) ?? 0xfffd);
+	return bytes;
+}
+
+function utf8Prefix(
+	text: string,
+	maxBytes: number,
+): { text: string; bytes: number } {
+	if (maxBytes <= 0) return { text: "", bytes: 0 };
+	const characters: string[] = [];
+	let bytes = 0;
+	for (const character of text) {
+		const width = utf8Width(character.codePointAt(0) ?? 0xfffd);
+		if (bytes + width > maxBytes) break;
+		characters.push(character);
+		bytes += width;
+	}
+	return { text: characters.join(""), bytes };
+}
+
+function utf8Suffix(
+	text: string,
+	maxBytes: number,
+): { text: string; bytes: number } {
+	if (maxBytes <= 0) return { text: "", bytes: 0 };
+	let index = text.length;
+	let start = index;
+	let bytes = 0;
+	while (index > 0) {
+		let characterStart = index - 1;
+		const last = text.charCodeAt(characterStart);
+		if (
+			last >= 0xdc00 &&
+			last <= 0xdfff &&
+			characterStart > 0 &&
+			text.charCodeAt(characterStart - 1) >= 0xd800 &&
+			text.charCodeAt(characterStart - 1) <= 0xdbff
+		)
+			characterStart--;
+		const width = utf8Width(text.codePointAt(characterStart) ?? 0xfffd);
+		if (bytes + width > maxBytes) break;
+		start = characterStart;
+		bytes += width;
+		index = characterStart;
+	}
+	return { text: text.slice(start), bytes };
+}
+
+/** Truncate text by UTF-8 bytes without splitting a Unicode code point. */
+function boundedUtf8Text(text: string, maxBytes: number): string {
+	if (maxBytes <= 0) return "";
+	if (utf8ByteLength(text) <= maxBytes) return text;
+	const markerBytes = utf8ByteLength(TRUNCATION_MARKER);
+	if (maxBytes <= markerBytes) return utf8Prefix(text, maxBytes).text;
+	const contentBytes = maxBytes - markerBytes;
+	const prefix = utf8Prefix(text, Math.ceil(contentBytes / 2));
+	const suffix = utf8Suffix(text, contentBytes - prefix.bytes);
+	return `${prefix.text}${TRUNCATION_MARKER}${suffix.text}`;
+}
+
+interface PageCollector {
+	readonly messageOffset: number;
+	readonly numMessages: number;
+	messages: TranscriptMessage[];
+	nextMessageOffset: number;
+	totalTextBytes: number;
+	filteredMessageCount: number;
+	collecting: boolean;
+}
+
+function createPageCollector(options: {
+	messageOffset: number;
+	numMessages: number;
+}): PageCollector {
+	return {
+		messageOffset: options.messageOffset,
+		numMessages: options.numMessages,
+		messages: [],
+		nextMessageOffset: options.messageOffset,
+		totalTextBytes: 0,
+		filteredMessageCount: 0,
+		collecting: options.numMessages > 0,
+	};
+}
+
+function collectMessage(collector: PageCollector, candidate: TranscriptMessage): void {
+	const offset = collector.filteredMessageCount++;
+	if (!collector.collecting || offset < collector.messageOffset) return;
+	if (
+		collector.messages.length >= collector.numMessages ||
+		collector.totalTextBytes >= MAX_TOTAL_TEXT_BYTES
+	) {
+		collector.collecting = false;
+		return;
+	}
+	const text = boundedUtf8Text(
+		candidate.text,
+		Math.min(MAX_MESSAGE_BYTES, MAX_TOTAL_TEXT_BYTES - collector.totalTextBytes),
+	);
+	if (!text) {
+		collector.collecting = false;
+		return;
+	}
+	collector.messages.push({ ...candidate, text });
+	collector.totalTextBytes += utf8ByteLength(text);
+	collector.nextMessageOffset = offset + 1;
+	if (
+		collector.messages.length >= collector.numMessages ||
+		collector.totalTextBytes >= MAX_TOTAL_TEXT_BYTES
+	)
+		collector.collecting = false;
+}
+
+function resultFor(
+	collector: PageCollector,
 	status: TranscriptStatus,
-	options: { messageOffset: number; numMessages: number },
 ): TranscriptResult {
 	return {
 		status,
-		messages: [],
-		nextMessageOffset: options.messageOffset,
+		messages: collector.messages,
+		nextMessageOffset: collector.nextMessageOffset,
 	};
+}
+
+function projectLine(
+	line: string,
+	collector: PageCollector,
+	onMalformed: () => void,
+): void {
+	if (!line.trim()) return;
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(line);
+	} catch {
+		onMalformed();
+		return;
+	}
+	if (!isRecord(parsed) || typeof parsed.type !== "string") {
+		onMalformed();
+		return;
+	}
+	const projected = messageFromEntry(parsed);
+	if (projected.malformed) {
+		onMalformed();
+		return;
+	}
+	if (projected.message) collectMessage(collector, projected.message);
+}
+
+/** Consume complete LF-framed records while retaining at most one bounded record. */
+class TranscriptScanner {
+	private lineParts: string[] = [];
+	private lineBytes = 0;
+	private lineHasContent = false;
+	private oversizedLine = false;
+	private malformed = false;
+
+	constructor(
+		private readonly onLine: (line: string, onMalformed: () => void) => void,
+	) {}
+
+	push(decoded: string): void {
+		let start = 0;
+		for (;;) {
+			const newline = decoded.indexOf("\n", start);
+			if (newline < 0) {
+				this.append(decoded.slice(start));
+				return;
+			}
+			this.append(decoded.slice(start, newline));
+			this.finishLine();
+			start = newline + 1;
+		}
+	}
+
+	finish(): TranscriptStatus {
+		const incomplete =
+			this.lineHasContent || this.lineParts.length > 0 || this.oversizedLine;
+		if (this.malformed) return "unreadable";
+		return incomplete ? "incomplete" : "available";
+	}
+
+	private append(segment: string): void {
+		if (!segment) return;
+		this.lineHasContent = true;
+		if (this.oversizedLine) return;
+		const bytes = Buffer.byteLength(segment, "utf8");
+		if (this.lineBytes + bytes > MAX_RECORD_BYTES) {
+			this.oversizedLine = true;
+			this.lineParts = [];
+			this.lineBytes = 0;
+			return;
+		}
+		this.lineParts.push(segment);
+		this.lineBytes += bytes;
+	}
+
+	private finishLine(): void {
+		if (this.oversizedLine) this.malformed = true;
+		else if (this.lineHasContent)
+			this.onLine(this.lineParts.join(""), () => {
+				this.malformed = true;
+			});
+		this.lineParts = [];
+		this.lineBytes = 0;
+		this.lineHasContent = false;
+		this.oversizedLine = false;
+	}
 }
 
 /**
@@ -232,41 +402,27 @@ export function parseTranscript(
 	numMessages?: number,
 ): TranscriptResult {
 	const options = normalizeOptions(optionsOrOffset, numMessages);
-	const lines = content.split("\n");
-	const trailing = lines.pop() || "";
-	const candidates: TranscriptMessage[] = [];
-	let malformed = false;
-
-	for (const line of lines) {
-		if (!line.trim()) continue;
-		let parsed: unknown;
-		try {
-			parsed = JSON.parse(line);
-		} catch {
-			malformed = true;
-			continue;
-		}
-		if (!isRecord(parsed) || typeof parsed.type !== "string") {
-			malformed = true;
-			continue;
-		}
-		const projected = messageFromEntry(parsed);
-		if (projected.malformed) {
-			malformed = true;
-			continue;
-		}
-		if (projected.message) candidates.push(projected.message);
+	const collector = createPageCollector(options);
+	const scanner = new TranscriptScanner((line, onMalformed) =>
+		projectLine(line, collector, onMalformed),
+	);
+	for (let offset = 0; offset < content.length; ) {
+		let end = Math.min(content.length, offset + STRING_SCAN_CHUNK_CHARS);
+		if (
+			end < content.length &&
+			content.charCodeAt(end - 1) >= 0xd800 &&
+			content.charCodeAt(end - 1) <= 0xdbff &&
+			content.charCodeAt(end) >= 0xdc00 &&
+			content.charCodeAt(end) <= 0xdfff
+		)
+			end--;
+		scanner.push(content.slice(offset, end));
+		offset = end;
 	}
-
-	const status: TranscriptStatus = malformed
-		? "unreadable"
-		: trailing.length > 0
-			? "incomplete"
-			: "available";
-	return page(candidates, status, options);
+	return resultFor(collector, scanner.finish());
 }
 
-/** Read and parse one child session snapshot. */
+/** Read and parse one child session snapshot with bounded chunk and record memory. */
 export async function readTranscript(
 	sessionPath: string | undefined,
 	optionsOrOffset?: TranscriptOptionsInput,
@@ -274,16 +430,31 @@ export async function readTranscript(
 ): Promise<TranscriptResult> {
 	const options = normalizeOptions(optionsOrOffset, numMessages);
 	if (typeof sessionPath !== "string" || sessionPath.length === 0)
-		return emptyResult("missing", options);
-	let content: string;
+		return resultFor(createPageCollector(options), "missing");
+
+	let file: Awaited<ReturnType<typeof fs.open>> | undefined;
 	try {
-		content = await fs.readFile(sessionPath, "utf8");
+		file = await fs.open(sessionPath, "r");
+		const collector = createPageCollector(options);
+		const scanner = new TranscriptScanner((line, onMalformed) =>
+			projectLine(line, collector, onMalformed),
+		);
+		const decoder = new StringDecoder("utf8");
+		const buffer = Buffer.allocUnsafe(READ_CHUNK_BYTES);
+		for (;;) {
+			const { bytesRead } = await file.read(buffer, 0, buffer.length, null);
+			if (bytesRead === 0) break;
+			scanner.push(decoder.write(buffer.subarray(0, bytesRead)));
+		}
+		scanner.push(decoder.end());
+		return resultFor(collector, scanner.finish());
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT")
-			return emptyResult("missing", options);
-		return emptyResult("unreadable", options);
+			return resultFor(createPageCollector(options), "missing");
+		return resultFor(createPageCollector(options), "unreadable");
+	} finally {
+		await file?.close().catch(() => {});
 	}
-	return parseTranscript(content, options);
 }
 
 /** Child-specific aliases keep callers explicit while sharing the same API. */

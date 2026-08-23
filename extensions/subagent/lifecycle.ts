@@ -110,6 +110,7 @@ export function startRun(
 	state.runState = "running";
 	state.lifecycle = state.killRequestedAt ? "killing" : "running";
 	state.runOutcome = "pending";
+	state.settlementStatus = "pending";
 	state.tentativeError = undefined;
 	state.finalError = undefined;
 	return run;

@@ -9,6 +9,28 @@ import {
 	type TranscriptMessage,
 } from "./transcript.ts";
 
+const MAX_MESSAGE_BYTES = 8 * 1024;
+const MAX_PAGE_BYTES = 32 * 1024;
+
+function assertWellFormedUtf16(value: string): void {
+	for (let index = 0; index < value.length; index++) {
+		const code = value.charCodeAt(index);
+		if (code >= 0xd800 && code <= 0xdbff) {
+			const next = value.charCodeAt(index + 1);
+			assert.ok(
+				next >= 0xdc00 && next <= 0xdfff,
+				`unpaired high surrogate at UTF-16 index ${index}`,
+			);
+			index++;
+		} else {
+			assert.ok(
+				code < 0xdc00 || code > 0xdfff,
+				`unpaired low surrogate at UTF-16 index ${index}`,
+			);
+		}
+	}
+}
+
 function line(value: unknown): string {
 	return `${JSON.stringify(value)}\n`;
 }
@@ -225,9 +247,51 @@ test("limits page size and bounds individual and total text", () => {
 	const result = parseTranscript(content, { numMessages: 100 });
 	assert.equal(result.status, "available");
 	assert.equal(result.messages.length, 20);
-	assert.ok(result.messages.every((item) => item.text.length <= 8 * 1024));
-	assert.ok(result.messages.reduce((total, item) => total + item.text.length, 0) <= 32 * 1024);
+	assert.ok(
+		result.messages.every(
+			(item) => Buffer.byteLength(item.text, "utf8") <= MAX_MESSAGE_BYTES,
+		),
+	);
+	assert.ok(
+		result.messages.reduce(
+			(total, item) => total + Buffer.byteLength(item.text, "utf8"),
+			0,
+		) <= MAX_PAGE_BYTES,
+	);
 	assert.equal(result.nextMessageOffset, result.messages.length);
+});
+
+test("multibyte text uses hard UTF-8 budgets without splitting a surrogate pair", () => {
+	const text = "prefix-😀".repeat(4_000);
+	const result = parseTranscript(
+		line(message("assistant", [{ type: "text", text }])),
+		{ numMessages: 1 },
+	);
+	assert.equal(result.status, "available");
+	assert.equal(result.messages.length, 1);
+	const projected = result.messages[0];
+	assert.ok(projected);
+	assert.ok(Buffer.byteLength(projected.text, "utf8") <= MAX_MESSAGE_BYTES);
+	assertWellFormedUtf16(projected.text);
+	assert.match(projected.text, /transcript text truncated/);
+});
+
+test("an oversized complete record stays bounded and does not change filtered offsets", async () => {
+	const fixture = await temporaryFile(
+		JSON.stringify({ type: "custom", payload: "x".repeat(300_000) }) +
+		"\n" +
+		line(message("user", "after oversized input")),
+	);
+	try {
+		const result = await readTranscript(fixture.path, { numMessages: 3 });
+		assert.equal(result.status, "unreadable");
+		assert.deepEqual(result.messages.map(({ role, text }) => ({ role, text })), [
+			{ role: "user", text: "after oversized input" },
+		]);
+		assert.equal(result.nextMessageOffset, 1);
+	} finally {
+		await removeTemporary(fixture.directory);
+	}
 });
 
 test("numeric arguments and defaults normalize the pagination contract", () => {

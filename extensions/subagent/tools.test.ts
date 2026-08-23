@@ -1,5 +1,13 @@
 import assert from "node:assert/strict";
-import { appendFile, chmod, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import {
+	appendFile,
+	chmod,
+	mkdir,
+	mkdtemp,
+	readFile,
+	rm,
+	writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -429,6 +437,64 @@ test("RPC child lifecycle supports settlement wakes, output collisions, transcri
 		else process.env.PI_SUBAGENT_DEPTH = old.depth;
 		if (old.mode === undefined) delete process.env.FAKE_PI_MODE;
 		else process.env.FAKE_PI_MODE = old.mode;
+	}
+});
+
+test("resume does not spawn when registry persistence fails", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "pi-rpc-resume-persist-"));
+	const agentDirectory = join(directory, "agent");
+	const parentSession = join(directory, "parent.jsonl");
+	const logPath = join(directory, "invocations.jsonl");
+	await writeFile(parentSession, "parent\n");
+	const binary = await fakePi(directory, logPath);
+	const old = {
+		agentDirectory: process.env.PI_CODING_AGENT_DIR,
+		pi: process.env.PI_SUBAGENT_PI_BIN,
+		depth: process.env.PI_SUBAGENT_DEPTH,
+	};
+	process.env.PI_CODING_AGENT_DIR = agentDirectory;
+	process.env.PI_SUBAGENT_PI_BIN = binary;
+	delete process.env.PI_SUBAGENT_DEPTH;
+	const handlers = new Map<string, TestHandler>();
+	const { tools } = setup(handlers);
+	const ctx = context(parentSession, "resume-persist-parent", directory);
+	try {
+		await handlers.get("session_start")?.({ reason: "startup" }, ctx);
+		const started = await requireTool(tools, "subagent_start").execute(
+			"start",
+			{ task: "initial", model: "provider/model", thinking: "off" },
+			undefined,
+			undefined,
+			ctx,
+		);
+		const childId = String(started.details.handle.id);
+		await requireTool(tools, "subagent_kill").execute("kill", { id: childId });
+		const registry = ownerRegistryPath(agentDirectory, {
+			ownerSessionFile: parentSession,
+			ownerSessionId: "resume-persist-parent",
+		});
+		await rm(registry, { force: true });
+		await mkdir(registry);
+		const resumed = await requireTool(tools, "subagent_resume").execute("resume", {
+			id: childId,
+			task: "must not spawn",
+		});
+		assert.match(resumed.content[0]?.text || "", /Could not persist/);
+		assert.equal(resumed.details.handle.processState, "stopped");
+		assert.equal(resumed.details.handle.incarnation, started.details.handle.incarnation);
+		const invocations = (await readFile(logPath, "utf8"))
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line) as string[]);
+		assert.equal(invocations.length, 1);
+	} finally {
+		await handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
+		if (old.agentDirectory === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = old.agentDirectory;
+		if (old.pi === undefined) delete process.env.PI_SUBAGENT_PI_BIN;
+		else process.env.PI_SUBAGENT_PI_BIN = old.pi;
+		if (old.depth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
+		else process.env.PI_SUBAGENT_DEPTH = old.depth;
 	}
 });
 

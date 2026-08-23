@@ -46,6 +46,7 @@ import {
 	saveRegistry,
 } from "./registry.js";
 import {
+	boundOutputError,
 	writeCallerOutput,
 	type OutputStatus,
 } from "./output-store.js";
@@ -340,7 +341,11 @@ function detachRuntime(runtime: RuntimeChild): void {
 }
 
 function runtimeMatches(handle: SubagentHandle, runtime: RuntimeChild): boolean {
-	return handle.runtime === runtime && handle.incarnation === runtime.incarnation;
+	return (
+		runtimeChildren.get(handle.id) === runtime &&
+		handle.runtime === runtime &&
+		handle.incarnation === runtime.incarnation
+	);
 }
 
 interface SubagentHandle extends SubagentDispatchHandle {
@@ -651,18 +656,20 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		diagnostics: handle.diagnostics.length ? [...handle.diagnostics] : undefined,
 		outputPath: handle.outputPath,
 		outputStatus: handle.outputStatus,
-		outputError: handle.outputError,
+		outputError: handle.outputError
+			? boundOutputError(handle.outputError)
+			: undefined,
 		ownerSessionFile: handle.ownerSessionFile,
 		ownerSessionId: handle.ownerSessionId,
 		incarnation: handle.incarnation,
 		resumedFrom: handle.resumedFrom,
 	});
 	const registryEntries = (): RegistryEntry[] => sorted().map(registryEntry);
-	const persist = (): Promise<boolean> => {
+	const persist = (snapshot?: RegistryEntry[]): Promise<boolean> => {
 		const persistenceOwner = owner;
 		if (!persistenceOwner || !leaseHeld) return Promise.resolve(false);
 		const path = ownerRegistryPath(getAgentDir(), persistenceOwner);
-		const entries = registryEntries();
+		const entries = snapshot || registryEntries();
 		const write = persistenceChain.then(async () => {
 			if (
 				!owner ||
@@ -749,7 +756,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		});
 		handle.outputWriteChain = write.catch((error) => {
 			handle.outputStatus = "failed";
-			handle.outputError = error instanceof Error ? error.message : String(error);
+			handle.outputError = boundOutputError(error);
 			addDiagnostic(handle, `Run ${runId} caller output failed: ${handle.outputError}`);
 			update(handle);
 		});
@@ -795,7 +802,9 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			output: {
 				path: handle.outputPath,
 				status: handle.outputStatus,
-				...(handle.outputError ? { error: handle.outputError } : {}),
+				...(handle.outputError
+					? { error: boundOutputError(handle.outputError) }
+					: {}),
 			},
 			task: handle.task,
 			cwd: handle.cwd,
@@ -928,7 +937,10 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			lastActivityAt: entry.lastActivityAt,
 			outputPath,
 			outputStatus,
-			outputError: entry.outputError,
+			outputError:
+				entry.outputError === undefined
+					? undefined
+					: boundOutputError(entry.outputError),
 			transcriptStatus: "missing",
 			outputWriteChain: Promise.resolve(),
 			stderr: typeof entry.stderrTail === "string" ? tail(entry.stderrTail) || "" : "",
@@ -1358,13 +1370,36 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			.catch(() => false);
 		if (!usable)
 			throw new Error(`No usable child session file exists for #${handle.id}; resume is not possible.`);
+		// Complete older output publication before persisting the new incarnation.
+		await handle.outputWriteChain;
 		const runIdBase = Math.max(
 			handle.runSequence,
 			handle.lastSettledRunId,
 		);
-		handle.runSequence = runIdBase;
 		const oldIncarnation = handle.incarnation;
 		const incarnation = createId();
+		const nextRegistry = registryEntries().map((entry) =>
+			entry.childId === handle.id
+				? {
+						...entry,
+						pid: undefined,
+						exitCode: undefined,
+						exitSignal: undefined,
+						processState: "alive" as const,
+						runState: "idle" as const,
+						runId: runIdBase || undefined,
+						runCursor: runIdBase || undefined,
+						runOutcome: "pending" as const,
+						settlementStatus: "pending" as const,
+						error: undefined,
+						incarnation,
+						resumedFrom: oldIncarnation,
+					}
+				: entry,
+		);
+		if (!(await persist(nextRegistry)))
+			throw new Error(`Could not persist the resumed state for #${handle.id}.`);
+		handle.runSequence = runIdBase;
 		handle.incarnation = incarnation;
 		handle.resumedFrom = oldIncarnation;
 		reviveForResume(handle);

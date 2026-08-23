@@ -3,7 +3,10 @@ import { mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { writeCallerOutput } from "./output-store.ts";
+import {
+	MAX_OUTPUT_ERROR_BYTES,
+	writeCallerOutput,
+} from "./output-store.ts";
 
 async function temporaryDirectory(): Promise<string> {
 	return mkdtemp(join(tmpdir(), "pi-caller-output-"));
@@ -70,6 +73,17 @@ test("filesystem errors return failed instead of throwing", async () => {
 	if (result.status === "failed") {
 		assert.equal(result.path, path);
 		assert.notEqual(result.error, "");
+	}
+});
+
+test("oversized filesystem errors return a bounded caller-output error", async () => {
+	const directory = await temporaryDirectory();
+	const path = join(directory, "x".repeat(4_000), "result.md");
+	const result = await writeCallerOutput({ path, content: "result" });
+	assert.equal(result.status, "failed");
+	if (result.status === "failed") {
+		assert.ok(Buffer.byteLength(result.error, "utf8") <= MAX_OUTPUT_ERROR_BYTES);
+		assert.ok(result.error.length < path.length);
 	}
 });
 
