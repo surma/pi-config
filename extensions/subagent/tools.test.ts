@@ -137,7 +137,7 @@ function turn(message) {
     setTimeout(() => process.exit(17), 5);
     return;
   }
-  if (mode === "abort") {
+  if (mode === "abort" || mode === "abort-error") {
     activeAbortRun = runId;
     return;
   }
@@ -176,7 +176,31 @@ function command(command) {
     if (activeAbortRun !== undefined) {
       const settledRun = activeAbortRun;
       activeAbortRun = undefined;
-      setTimeout(() => output({ type: "agent_settled", runId: settledRun, runOutcome: "aborted" }), 20);
+      if (mode === "abort-error") {
+        const responseId = "response-" + settledRun;
+        const assistant = {
+          role: "assistant",
+          provider: "provider",
+          model: "model",
+          responseId,
+          timestamp: 1000 + settledRun,
+          content: [],
+          stopReason: "error",
+          errorMessage: "This operation was aborted",
+          usage: { input: 3, output: 0, cacheRead: 1, cacheWrite: 0, cost: { total: 0.01 } },
+        };
+        setTimeout(() => {
+          output({ type: "tool_execution_start", toolCallId: "tool-" + settledRun, toolName: "bash", args: { command: "sleep 60" } });
+          output({ type: "tool_execution_update", toolCallId: "tool-" + settledRun, partialResult: { content: [{ type: "text", text: "running" }] } });
+          output({ type: "tool_execution_end", toolCallId: "tool-" + settledRun, result: { content: [{ type: "text", text: "Command aborted" }] }, isError: true });
+          output({ type: "message_start", message: { role: "assistant", provider: "provider", model: "model", responseId, timestamp: 1000 + settledRun, content: [] } });
+          output({ type: "message_end", message: assistant });
+          output({ type: "agent_end", runId: settledRun, messages: [assistant], willRetry: false });
+          output({ type: "agent_settled", runId: settledRun });
+        }, 20);
+      } else {
+        setTimeout(() => output({ type: "agent_settled", runId: settledRun, runOutcome: "aborted" }), 20);
+      }
     }
   } else {
     respond(command);
@@ -550,13 +574,14 @@ test("failed settlement writes caller output and reports a failed run", async ()
 	}
 });
 
-test("interrupt returns acceptance while the child stays alive until aborted settlement", async () => {
-	const directory = await mkdtemp(join(tmpdir(), "pi-rpc-abort-"));
+test("native assistant abort errors settle as one aborted wake with empty output", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "pi-rpc-abort-error-"));
 	const agentDirectory = join(directory, "agent");
 	const parentSession = join(directory, "parent.jsonl");
 	const logPath = join(directory, "invocations.jsonl");
+	const outputPath = join(directory, "aborted.txt");
 	await writeFile(parentSession, "parent\n");
-	const binary = await fakePi(directory, logPath, "abort");
+	const binary = await fakePi(directory, logPath, "abort-error");
 	const old = {
 		agentDirectory: process.env.PI_CODING_AGENT_DIR,
 		pi: process.env.PI_SUBAGENT_PI_BIN,
@@ -573,7 +598,12 @@ test("interrupt returns acceptance while the child stays alive until aborted set
 		await handlers.get("session_start")?.({ reason: "startup" }, ctx);
 		const started = await requireTool(tools, "subagent_start").execute(
 			"start",
-			{ task: "abort", model: "provider/model", thinking: "high" },
+			{
+				task: "abort",
+				model: "provider/model",
+				thinking: "high",
+				outputPath,
+			},
 			undefined,
 			undefined,
 			ctx,
@@ -587,11 +617,35 @@ test("interrupt returns acceptance while the child stays alive until aborted set
 		assert.equal(interrupted.details.handle.settlement.status, "pending");
 		await waitFor(async () => {
 			const status = await requireTool(tools, "subagent_status").execute("status", { id: childId });
-			return status.details.runOutcome === "aborted" && status.details.settlement.status === "settled";
+			return (
+				status.details.runOutcome === "aborted" &&
+				status.details.settlement.status === "settled" &&
+				status.details.output.status === "written"
+			);
 		});
 		const status = await requireTool(tools, "subagent_status").execute("status", { id: childId });
 		assert.equal(status.details.processState, "alive");
-		await waitFor(() => sent.some((message) => message.message.details?.outcome === "aborted"));
+		assert.equal(status.details.runOutcome, "aborted");
+		assert.equal(status.details.settlement.status, "settled");
+		assert.equal(status.details.error, undefined);
+		assert.equal(status.details.finalError, undefined);
+		assert.equal(status.details.tentativeError, undefined);
+		assert.equal(status.details.output.path, outputPath);
+		assert.equal(status.details.output.status, "written");
+		assert.equal(await readFile(outputPath, "utf8"), "");
+		await waitFor(() => sent.length >= 1);
+		assert.equal(sent.length, 1);
+		assert.deepEqual(
+			sent.map((message) => message.message.details?.outcome),
+			["aborted"],
+		);
+		assert.equal(sent[0]?.message.customType, "subagent-settlement");
+		assert.equal(
+			sent[0]?.message.content,
+			`Subagent ${childId} reached idle after run 1. Check subagent_status with messages=3.`,
+		);
+		assert.equal(sent[0]?.message.details?.settlements?.length, 1);
+		assert.deepEqual(sent[0]?.options, { triggerTurn: true, deliverAs: "steer" });
 		await requireTool(tools, "subagent_kill").execute("kill", { id: childId });
 	} finally {
 		await handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);

@@ -171,13 +171,22 @@ export function endRun(
 	return true;
 }
 
-/** Explicitly end an interrupted run when native settlement omits message_end. */
+/** Fence an interrupted run, including one that native agent_end already ended. */
 export function abortRun(state: LifecycleState, at: number): boolean {
 	if (isLifecycleTerminal(state)) return false;
 	const run = currentRun(state);
+	if (run?.phase === "ended") {
+		run.outcome = "aborted";
+		run.stopReason = "aborted";
+		run.error = undefined;
+		state.tentativeError = undefined;
+		return true;
+	}
 	if (run?.phase !== "active") return false;
 	run.outcome = "aborted";
 	run.stopReason = "aborted";
+	run.error = undefined;
+	state.tentativeError = undefined;
 	return endRun(state, at, false);
 }
 

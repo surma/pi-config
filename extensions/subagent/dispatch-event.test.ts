@@ -208,6 +208,65 @@ test("explicit abort fence settles native settlement without message_end", () =>
 	assert.equal(h.settled, 1);
 });
 
+test("an accepted abort fences a native assistant error before agent_settled", () => {
+	const h = harness();
+	let settledRun: { outcome: string; error?: string } | undefined;
+	let settledCount = 0;
+	h.options.onSettled = (run) => {
+		settledRun = run;
+		settledCount++;
+	};
+	const aborted = assistant(
+		4,
+		"",
+		"error",
+		"aborted-error",
+		"This operation was aborted",
+	);
+	const events: Record<string, unknown>[] = [
+		{ type: "agent_start", runId: 1 },
+		{
+			type: "tool_execution_start",
+			toolCallId: "sleep-call",
+			toolName: "bash",
+			args: { command: "sleep 60" },
+		},
+		{
+			type: "tool_execution_update",
+			toolCallId: "sleep-call",
+			partialResult: { content: [{ type: "text", text: "running" }] },
+		},
+		{
+			type: "tool_execution_end",
+			toolCallId: "sleep-call",
+			result: { content: [{ type: "text", text: "Command aborted" }] },
+			isError: true,
+		},
+		{ type: "message_start", message: { ...aborted, content: [] } },
+		{ type: "message_end", message: aborted },
+		{ type: "agent_end", runId: 1, messages: [aborted], willRetry: false },
+		{ type: "agent_settled", runId: 1 },
+	];
+	assert.equal(
+		dispatchSubagentEvent(h.handle, events[0]!, h.options),
+		true,
+	);
+	h.handle.abortRequestedAt = 2;
+	for (const event of events.slice(1))
+		assert.equal(dispatchSubagentEvent(h.handle, event, h.options), true);
+
+	assert.equal(h.handle.runOutcome, "aborted");
+	assert.equal(h.handle.settlementStatus, "settled");
+	assert.equal(h.handle.runState, "idle");
+	assert.equal(h.handle.processState, "alive");
+	assert.equal(h.handle.finalError, undefined);
+	assert.equal(h.handle.tentativeError, undefined);
+	assert.equal(h.handle.error, undefined);
+	assert.equal(settledRun?.outcome, "aborted");
+	assert.equal(settledRun?.error, undefined);
+	assert.equal(settledCount, 1);
+});
+
 test("an abort settlement clears an unfinished assistant before the next run", () => {
 	const h = harness();
 	const first = assistant(1, "partial");

@@ -422,15 +422,17 @@ export function dispatchSubagentEvent(
 				handle.abortRequestedAt !== undefined ||
 				outcome === "aborted" ||
 				stopReason === "aborted";
-			if (current?.phase === "active" && abortFence) abortRun(handle, at);
+			if (abortFence) abortRun(handle, at);
 			const state = settleRunToIdle(
 				handle,
 				at,
-				outcome,
-				stopReason,
-				typeof record.errorMessage === "string"
-					? record.errorMessage
-					: undefined,
+				abortFence ? "aborted" : outcome,
+				abortFence ? "aborted" : stopReason,
+				abortFence
+					? undefined
+					: typeof record.errorMessage === "string"
+						? record.errorMessage
+						: undefined,
 			);
 			if (!state) {
 				options.diagnostic(
