@@ -31,9 +31,7 @@ export interface InspectorHandle {
 	processState: "alive" | "stopped";
 	runState: "idle" | "running" | "retrying" | "finishing";
 	runId?: number;
-	tabId?: number;
-	paneId?: number;
-	reconnecting?: boolean;
+	rpcReady?: boolean;
 	killing: boolean;
 	task: string;
 	cwd: string;
@@ -49,7 +47,7 @@ export interface InspectorHandle {
 	resultKind: "none" | "final" | "partial";
 	transcriptNote: string;
 	createdAt: number;
-	ipcReadyAt?: number;
+	rpcReadyAt?: number;
 	agentStartedAt?: number;
 	lastActivityAt: number;
 	completedAt?: number;
@@ -271,7 +269,7 @@ export class SubagentInspector implements Focusable {
 		mtimeMs: number;
 		lines: string[];
 	};
-	private heartbeat?: NodeJS.Timeout;
+	private refreshTimer?: NodeJS.Timeout;
 	private disposed = false;
 	private requestGeneration = 0;
 	private transcriptReadActive = false;
@@ -287,15 +285,15 @@ export class SubagentInspector implements Focusable {
 		private readonly callbacks: SubagentInspectorCallbacks,
 		private readonly files: InspectorFiles = fs,
 	) {
-		this.reconcileHeartbeat();
+		this.reconcileRefreshTimer();
 	}
 
 	dispose(): void {
 		if (this.disposed) return;
 		this.disposed = true;
 		this.requestGeneration += 1;
-		if (this.heartbeat) clearInterval(this.heartbeat);
-		this.heartbeat = undefined;
+		if (this.refreshTimer) clearInterval(this.refreshTimer);
+		this.refreshTimer = undefined;
 		if (this.transcriptDelay) clearTimeout(this.transcriptDelay);
 		this.transcriptDelay = undefined;
 		this.transcriptReadPending = false;
@@ -399,7 +397,7 @@ export class SubagentInspector implements Focusable {
 
 	render(width: number): string[] {
 		this.ensureSelection();
-		this.reconcileHeartbeat();
+		this.reconcileRefreshTimer();
 		const innerWidth = Math.max(1, width - 2);
 		const rows = this.tui.terminal.rows || 24;
 		const panelHeight = Math.max(9, Math.min(rows, Math.floor(rows * 0.95)));
@@ -464,7 +462,7 @@ export class SubagentInspector implements Focusable {
 	refresh(): void {
 		if (this.disposed) return;
 		this.ensureSelection();
-		this.reconcileHeartbeat();
+		this.reconcileRefreshTimer();
 		this.requestRender();
 	}
 
@@ -538,15 +536,15 @@ export class SubagentInspector implements Focusable {
 		this.pushField(
 			lines,
 			"State",
-			`${stateText(handle)} ${activityText(handle)}${handle.reconnecting ? " · reconnecting" : ""}`,
+			`${stateText(handle)} ${activityText(handle)}${handle.rpcReady === false ? " · RPC unavailable" : ""}`,
 			width,
 			stateColor(handle),
 		);
 		this.pushField(lines, "Run", String(handle.runId ?? 0), width);
 		this.pushField(
 			lines,
-			"Zellij",
-			`tab ${handle.tabId ?? "-"} · pane ${handle.paneId ?? "-"}`,
+			"RPC",
+			handle.rpcReady === false ? "not ready" : "ready",
 			width,
 		);
 		this.pushField(
@@ -968,24 +966,24 @@ export class SubagentInspector implements Focusable {
 		}
 	}
 
-	private reconcileHeartbeat(): void {
+	private reconcileRefreshTimer(): void {
 		if (this.disposed) return;
 		const active = this.callbacks
 			.getHandles()
 			.some(
 				(handle) => handle.state === "starting" || handle.state === "running",
 			);
-		if (active && !this.heartbeat) {
-			this.heartbeat = setInterval(() => {
+		if (active && !this.refreshTimer) {
+			this.refreshTimer = setInterval(() => {
 				if (this.disposed) return;
 				const selected = this.view === "live" ? this.selected() : undefined;
 				if (selected)
 					void this.refreshTranscript(selected, this.requestGeneration);
 				this.requestRender();
 			}, 1000);
-		} else if (!active && this.heartbeat) {
-			clearInterval(this.heartbeat);
-			this.heartbeat = undefined;
+		} else if (!active && this.refreshTimer) {
+			clearInterval(this.refreshTimer);
+			this.refreshTimer = undefined;
 		}
 	}
 

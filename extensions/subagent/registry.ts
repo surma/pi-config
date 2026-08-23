@@ -9,13 +9,9 @@ export interface RegistryEntry {
 	name?: string;
 	task: string;
 	cwd: string;
-	tabId?: number;
-	paneId?: number;
-	zellijSessionName?: string;
-	terminalCleanupPending?: boolean;
-	terminalCleanupError?: string;
+	pid?: number;
+	exitCode?: number;
 	sessionDir: string;
-	socketPath: string;
 	sessionFile?: string;
 	promptPath?: string;
 	requestedModel: string;
@@ -26,10 +22,8 @@ export interface RegistryEntry {
 	lastSettledRunId?: number;
 	createdAt: number;
 	lastActivityAt: number;
-	detached?: boolean;
 	ownerSessionFile: string;
 	ownerSessionId: string;
-	controllerInstanceId: string;
 	incarnation: string;
 	resumedFrom?: string;
 }
@@ -57,7 +51,10 @@ export async function loadRegistry(path = registryPath()): Promise<RegistryEntry
 	}
 }
 
-export async function saveRegistry(entries: RegistryEntry[], path = registryPath()): Promise<void> {
+export async function saveRegistry(
+	entries: RegistryEntry[],
+	path = registryPath(),
+): Promise<void> {
 	await fs.mkdir(dirname(path), { recursive: true, mode: 0o700 });
 	await fs.chmod(dirname(path), 0o700).catch(() => {});
 	const temporary = `${path}.tmp-${process.pid}-${Date.now()}`;
@@ -72,10 +69,6 @@ export async function saveRegistry(entries: RegistryEntry[], path = registryPath
 	} finally {
 		await fs.unlink(temporary).catch(() => {});
 	}
-}
-
-export function helloMatchesRegistryChild(expectedChildId: string, helloChildId: unknown): boolean {
-	return typeof helloChildId === "string" && helloChildId === expectedChildId;
 }
 
 export function registryEntriesForOwner(

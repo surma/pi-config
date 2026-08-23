@@ -19,8 +19,7 @@ function handle(
 		processState: "alive",
 		runState: "running",
 		runId: 1,
-		tabId: 2,
-		paneId: 3,
+		rpcReady: true,
 		killing: false,
 		task: `task-${id}\nwith details`,
 		cwd: "/tmp/work",
@@ -277,7 +276,7 @@ test("malformed and partial JSONL history remains renderable", async () => {
 	fx.inspector.dispose();
 });
 
-test("active heartbeat refreshes elapsed labels and dispose stops future renders", async () => {
+test("active refresh timer updates elapsed labels and dispose stops future renders", async () => {
 	const fx = fixture([handle("a")], noFiles);
 	const before = fx.renders;
 	await new Promise((resolve) => setTimeout(resolve, 1_050));

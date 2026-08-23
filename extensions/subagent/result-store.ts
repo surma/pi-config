@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { promises as fs } from "node:fs";
+import { promises as fs, type Dirent } from "node:fs";
 import { join } from "node:path";
 import type { RunOutcome } from "./lifecycle.js";
 
@@ -54,6 +54,44 @@ export function runResultPaths(sessionDir: string, runId: number) {
 		resultPath: join(directory, "result.md"),
 		metadataPath: join(directory, "result.json"),
 	};
+}
+
+export interface RunArtifactScan {
+	highestExistingRunId: number;
+	highestPublishedRunId: number;
+}
+
+export function numericRunDirectory(name: string): number | undefined {
+	if (!/^[1-9][0-9]*$/u.test(name)) return undefined;
+	const runId = Number(name);
+	return Number.isSafeInteger(runId) ? runId : undefined;
+}
+
+/** Scan immutable run directories and validate every numeric artifact pair. */
+export async function scanRunArtifacts(
+	sessionDir: string,
+): Promise<RunArtifactScan> {
+	const runsDirectory = join(sessionDir, "runs");
+	let entries: Dirent[];
+	try {
+		entries = await fs.readdir(runsDirectory, { withFileTypes: true });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT")
+			return { highestExistingRunId: 0, highestPublishedRunId: 0 };
+		throw error;
+	}
+	let highestExistingRunId = 0;
+	let highestPublishedRunId = 0;
+	for (const entry of entries) {
+		if (!entry.isDirectory()) continue;
+		const runId = numericRunDirectory(entry.name);
+		if (runId === undefined) continue;
+		highestExistingRunId = Math.max(highestExistingRunId, runId);
+		const artifact = await readRunResult(sessionDir, runId);
+		if (artifact.status === "available")
+			highestPublishedRunId = Math.max(highestPublishedRunId, runId);
+	}
+	return { highestExistingRunId, highestPublishedRunId };
 }
 
 function temporaryName(prefix: string): string {
