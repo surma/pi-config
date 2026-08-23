@@ -17,7 +17,7 @@ import {
 	canonicalOwnerSessionFile,
 	controllerDir,
 	hasLeaseAuthority,
-	incarnationSocketDir,
+	// incarnationSocketDir was removed in the Zellij-to-RPC migration.
 	LEASE_STALE_GRACE_MS,
 	LEASE_TTL_MS,
 	type LeaseRecord,
@@ -71,24 +71,11 @@ test("controller-scoped paths nest under controllers/<ownerKey>", () => {
 		ownerRegistryPath(agentDir, owner),
 		join(controllerDir(agentDir, owner), "registry.json"),
 	);
-	assert.equal(
-		incarnationSocketDir(agentDir, owner, "child1", "inc1"),
-		join(
-			controllerDir(agentDir, owner),
-			"children",
-			"child1",
-			"inc1",
-			"bridge.sock",
-		),
-	);
+	// incarnationSocketDir removed in Zellij-to-RPC migration — assertion skipped.
 });
 
-test("incarnation socket dirs for the same child differ by incarnation", () => {
-	const agentDir = "/tmp/agent";
-	const a = incarnationSocketDir(agentDir, owner, "child1", "inc-a");
-	const b = incarnationSocketDir(agentDir, owner, "child1", "inc-b");
-	assert.notEqual(a, b);
-});
+// incarnationSocketDir removed in Zellij-to-RPC migration — test removed.
+// test("incarnation socket dirs for the same child differ by incarnation", ...)
 
 test("acquire writes a valid lease on an absent file", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-owner-lease-"));

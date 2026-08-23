@@ -1,3 +1,4 @@
+import { type ChildProcess, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { accessSync, constants, promises as fs } from "node:fs";
 import { basename, delimiter, dirname, join } from "node:path";
@@ -15,19 +16,6 @@ import {
 	type SubagentDispatchHandle,
 } from "./dispatch-event.js";
 import {
-	type AckFrame,
-	acknowledgementMatchesConnectionEpoch,
-	type EventFrame,
-	frameMatchesConnectionEpoch,
-	type HelloFrame,
-	type IpcConnection,
-	type IpcServer,
-	prepareIpcSocketPath,
-	type SnapshotFrame,
-	type PongFrame,
-	startIpcServer,
-} from "./ipc.js";
-import {
 	createLifecycleState,
 	lifecycleActivity,
 	markStopped,
@@ -43,7 +31,6 @@ import {
 	canonicalOwnerSessionFile,
 	createControllerInstanceId,
 	hasLeaseAuthority,
-	incarnationSocketDir,
 	LEASE_RENEW_INTERVAL_MS,
 	leasePath,
 	type OwnerIdentity,
@@ -53,20 +40,11 @@ import {
 	renewLease,
 } from "./owner.js";
 import {
-	helloMatchesRegistryChild,
 	loadRegistry,
 	type RegistryEntry,
 	registryEntriesForOwner,
 	saveRegistry,
 } from "./registry.js";
-import {
-	ensureRetainedCleanupLeaseAuthority,
-	releaseRetainedCleanupLeasesForQuit,
-	resolveRetainedCleanupLeases,
-	retainCleanupLease,
-	retainedCleanupLeaseExists,
-	type RetainedCleanupLease,
-} from "./retained-cleanup-leases.js";
 import {
 	persistRunResult,
 	readRunResult,
@@ -82,39 +60,12 @@ import {
 	SubagentInspector,
 	sanitizeTerminalText,
 } from "./ui.js";
-import {
-	closePaneInSession,
-	discoverPaneIdInSession,
-	newTabInSession,
-	sendKeysInSession,
-	type SubagentPaneIdentity,
-} from "./zellij.js";
-import {
-	assertDedicatedActionsAllowed,
-	establishDedicatedLifecycle,
-	hasPendingDedicatedRetirement,
-	preserveDedicatedLifecycleForReload,
-	retireDedicatedLifecycle,
-	type DedicatedLifecycle,
-} from "./zellij-manager.js";
-import {
-	CLEANUP_RETRY_DELAYS_MS,
-	heartbeatExpired,
-	HEARTBEAT_RESPONSE_MS,
-	HEARTBEAT_SWEEP_MS,
-	parentStalled,
-	pingDue,
-	reconnectExpired,
-	RECONNECT_GRACE_MS,
-	type PendingHeartbeat,
-	type TerminalCleanupState,
-} from "./liveness.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const childExtensionPath = join(__dirname, "child.ts");
 const STARTUP_TIMEOUT_MS = 10_000;
 const ACK_TIMEOUT_MS = 10_000;
-const ABORT_ACK_TIMEOUT_MS = 1_000;
+const ABORT_SETTLE_TIMEOUT_MS = 1_000;
 const TERM_DEADLINE_MS = 1_500;
 const KILL_DEADLINE_MS = 4_000;
 const ASSISTANT_DISPLAY_MAX = 64 * 1024;
@@ -153,10 +104,9 @@ interface UsageStats {
 	cost: number;
 	turns: number;
 }
-interface PendingAck {
-	childConnectionId: string;
-	parentConnectionId: string;
-	resolve(frame: AckFrame): void;
+interface PendingRpcCommand {
+	type: string;
+	resolve(response: Record<string, unknown>): void;
 	reject(error: Error): void;
 	timer: NodeJS.Timeout;
 }
@@ -169,29 +119,6 @@ interface TaskSpec {
 	systemPrompt?: string;
 }
 
-export async function withTerminalCleanupLock(
-	state: { terminalCleanupActive?: boolean },
-	action: () => Promise<void>,
-): Promise<boolean> {
-	if (state.terminalCleanupActive) return false;
-	state.terminalCleanupActive = true;
-	try {
-		await action();
-		return true;
-	} finally {
-		state.terminalCleanupActive = false;
-	}
-}
-
-export async function closeAndDrainIpcMutations(
-	state: { ipcMutationsClosed: boolean; ipcMutationChain: Promise<void> },
-	closeTransport: () => Promise<void>,
-): Promise<void> {
-	state.ipcMutationsClosed = true;
-	await closeTransport();
-	await state.ipcMutationChain;
-}
-
 interface SubagentHandle extends SubagentDispatchHandle {
 	id: string;
 	name?: string;
@@ -200,47 +127,26 @@ interface SubagentHandle extends SubagentDispatchHandle {
 	requestedModel: string;
 	requestedThinking: ThinkingLevel;
 	sessionDir: string;
-	socketPath: string;
 	promptPath: string;
+	childProcess?: ChildProcess;
+	rpcReady: boolean;
+	pid?: number;
+	exitCode?: number;
 	actualModel?: ActualModel;
 	actualThinking?: ThinkingLevel;
 	sessionPath?: string;
 	sessionId?: string;
-	connectionId?: string;
-	pid?: number;
-	tabId?: number;
-	paneId?: number;
-	zellijSessionName?: string;
-	exitCode?: number;
-	reconnecting?: boolean;
-	lastIpcFrameAt: number;
-	pendingHeartbeat?: PendingHeartbeat;
-	disconnectedAt?: number;
-	disconnectDeadlineAt?: number;
-	deathReason?: "heartbeat_timeout" | "reconnect_timeout" | "quit" | "kill";
-	terminalCleanup: TerminalCleanupState;
-	cleanupRequired: boolean;
-	terminalStateDurable: boolean;
-	terminalCleanupActive?: boolean;
-	ipcServer?: IpcServer;
-	ipcConn?: IpcConnection;
-	seenHelloConnections: Set<string>;
-	pendingAcks: Map<string, PendingAck>;
-	requestSequence: number;
 	createdAt: number;
-	ipcReadyAt?: number;
 	lastActivityAt: number;
 	completedAt?: number;
-	promptCaptured?: boolean;
-	transcriptPersisted?: boolean;
 	resultPath?: string;
-	settlementPersistenceChain: Promise<void>;
+	transcriptPersisted?: boolean;
 	stderr: string;
 	diagnostics: string[];
 	waiters: Set<() => void>;
 	terminationPromise?: Promise<SubagentHandle>;
-	ipcMutationChain: Promise<void>;
-	ipcMutationsClosed: boolean;
+	settlementPersistenceChain: Promise<void>;
+	pendingRpcCommands: Map<string, PendingRpcCommand>;
 	ownerSessionFile: string;
 	ownerSessionId: string;
 	controllerInstanceId: string;
@@ -297,9 +203,6 @@ const ResumeSchema = Type.Object({
 
 function now() {
 	return Date.now();
-}
-function monotonicNow() {
-	return performance.now();
 }
 function createId() {
 	return randomBytes(8).toString("hex");
@@ -358,6 +261,72 @@ export function getPiInvocation(args: string[]): string[] {
 		: [process.execPath, ...offlineArgs];
 }
 
+/** Parse JSONL lines from a readable stream and call onLine for each object. */
+function attachJsonlReader(
+	stream: NodeJS.ReadableStream,
+	onLine: (parsed: Record<string, unknown>) => void,
+	onError?: (error: Error) => void,
+): void {
+	let buffer = "";
+	stream.setEncoding("utf8");
+	stream.on("data", (chunk: string) => {
+		buffer += chunk;
+		let newline: number;
+		while ((newline = buffer.indexOf("\n")) >= 0) {
+			const line = buffer.slice(0, newline);
+			buffer = buffer.slice(newline + 1);
+			const trimmed = line.endsWith("\r") ? line.slice(0, -1) : line;
+			if (!trimmed) continue;
+			try {
+				const parsed = JSON.parse(trimmed);
+				if (parsed && typeof parsed === "object") onLine(parsed as Record<string, unknown>);
+			} catch (error) {
+				onError?.(error instanceof Error ? error : new Error(String(error)));
+			}
+		}
+	});
+}
+
+/** Write a JSONL command to the child process stdin. */
+function writeRpcCommand(
+	handle: SubagentHandle,
+	command: Record<string, unknown>,
+): void {
+	if (!handle.childProcess?.stdin?.writable) return;
+	handle.childProcess.stdin.write(`${JSON.stringify(command)}\n`);
+}
+
+/** Send a command to the child and wait for a matching response frame. */
+function sendRpcCommand(
+	handle: SubagentHandle,
+	command: Record<string, unknown>,
+	timeoutMs = ACK_TIMEOUT_MS,
+): Promise<Record<string, unknown>> {
+	const commandType = String(command.type);
+	return new Promise((resolve, reject) => {
+		const existing = handle.pendingRpcCommands.get(commandType);
+		if (existing) {
+			clearTimeout(existing.timer);
+			existing.reject(new Error(`Superseded by new ${commandType} command.`));
+		}
+		const timer = setTimeout(() => {
+			handle.pendingRpcCommands.delete(commandType);
+			reject(
+				new Error(
+					`RPC command "${commandType}" timed out after ${timeoutMs}ms.`,
+				),
+			);
+		}, timeoutMs);
+		handle.pendingRpcCommands.set(commandType, {
+			type: commandType,
+			resolve,
+			reject,
+			timer,
+		});
+		writeRpcCommand(handle, command);
+	});
+}
+
 export default function subagentExtension(pi: ExtensionAPI) {
 	if (process.env.PI_SUBAGENT_CHILD === "1") return;
 
@@ -370,11 +339,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	const controllerInstanceId = processControllerInstanceId;
 	let leaseHeld = false;
 	let leaseRenewTimer: NodeJS.Timeout | undefined;
-	let watchdogTimer: NodeJS.Timeout | undefined;
-	let watchdogSweepActive = false;
-	let lastWatchdogSweepAt = monotonicNow();
 	let sessionShuttingDown = false;
-	let dedicatedLifecycle: DedicatedLifecycle | undefined;
 	let settlementNotificationEpoch = 0;
 	const settlementNotifications = new SettlementNotificationQueue(
 		(message, options) => pi.sendMessage(message, options),
@@ -400,78 +365,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			(a, b) => b.createdAt - a.createdAt || b.id.localeCompare(a.id),
 		);
 	const active = (handle: SubagentHandle) => handle.processState === "alive";
-	const paneIdentity = (handle: SubagentHandle): SubagentPaneIdentity => ({
-		childId: handle.id,
-		socketPath: handle.socketPath,
-		ownerSessionFile: handle.ownerSessionFile,
-		ownerSessionId: handle.ownerSessionId,
-		controllerInstanceId: handle.controllerInstanceId,
-		incarnation: handle.incarnation,
-	});
 	const requireLease = (): boolean => leaseHeld && owner !== null;
-	const requiredDedicatedSession = (): string => assertDedicatedActionsAllowed();
-	async function ensureDedicatedSession(ctx?: ExtensionContext): Promise<string> {
-		try {
-			return requiredDedicatedSession();
-		} catch (error) {
-			if (!(error instanceof Error) || !error.message.includes("cleanup is pending")) throw error;
-			const retryContext = ctx ?? latestCtx;
-			if (!retryContext) throw error;
-			await establishController(retryContext);
-			return requiredDedicatedSession();
-		}
-	}
-	const requireHandleDedicatedSession = (handle: SubagentHandle): string => {
-		const activeSession = requiredDedicatedSession();
-		if (handle.zellijSessionName !== activeSession)
-			throw new Error(
-				`Subagent #${handle.id} does not belong to the active dedicated Zellij session.`,
-			);
-		return activeSession;
-	};
-	const setDedicatedSessionStatus = (
-		ctx: ExtensionContext | null,
-		sessionName: string | undefined,
-	): void => {
-		ctx?.ui?.setStatus("subagent-zellij", sessionName);
-	};
-	/**
-	 * Wall-clock expiry can lapse without any competing controller, most visibly
-	 * across host suspend. Re-extend our own record before concluding that
-	 * authority was lost; only a missing or foreign record is a real loss.
-	 */
-	async function ensureLeaseAuthority(
-		authorityOwner: OwnerIdentity,
-	): Promise<boolean> {
-		const agentDir = getAgentDir();
-		if (
-			await hasLeaseAuthority(
-				agentDir,
-				authorityOwner,
-				controllerInstanceId,
-				now(),
-			)
-		)
-			return true;
-		return renewLease(
-			agentDir,
-			authorityOwner,
-			controllerInstanceId,
-			now(),
-		).catch(() => false);
-	}
-	async function requireCurrentAuthority(): Promise<boolean> {
-		if (!leaseHeld || !owner || !controllerInstanceId) return false;
-		const authoritative = await ensureLeaseAuthority(owner);
-		if (!authoritative) {
-			leaseHeld = false;
-			suppressAllSettlementNotifications();
-			stopTimers();
-			setDedicatedSessionStatus(latestCtx, undefined);
-			refreshUi();
-		}
-		return authoritative;
-	}
 	const addDiagnostic = (handle: SubagentHandle, message: string) => {
 		handle.diagnostics.push(message.slice(0, 2048));
 		if (handle.diagnostics.length > MAX_DIAGNOSTICS)
@@ -480,35 +374,37 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	const notifyWaiters = (handle: SubagentHandle) => {
 		for (const waiter of [...handle.waiters]) waiter();
 	};
+	const rejectPendingRpcCommands = (handle: SubagentHandle, message: string) => {
+		for (const [type, pending] of handle.pendingRpcCommands) {
+			clearTimeout(pending.timer);
+			pending.reject(new Error(message));
+			handle.pendingRpcCommands.delete(type);
+		}
+	};
+
 	const registryEntry = (handle: SubagentHandle): RegistryEntry => ({
-			childId: handle.id,
-			name: handle.name,
-			task: handle.task,
-			cwd: handle.cwd,
-			tabId: handle.tabId,
-			paneId: handle.paneId,
-			zellijSessionName: handle.zellijSessionName,
-			terminalCleanupPending: handle.cleanupRequired,
-			terminalCleanupError: handle.terminalCleanup.lastError,
-			sessionDir: handle.sessionDir,
-			socketPath: handle.socketPath,
-			sessionFile: handle.sessionPath,
-			promptPath: handle.promptPath,
-			requestedModel: handle.requestedModel,
-			requestedThinking: handle.requestedThinking,
-			processState: handle.processState,
-			runState: handle.runState,
-			runId: handle.runSequence || undefined,
-			lastSettledRunId: handle.lastSettledRunId || undefined,
-			createdAt: handle.createdAt,
-			lastActivityAt: handle.lastActivityAt,
-			detached: handle.reconnecting && !handle.ipcConn,
-			ownerSessionFile: handle.ownerSessionFile,
-			ownerSessionId: handle.ownerSessionId,
-			controllerInstanceId: handle.controllerInstanceId,
-			incarnation: handle.incarnation,
-			resumedFrom: handle.resumedFrom,
-		});
+		childId: handle.id,
+		name: handle.name,
+		task: handle.task,
+		cwd: handle.cwd,
+		sessionDir: handle.sessionDir,
+		sessionFile: handle.sessionPath,
+		promptPath: handle.promptPath,
+		requestedModel: handle.requestedModel,
+		requestedThinking: handle.requestedThinking,
+		processState: handle.processState,
+		runState: handle.runState,
+		runId: handle.runSequence || undefined,
+		lastSettledRunId: handle.lastSettledRunId || undefined,
+		pid: handle.pid,
+		createdAt: handle.createdAt,
+		lastActivityAt: handle.lastActivityAt,
+		ownerSessionFile: handle.ownerSessionFile,
+		ownerSessionId: handle.ownerSessionId,
+		controllerInstanceId: handle.controllerInstanceId,
+		incarnation: handle.incarnation,
+		resumedFrom: handle.resumedFrom,
+	});
 	const registryEntries = (): RegistryEntry[] => sorted().map(registryEntry);
 	const persist = (): Promise<boolean> => {
 		const persistenceOwner = owner;
@@ -545,14 +441,13 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			.sort((a, b) => a.lastActivityAt - b.lastActivityAt);
 		while (handles.size > MAX_RETAINED_HANDLES && stopped.length) {
 			const candidate = stopped.shift();
-			if (candidate && !candidate.cleanupRequired) handles.delete(candidate.id);
+			if (candidate) handles.delete(candidate.id);
 		}
 	};
 	const update = (handle: SubagentHandle, shouldPersist = true) => {
 		handle.lastActivityAt = now();
 		trimRetained();
 		refreshUi();
-		reconcileWatchdog();
 		if (shouldPersist) void persist();
 	};
 
@@ -638,6 +533,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			);
 		});
 	}
+
 	async function transcriptStatus(handle: SubagentHandle) {
 		if (!handle.sessionPath)
 			return { persisted: false, note: "no persisted transcript yet" };
@@ -679,29 +575,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			runOutcome: handle.runOutcome,
 			task: handle.task,
 			cwd: handle.cwd,
-			tabId: handle.tabId,
-			paneId: handle.paneId,
-			zellijSessionName: handle.zellijSessionName,
 			pid: handle.pid,
 			exitCode: handle.exitCode,
-			reconnecting: handle.reconnecting,
-			ipcLiveness: {
-				state:
-					handle.processState === "stopped"
-						? "dead"
-						: handle.reconnecting
-							? "reconnecting"
-							: handle.pendingHeartbeat
-								? "awaiting_pong"
-								: "healthy",
-				heartbeatPending: !!handle.pendingHeartbeat,
-				deathReason: handle.deathReason,
-			},
-			terminalCleanup: {
-				status: handle.terminalCleanup.status,
-				attempts: handle.terminalCleanup.attempts,
-				lastError: handle.terminalCleanup.lastError,
-			},
 			requestedModel: handle.requestedModel,
 			requestedThinking: handle.requestedThinking,
 			actualModel,
@@ -713,7 +588,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			transcriptPersisted: transcript.persisted,
 			transcriptNote: transcript.note,
 			createdAt: handle.createdAt,
-			ipcReadyAt: handle.ipcReadyAt,
 			agentStartedAt: handle.agentStartedAt,
 			lastActivityAt: handle.lastActivityAt,
 			completedAt: handle.completedAt,
@@ -723,31 +597,22 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			isStreaming: handle.isStreaming,
 			usage: { ...handle.usage },
 			stopReason: handle.stopReason,
-			error:
-				handle.terminalCleanup.status === "failed"
-					? handle.terminalCleanup.lastError
-					: handle.error || handle.finalError,
-			resultPreview: handle.resultText
-				? truncate(handle.resultText)
-				: undefined,
+			error: handle.error || handle.finalError,
+			resultPreview: handle.resultText ? truncate(handle.resultText) : undefined,
 			currentAssistantText: handle.currentAssistantText || undefined,
 			latestAssistantText: handle.latestAssistantText || undefined,
-			activeTools: [...handle.activeTools.values()].map((tool) => ({
-				...tool,
-			})),
+			activeTools: [...handle.activeTools.values()].map((tool) => ({ ...tool })),
 			recentTools: handle.recentTools.map((tool) => ({ ...tool })),
 			tentativeError: handle.tentativeError,
 			finalError: handle.finalError,
 			settledAt: handle.settledAt,
-			diagnostics: handle.diagnostics.length
-				? [...handle.diagnostics]
-				: undefined,
+			diagnostics: handle.diagnostics.length ? [...handle.diagnostics] : undefined,
 		};
 	}
 	async function summary(handle: SubagentHandle) {
 		const serial = await serialize(handle);
 		return sanitizeTerminalText(
-			`#${handle.id}${handle.name ? ` ${handle.name}` : ""} ${handle.processState}/${handle.runState} · run:${handle.runSequence || 0}\n  actual ${formatModel(serial.actualModel)} · thinking:${serial.actualThinking}\n  tab ${handle.tabId ?? "?"} pane ${handle.paneId ?? "?"}${handle.reconnecting ? " · reconnecting" : ""}\n  session ${serial.sessionPath} (${serial.transcriptNote})${serial.error ? `\n  error ${truncate(serial.error, 180)}` : ""}`,
+			`#${handle.id}${handle.name ? ` ${handle.name}` : ""} ${handle.processState}/${handle.runState} · run:${handle.runSequence || 0}\n  actual ${formatModel(serial.actualModel)} · thinking:${serial.actualThinking}\n  pid:${handle.pid ?? "?"} · exit:${handle.exitCode ?? "-"}\n  session ${serial.sessionPath} (${serial.transcriptNote})${serial.error ? `\n  error ${truncate(serial.error, 180)}` : ""}`,
 		);
 	}
 
@@ -757,7 +622,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			task: string;
 			cwd: string;
 			sessionDir: string;
-			socketPath: string;
 			requestedModel: string;
 			requestedThinking: string;
 			createdAt: number;
@@ -779,14 +643,13 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				? entry.requestedThinking
 				: "off",
 			sessionDir: entry.sessionDir,
-			socketPath: entry.socketPath,
 			promptPath:
 				entry.promptPath ||
 				join(entry.sessionDir, "pi-effective-system-prompt.txt"),
 			sessionPath: entry.sessionFile,
-			tabId: entry.tabId,
-			paneId: entry.paneId,
-			zellijSessionName: entry.zellijSessionName,
+			pid: entry.pid,
+			childProcess: undefined,
+			rpcReady: false,
 			processState: entry.processState || "alive",
 			runState: entry.runState || "idle",
 			runSequence: entry.runId || 0,
@@ -808,30 +671,13 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			isStreaming: false,
 			usage: createUsage(),
 			completionSettled: false,
-			seenHelloConnections: new Set(),
-			pendingAcks: new Map(),
-			requestSequence: 0,
+			pendingRpcCommands: new Map(),
 			createdAt: entry.createdAt,
 			lastActivityAt: entry.lastActivityAt,
 			stderr: "",
 			diagnostics: [],
 			waiters: new Set(),
-			ipcMutationChain: Promise.resolve(),
-			ipcMutationsClosed: false,
 			settlementPersistenceChain: Promise.resolve(),
-			reconnecting: entry.detached,
-			lastIpcFrameAt: monotonicNow(),
-			terminalCleanup: {
-				status: entry.terminalCleanupPending
-					? entry.terminalCleanupError
-						? "failed"
-						: "pending"
-					: "none",
-				attempts: 0,
-				lastError: entry.terminalCleanupError,
-			},
-			cleanupRequired: entry.terminalCleanupPending === true,
-			terminalStateDurable: entry.terminalCleanupPending === true,
 			ownerSessionFile: entry.ownerSessionFile,
 			ownerSessionId: entry.ownerSessionId,
 			controllerInstanceId: entry.controllerInstanceId,
@@ -867,533 +713,156 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			},
 		};
 	}
-	function isCurrentEpoch(
+
+	function handleRpcLine(
 		handle: SubagentHandle,
-		frame: { connectionId: string },
-		conn: IpcConnection,
-	): boolean {
-		return frameMatchesConnectionEpoch(
-			{
-				parentConnectionId: handle.ipcConn?.id,
-				childConnectionId: handle.connectionId,
-			},
-			frame,
-			conn,
-		);
-	}
-	function isCurrentEpochWithOwner(
-		handle: SubagentHandle,
-		frame: {
-			ownerSessionFile?: string;
-			ownerSessionId?: string;
-			launchControllerInstanceId?: string;
-			incarnation?: string;
-			connectionId: string;
-		},
-		conn: IpcConnection,
-	): boolean {
-		return (
-			frame.ownerSessionFile === handle.ownerSessionFile &&
-			frame.ownerSessionId === handle.ownerSessionId &&
-			frame.launchControllerInstanceId === handle.controllerInstanceId &&
-			frame.incarnation === handle.incarnation &&
-			isCurrentEpoch(handle, frame, conn)
-		);
-	}
-	function rejectPendingAcks(
-		handle: SubagentHandle,
-		parentConnectionId: string,
-		message: string,
+		parsed: Record<string, unknown>,
 	): void {
-		for (const [id, pending] of handle.pendingAcks) {
-			if (pending.parentConnectionId !== parentConnectionId) continue;
-			clearTimeout(pending.timer);
-			handle.pendingAcks.delete(id);
-			pending.reject(new Error(message));
-		}
-	}
-	function applySnapshot(handle: SubagentHandle, frame: SnapshotFrame) {
-		const previousSettledRunId = handle.lastSettledRunId;
-		handle.sessionId = frame.sessionId;
-		handle.sessionPath = frame.sessionFile;
-		handle.runState = frame.runState;
-		handle.runSequence = Math.max(handle.runSequence, frame.runId);
-		handle.runOutcome = frame.runOutcome;
-		handle.stopReason = frame.stopReason;
-		handle.error = frame.errorMessage;
-		handle.currentTool = frame.currentTool;
-		handle.isStreaming = frame.isStreaming;
-		handle.currentAssistantText = frame.assistantTail;
-		Object.assign(handle.usage, frame.usage);
-		if (
-			frame.runState === "idle" &&
-			frame.runId > 0 &&
-			frame.runOutcome !== "pending"
-		) {
-			handle.lastSettledRunId = Math.max(handle.lastSettledRunId, frame.runId);
-			handle.state =
-				frame.runOutcome === "failed"
-					? "error"
-					: frame.runOutcome === "succeeded"
-						? "done"
-						: "running";
-			if (frame.runId > previousSettledRunId) {
-				acceptSettlement(
-					handle,
-					frame.runId,
-					frame.runOutcome,
-					frame.assistantTail,
-					frame.updatedAt,
-					"snapshot",
-				);
-			}
-			notifyWaiters(handle);
-		} else if (frame.runState !== "idle") handle.state = "running";
-		handle.lifecycle = frame.runState;
-		update(handle);
-	}
-	function handleHello(
-		handle: SubagentHandle,
-		frame: HelloFrame,
-		conn: IpcConnection,
-	) {
-		if (handle.processState === "stopped") {
-			addDiagnostic(handle, "Rejected IPC hello for a stopped incarnation.");
-			conn.close();
-			return;
-		}
-		if (!helloMatchesRegistryChild(handle.id, frame.childId)) {
-			addDiagnostic(
-				handle,
-				`Rejected IPC hello for unexpected childId ${frame.childId}.`,
-			);
-			conn.close();
-			return;
-		}
-		if (
-			frame.ownerSessionFile !== handle.ownerSessionFile ||
-			frame.ownerSessionId !== handle.ownerSessionId ||
-			frame.launchControllerInstanceId !== handle.controllerInstanceId ||
-			frame.incarnation !== handle.incarnation
-		) {
-			addDiagnostic(
-				handle,
-				`Rejected IPC hello for mismatched owner or incarnation.`,
-			);
-			conn.close();
-			return;
-		}
-		if (handle.seenHelloConnections.has(frame.connectionId)) return;
-		handle.seenHelloConnections.add(frame.connectionId);
-		const sessionChanged =
-			(!!handle.sessionId && handle.sessionId !== frame.sessionId) ||
-			frame.reason === "new" ||
-			frame.reason === "resume";
-		const previousConnection = handle.ipcConn;
-		if (previousConnection && previousConnection.id !== conn.id) {
-			rejectPendingAcks(
-				handle,
-				previousConnection.id,
-				"Child IPC connection changed before acknowledgement.",
-			);
-			const closeTimer = setTimeout(() => previousConnection.close(), 250);
-			closeTimer.unref();
-		}
-		handle.ipcConn = conn;
-		handle.connectionId = frame.connectionId;
-		handle.sessionId = frame.sessionId;
-		handle.sessionPath = frame.sessionFile;
-		handle.pid = frame.pid;
-		handle.actualModel = frame.model || undefined;
-		handle.actualThinking = isThinking(frame.thinkingLevel)
-			? frame.thinkingLevel
-			: handle.requestedThinking;
-		handle.ipcReadyAt ||= now();
-		handle.reconnecting = false;
-		handle.pendingHeartbeat = undefined;
-		handle.disconnectedAt = undefined;
-		handle.disconnectDeadlineAt = undefined;
-		recordCurrentFrame(handle);
-		handle.processState = "alive";
-		if (sessionChanged) {
-			resetRunViewForSession(handle);
-			handle.activeTools.clear();
-			handle.isStreaming = false;
-		}
-		update(handle);
-		notifyWaiters(handle);
-	}
-	function recordCurrentFrame(handle: SubagentHandle): void {
-		handle.lastIpcFrameAt = monotonicNow();
-	}
-	function startReconnectGrace(handle: SubagentHandle, at = monotonicNow()): void {
-		handle.pendingHeartbeat = undefined;
-		handle.disconnectedAt = at;
-		handle.disconnectDeadlineAt = at + RECONNECT_GRACE_MS;
-		handle.reconnecting = true;
-		reconcileWatchdog();
-	}
-	async function attemptTerminalCleanup(handle: SubagentHandle): Promise<void> {
-		if (handle.terminalCleanup.status !== "pending") return;
-		await withTerminalCleanupLock(handle, async () => {
-			if (handle.terminalCleanup.status !== "pending") return;
-			let shouldPersist = false;
-			try {
-				if (!(await requireCurrentAuthority())) return;
-				if (!handle.terminalStateDurable) {
-					if (!(await persist())) {
-						handle.terminalCleanup.nextAttemptAt =
-							monotonicNow() + HEARTBEAT_SWEEP_MS;
-						return;
-					}
-					handle.terminalStateDurable = true;
-				}
-				shouldPersist = true;
-				handle.terminalCleanup.attempts++;
-				if (!handle.zellijSessionName || handle.paneId === undefined) {
-					const message = `Cannot clean up #${handle.id}: missing ${!handle.zellijSessionName ? "Zellij session name" : "terminal pane ID"}.`;
-					handle.terminalCleanup = {
-						status: "failed",
-						attempts: handle.terminalCleanup.attempts,
-						lastError: message,
-					};
-					addDiagnostic(handle, message);
-					return;
-				}
-				await closePaneInSession(requireHandleDedicatedSession(handle), handle.paneId);
-				handle.cleanupRequired = false;
-				handle.terminalCleanup = { status: "complete", attempts: handle.terminalCleanup.attempts };
-			} catch (error) {
-				const message = error instanceof Error ? error.message : String(error);
-				if (/pane.*(not found|does not exist)|no such pane/i.test(message)) {
-					handle.cleanupRequired = false;
-					handle.terminalCleanup = { status: "complete", attempts: handle.terminalCleanup.attempts };
-				} else if (handle.terminalCleanup.attempts >= CLEANUP_RETRY_DELAYS_MS.length) {
-					handle.terminalCleanup = {
-						status: "failed",
-						attempts: handle.terminalCleanup.attempts,
-						lastError: message,
-					};
-					addDiagnostic(handle, `Terminal cleanup failed: ${message}`);
-				} else {
-					handle.terminalCleanup.nextAttemptAt =
-						monotonicNow() + CLEANUP_RETRY_DELAYS_MS[handle.terminalCleanup.attempts]!;
-					handle.terminalCleanup.lastError = message;
-					addDiagnostic(handle, `Terminal cleanup retry scheduled: ${message}`);
-				}
-			} finally {
-				if (shouldPersist) await persist();
-				reconcileWatchdog();
-			}
-		});
-	}
-	async function declareDead(
-		handle: SubagentHandle,
-		reason: "heartbeat_timeout" | "reconnect_timeout" | "quit" | "kill",
-	): Promise<void> {
-		if (!(await requireCurrentAuthority()) || handle.processState === "stopped") return;
-		handle.deathReason = reason;
-		handle.pendingHeartbeat = undefined;
-		handle.disconnectedAt = undefined;
-		handle.disconnectDeadlineAt = undefined;
-		handle.reconnecting = false;
-		rejectPendingAcks(handle, handle.ipcConn?.id || "", "Child IPC connection ended.");
-		markStopped(handle, now(), {
-			error:
-				reason === "heartbeat_timeout"
-					? "IPC heartbeat timed out."
-					: reason === "reconnect_timeout"
-						? "IPC reconnect grace expired."
-						: undefined,
-		});
-		handle.cleanupRequired = true;
-		handle.terminalStateDurable = false;
-		handle.terminalCleanup = {
-			status: "pending",
-			attempts: 0,
-			nextAttemptAt: monotonicNow(),
-		};
-		notifyWaiters(handle);
-		await cleanupTransport(handle);
-		update(handle, false);
-		if (!(await persist())) {
-			handle.terminalCleanup.nextAttemptAt = monotonicNow() + HEARTBEAT_SWEEP_MS;
-			reconcileWatchdog();
-			return;
-		}
-		handle.terminalStateDurable = true;
-		await attemptTerminalCleanup(handle);
-	}
-	function enqueueAuthorizedMutation(
-		handle: SubagentHandle,
-		action: () => void | Promise<void>,
-	): Promise<void> {
-		if (handle.ipcMutationsClosed) return handle.ipcMutationChain;
-		handle.ipcMutationChain = handle.ipcMutationChain
-			.then(async () => {
-				if (await requireCurrentAuthority()) await action();
-			})
-			.catch((error) =>
-				addDiagnostic(
-					handle,
-					`Authorized IPC mutation failed: ${String(error)}`,
-				),
-			);
-		return handle.ipcMutationChain;
-	}
-	async function attachServer(handle: SubagentHandle): Promise<void> {
-		if (!(await requireCurrentAuthority()))
-			throw new Error(await leaseConflictMessage());
-		await handle.ipcServer?.close().catch(() => {});
-		handle.ipcServer = await startIpcServer(handle.socketPath, {
-			onHello: (frame, conn) =>
-				enqueueAuthorizedMutation(handle, () =>
-					handleHello(handle, frame, conn),
-				),
-			onSnapshot: (frame, conn) =>
-				enqueueAuthorizedMutation(handle, () => {
-					if (
-						frame.childId !== handle.id ||
-						!isCurrentEpochWithOwner(handle, frame, conn) ||
-						frame.sessionId !== handle.sessionId
-					) {
-						addDiagnostic(
-							handle,
-							"Ignored snapshot from a stale IPC connection or session epoch.",
-						);
-						return;
-					}
-					recordCurrentFrame(handle);
-					if (frame.runId >= handle.runSequence) applySnapshot(handle, frame);
-				}),
-			onEvent: (frame: EventFrame, conn) =>
-				enqueueAuthorizedMutation(handle, () => {
-					if (
-						frame.childId !== handle.id ||
-						!isCurrentEpochWithOwner(handle, frame, conn)
-					) {
-						addDiagnostic(
-							handle,
-							"Ignored event from a stale IPC connection epoch.",
-						);
-						return;
-					}
-					recordCurrentFrame(handle);
-					if (frame.event === "session_shutdown") return;
-					dispatchSubagentEvent(
-						handle,
-						{ ...frame, type: frame.event },
-						dispatchOptions(handle),
-					);
-				}),
-			onAck: (frame, conn) =>
-				enqueueAuthorizedMutation(handle, () => {
-					if (
-						frame.childId !== handle.id ||
-						!isCurrentEpochWithOwner(handle, frame, conn)
-					) {
-						addDiagnostic(handle, "Ignored acknowledgement from a stale IPC connection epoch.");
-						return;
-					}
-					recordCurrentFrame(handle);
-					const pending = handle.pendingAcks.get(frame.id);
-					if (
-						!pending ||
-						!acknowledgementMatchesConnectionEpoch(
-							{
-								parentConnectionId: handle.ipcConn?.id,
-								childConnectionId: handle.connectionId,
-							},
-							frame,
-							conn,
-							pending,
-						)
-					) {
-						addDiagnostic(handle, "Ignored acknowledgement without a current request.");
-						return;
-					}
+		const type = typeof parsed.type === "string" ? parsed.type : undefined;
+		if (!type) return;
+		handle.rpcReady = true;
+
+		// Resolve pending RPC command responses.
+		if (type === "response") {
+			const commandType = typeof parsed.command === "string" ? parsed.command : undefined;
+			if (commandType) {
+				const pending = handle.pendingRpcCommands.get(commandType);
+				if (pending) {
 					clearTimeout(pending.timer);
-					handle.pendingAcks.delete(frame.id);
-					pending.resolve(frame);
-				}),
-			onBye: (frame, conn) =>
-				enqueueAuthorizedMutation(handle, () => {
-					if (
-						frame.childId !== handle.id ||
-						!isCurrentEpochWithOwner(handle, frame, conn)
-					)
-						return;
-					recordCurrentFrame(handle);
-					addDiagnostic(handle, `Child connection closing for ${frame.reason}.`);
-				}),
-			onPong: (frame: PongFrame, conn) =>
-				enqueueAuthorizedMutation(handle, () => {
-					if (
-						frame.childId !== handle.id ||
-						!isCurrentEpochWithOwner(handle, frame, conn)
-					)
-						return;
-					recordCurrentFrame(handle);
-					const pending = handle.pendingHeartbeat;
-					if (
-						pending &&
-						frame.id === pending.id &&
-						pending.parentConnectionId === conn.id &&
-						pending.childConnectionId === frame.connectionId
-					)
-						handle.pendingHeartbeat = undefined;
-				}),
-			onConnectionClose: (conn, hadBye, reason) =>
-				enqueueAuthorizedMutation(handle, async () => {
-					if (handle.processState === "stopped" || handle.ipcConn?.id !== conn.id)
-						return;
-					rejectPendingAcks(
-						handle,
-						conn.id,
-						"Child IPC connection closed before acknowledgement.",
-					);
-					handle.ipcConn = undefined;
-					if (hadBye && reason === "quit") {
-						await declareDead(handle, "quit");
-						return;
+					handle.pendingRpcCommands.delete(commandType);
+					if (parsed.success === false) {
+						pending.reject(
+							new Error(
+								typeof parsed.error === "string"
+									? parsed.error
+									: `RPC command "${commandType}" failed.`,
+							),
+						);
+					} else {
+						pending.resolve(parsed);
 					}
-					startReconnectGrace(handle);
-					addDiagnostic(
-						handle,
-						`Child IPC disconnected${hadBye ? ` (${reason})` : ""}; awaiting reconnect.`,
-					);
-				}),
-			onConnectionError: (_conn, error) =>
-				addDiagnostic(handle, `IPC connection error: ${error.message}`),
-			onDiagnostic: (message) => addDiagnostic(handle, message),
+				}
+			}
+			return;
+		}
+
+		// Dispatch lifecycle events to the shared dispatcher.
+		if (type === "agent_settled") {
+			dispatchSubagentEvent(handle, { type: "agent_settled", ...parsed }, dispatchOptions(handle));
+			notifyWaiters(handle);
+			return;
+		}
+		if (
+			type === "agent_start" ||
+			type === "agent_end" ||
+			type === "message_start" ||
+			type === "message_update" ||
+			type === "message_end" ||
+			type === "tool_execution_start" ||
+			type === "tool_execution_update" ||
+			type === "tool_execution_end" ||
+			type === "extension_error"
+		) {
+			dispatchSubagentEvent(handle, { type, ...parsed }, dispatchOptions(handle));
+			return;
+		}
+	}
+
+	async function declareDead(handle: SubagentHandle): Promise<void> {
+		if (handle.processState === "stopped") return;
+		rejectPendingRpcCommands(handle, "Child process ended.");
+		markStopped(handle, now(), {});
+		notifyWaiters(handle);
+		update(handle, false);
+		await persist();
+	}
+
+	function attachChildProcess(handle: SubagentHandle, child: ChildProcess): void {
+		handle.childProcess = child;
+		handle.pid = child.pid;
+
+		attachJsonlReader(
+			child.stdout!,
+			(parsed) => handleRpcLine(handle, parsed),
+			(error) => addDiagnostic(handle, `RPC parse error: ${error.message}`),
+		);
+
+		child.stderr!.setEncoding("utf8");
+		child.stderr!.on("data", (chunk: string) => {
+			handle.stderr += chunk;
+			if (handle.stderr.length > 64 * 1024)
+				handle.stderr = handle.stderr.slice(-64 * 1024);
+		});
+
+		child.on("close", (code) => {
+			handle.exitCode = code ?? undefined;
+			handle.childProcess = undefined;
+			rejectPendingRpcCommands(handle, "Child process closed.");
+			void declareDead(handle);
 		});
 	}
-	function awaitReady(
+
+	async function waitForReady(
 		handle: SubagentHandle,
 		timeoutMs = STARTUP_TIMEOUT_MS,
 	): Promise<void> {
-		if (handle.ipcConn && handle.actualModel && handle.sessionPath)
-			return Promise.resolve();
+		if (handle.rpcReady || handle.processState === "stopped") return;
 		return new Promise((resolve, reject) => {
 			const timer = setTimeout(() => {
 				handle.waiters.delete(check);
-				reject(
-					new Error(`Timed out waiting for child #${handle.id} IPC hello.`),
-				);
+				if (!handle.rpcReady)
+					reject(new Error(`Timed out waiting for child #${handle.id} to become ready.`));
+				else resolve();
 			}, timeoutMs);
 			const check = () => {
-				if (!handle.ipcConn || !handle.actualModel || !handle.sessionPath)
-					return;
+				if (!handle.rpcReady && handle.processState !== "stopped") return;
 				clearTimeout(timer);
 				handle.waiters.delete(check);
-				resolve();
+				if (handle.processState === "stopped")
+					reject(new Error(`Child #${handle.id} died before becoming ready.`));
+				else resolve();
 			};
 			handle.waiters.add(check);
 			check();
 		});
 	}
+
 	async function sendMessage(
 		handle: SubagentHandle,
 		deliverAs: "followUp" | "steer",
 		content: string,
-	): Promise<AckFrame> {
+	): Promise<void> {
 		if (!(await requireCurrentAuthority()))
 			throw new Error(await leaseConflictMessage());
 		if (handle.processState !== "alive")
-			return Promise.reject(
-				new Error(`Subagent #${handle.id} is no longer running.`),
-			);
-		if (!handle.ipcConn)
-			return Promise.reject(
-				new Error(`Subagent #${handle.id} is reconnecting and not ready.`),
-			);
-		const connection = handle.ipcConn;
-		const connectionId = handle.connectionId;
-		if (!connection || !connectionId)
-			return Promise.reject(
-				new Error(`Subagent #${handle.id} is reconnecting and not ready.`),
-			);
-		const id = `${handle.id}:${++handle.requestSequence}`;
-		return new Promise((resolve, reject) => {
-			const timer = setTimeout(() => {
-				handle.pendingAcks.delete(id);
-				reject(
-					new Error(
-						`${deliverAs === "steer" ? "Steer" : "Follow-up"} acknowledgement timed out; delivery may still have occurred.`,
-					),
-				);
-			}, ACK_TIMEOUT_MS);
-			handle.pendingAcks.set(id, {
-				childConnectionId: connectionId,
-				parentConnectionId: connection.id,
-				resolve: (frame) =>
-					frame.ok
-						? resolve(frame)
-						: reject(new Error(frame.error || "Child rejected message.")),
-				reject,
-				timer,
-			});
-			connection.send({
-				type: "send",
-				id,
-				deliverAs,
-				content,
-				ownerSessionFile: handle.ownerSessionFile,
-				ownerSessionId: handle.ownerSessionId,
-				launchControllerInstanceId: handle.controllerInstanceId,
-				incarnation: handle.incarnation,
-			});
-		});
+			throw new Error(`Subagent #${handle.id} is no longer running.`);
+		const rpcType = deliverAs === "steer" ? "steer" : "follow_up";
+		await sendRpcCommand(handle, { type: rpcType, message: content });
 	}
+
 	async function interrupt(handle: SubagentHandle): Promise<boolean> {
 		if (handle.processState !== "alive")
 			throw new Error(`Subagent #${handle.id} is no longer running.`);
-		const paneId = handle.paneId;
-		if (paneId === undefined || !handle.zellijSessionName)
-			throw new Error(`Subagent #${handle.id} stable pane identity is unavailable.`);
 		if (!(await requireCurrentAuthority()))
 			throw new Error(await leaseConflictMessage());
 		const cursor = handle.lastSettledRunId;
-		await sendKeysInSession(requireHandleDedicatedSession(handle), paneId, "Esc");
+		writeRpcCommand(handle, { type: "abort" });
 		if (handle.runState === "idle") return true;
 		const settled = await waitFor(
 			[{ handle, cursor }],
-			ABORT_ACK_TIMEOUT_MS / 1000,
+			ABORT_SETTLE_TIMEOUT_MS / 1000,
 			undefined,
 		);
 		if (settled !== "completed") {
 			addDiagnostic(
 				handle,
-				"Esc interrupt did not settle within the acknowledgement deadline.",
+				"Abort command did not settle within the acknowledgement deadline.",
 			);
 			return false;
 		}
 		return true;
 	}
-	async function cleanupTransport(handle: SubagentHandle): Promise<void> {
-		const connection = handle.ipcConn;
-		const server = handle.ipcServer;
-		handle.ipcConn = undefined;
-		handle.ipcServer = undefined;
-		connection?.close();
-		await server
-			?.close()
-			.catch((error) =>
-				addDiagnostic(handle, `IPC cleanup failed: ${String(error)}`),
-			);
-		if (dirname(handle.socketPath) !== handle.sessionDir) {
-			await fs
-				.rmdir(dirname(handle.socketPath))
-				.catch((error: NodeJS.ErrnoException) => {
-					if (error.code !== "ENOENT" && error.code !== "ENOTEMPTY") {
-						addDiagnostic(
-							handle,
-							`IPC fallback directory cleanup failed: ${error.message}`,
-						);
-					}
-				});
-		}
-	}
+
 	async function terminate(handle: SubagentHandle): Promise<SubagentHandle> {
 		if (!(await requireCurrentAuthority()))
 			throw new Error(await leaseConflictMessage());
@@ -1403,11 +872,40 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			settlementNotifications.suppressChild(handle.id);
 			requestKill(handle, now());
 			update(handle, false);
-			await interrupt(handle).catch((error) =>
-				addDiagnostic(handle, `Interrupt before kill failed: ${String(error)}`),
-			);
+
+			// 1. Send abort and wait briefly.
+			writeRpcCommand(handle, { type: "abort" });
 			await new Promise((resolve) => setTimeout(resolve, TERM_DEADLINE_MS));
-			await enqueueAuthorizedMutation(handle, () => declareDead(handle, "kill"));
+
+			if (handle.processState === "stopped") {
+				handle.completedAt ||= now();
+				await handle.settlementPersistenceChain;
+				await persistenceChain;
+				return handle;
+			}
+
+			// 2. SIGTERM.
+			handle.childProcess?.kill("SIGTERM");
+			await new Promise((resolve) => setTimeout(resolve, TERM_DEADLINE_MS));
+
+			if (handle.processState === "stopped") {
+				handle.completedAt ||= now();
+				await handle.settlementPersistenceChain;
+				await persistenceChain;
+				return handle;
+			}
+
+			// 3. SIGKILL.
+			handle.childProcess?.kill("SIGKILL");
+			await new Promise((resolve) => setTimeout(resolve, KILL_DEADLINE_MS));
+
+			if (handle.processState !== "stopped") {
+				rejectPendingRpcCommands(handle, "Child process forcibly killed.");
+				markStopped(handle, now(), {});
+				notifyWaiters(handle);
+				update(handle);
+			}
+
 			handle.completedAt ||= now();
 			await handle.settlementPersistenceChain;
 			await persistenceChain;
@@ -1416,41 +914,13 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		return handle.terminationPromise;
 	}
 
-	async function retireAfterUncertainChildLaunch(
-		handle: SubagentHandle,
-		error: unknown,
-		removeHandleAfterSettlement: boolean,
-	): Promise<never> {
-		if (!dedicatedLifecycle) throw error;
-		setDedicatedSessionStatus(latestCtx, undefined);
-		const retiringLifecycle = dedicatedLifecycle;
-		try {
-			await retireDedicatedLifecycle(
-				getAgentDir(),
-				retiringLifecycle,
-				() => settleChildrenAfterWholeSessionDeletion(retiringLifecycle.owner),
-			);
-			dedicatedLifecycle = undefined;
-			if (removeHandleAfterSettlement && !handle.cleanupRequired)
-				handles.delete(handle.id);
-			await persist();
-		} catch (cleanupError) {
-			throw new AggregateError(
-				[error, cleanupError],
-				`Child launch was uncertain (${error instanceof Error ? error.message : String(error)}) and whole-session cleanup remains pending.`,
-			);
-		}
-		throw error;
-	}
-
 	async function launch(
 		spec: TaskSpec,
 		cwd: string,
 		requestedModel: string,
 		requestedThinking: ThinkingLevel,
-		ctx: ExtensionContext,
+		_ctx: ExtensionContext,
 	): Promise<SubagentHandle> {
-		const zellijSessionName = await ensureDedicatedSession(ctx);
 		if (!(await requireCurrentAuthority()))
 			throw new Error(await leaseConflictMessage());
 		const resolvedOwner = owner;
@@ -1466,26 +936,15 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		const sessionDir = join(getAgentDir(), "sessions", "subagents", id);
 		await fs.mkdir(sessionDir, { recursive: true, mode: 0o700 });
 		await fs.chmod(sessionDir, 0o700).catch(() => {});
-		const preferredSocket = incarnationSocketDir(
-			getAgentDir(),
-			resolvedOwner,
-			id,
-			incarnation,
-		);
-		const socketPath = await prepareIpcSocketPath(
-			preferredSocket,
-			`${id}-${incarnation.slice(0, 8)}`,
-		);
+
 		const handle = createHandle({
 			childId: id,
 			name: spec.name?.trim() || undefined,
 			task: spec.task,
 			cwd,
 			sessionDir,
-			socketPath,
 			requestedModel,
 			requestedThinking,
-			zellijSessionName,
 			processState: "alive",
 			runState: "idle",
 			createdAt: now(),
@@ -1496,11 +955,12 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			incarnation,
 		});
 		handles.set(id, handle);
-		await attachServer(handle);
 		await persist();
-		let launchPresenceUncertain = false;
+
 		try {
 			const command = getPiInvocation([
+				"--mode",
+				"rpc",
 				"-e",
 				childExtensionPath,
 				"--session-dir",
@@ -1510,38 +970,28 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				"--thinking",
 				requestedThinking,
 			]);
-			const env = {
+			const env: NodeJS.ProcessEnv = {
+				...process.env,
 				PI_SUBAGENT_CHILD: "1",
 				PI_SUBAGENT_CHILD_ID: id,
-				PI_SUBAGENT_OWNER_SESSION_FILE: resolvedOwner.ownerSessionFile,
-				PI_SUBAGENT_OWNER_SESSION_ID: resolvedOwner.ownerSessionId,
-				PI_SUBAGENT_CONTROLLER_INSTANCE_ID: controllerInstanceId,
 				PI_SUBAGENT_INCARNATION: incarnation,
-				PI_SUBAGENT_RUN_ID_BASE: "0",
 				PI_SUBAGENT_SYSTEM_PROMPT: spec.systemPrompt || "",
 				PI_SUBAGENT_DEPTH: String(getDepth() + 1),
 				PI_SUBAGENT_PROMPT_PATH: handle.promptPath,
 				PI_SUBAGENT_SESSION_DIR: handle.sessionDir,
-				BRIDGE_SOCKET_PATH: socketPath,
-				BRIDGE_LOG_PATH: join(sessionDir, "child-events.log"),
-				TERM: "xterm-256color",
 			};
-			launchPresenceUncertain = true;
-			const launched = await newTabInSession(
-				zellijSessionName,
-				spec.name?.trim() || `subagent-${id.slice(0, 8)}`,
+			const child = spawn(command[0]!, command.slice(1), {
 				cwd,
-				command,
 				env,
-			);
-			handle.tabId = launched.tabId;
-			handle.zellijSessionName = launched.sessionName;
-			handle.paneId = await discoverPaneIdInSession(zellijSessionName, handle.tabId, paneIdentity(handle));
-			launchPresenceUncertain = false;
+				stdio: ["pipe", "pipe", "pipe"],
+				shell: false,
+			});
+			attachChildProcess(handle, child);
 			update(handle);
-			await awaitReady(handle);
+			await waitForReady(handle);
+			// Send the initial task as a prompt command.
 			const before = handle.runSequence;
-			await sendMessage(handle, "followUp", spec.task);
+			await sendRpcCommand(handle, { type: "prompt", message: spec.task }, ACK_TIMEOUT_MS);
 			await waitUntil(
 				() => handle.runSequence > before || handle.processState === "stopped",
 				1000,
@@ -1552,10 +1002,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				handle,
 				`Child startup failed: ${error instanceof Error ? error.message : String(error)}`,
 			);
-			if (launchPresenceUncertain)
-				return retireAfterUncertainChildLaunch(handle, error, true);
 			await terminate(handle).catch(() => {});
-			if (!handle.cleanupRequired) handles.delete(id);
+			handles.delete(id);
 			await persist();
 			throw error;
 		}
@@ -1564,13 +1012,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	async function resumeChild(
 		handle: SubagentHandle,
 		task: string | undefined,
-		ctx?: ExtensionContext,
+		_ctx?: ExtensionContext,
 	): Promise<void> {
-		if (handle.cleanupRequired)
-			throw new Error(
-				`Subagent #${handle.id} has required terminal cleanup. Resume is blocked until cleanup completes.`,
-			);
-		const zellijSessionName = await ensureDedicatedSession(ctx);
 		if (!(await requireCurrentAuthority()))
 			throw new Error(await leaseConflictMessage());
 		const resolvedOwner = owner;
@@ -1591,44 +1034,23 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			);
 		const oldIncarnation = handle.incarnation;
 		const incarnation = createId();
-		const preferredSocket = incarnationSocketDir(
-			getAgentDir(),
-			resolvedOwner,
-			handle.id,
-			incarnation,
-		);
-		const socketPath = await prepareIpcSocketPath(
-			preferredSocket,
-			`${handle.id}-${incarnation.slice(0, 8)}`,
-		);
 		handle.incarnation = incarnation;
 		handle.controllerInstanceId = controllerInstanceId;
-		handle.socketPath = socketPath;
-		handle.zellijSessionName = zellijSessionName;
 		handle.resumedFrom = oldIncarnation;
 		reviveForResume(handle);
 		handle.completedAt = undefined;
 		handle.error = undefined;
 		handle.stopReason = undefined;
-		handle.reconnecting = false;
 		handle.terminationPromise = undefined;
-		handle.seenHelloConnections = new Set();
-		handle.pendingAcks = new Map();
-		handle.ipcConn = undefined;
-		handle.ipcReadyAt = undefined;
+		handle.childProcess = undefined;
+		handle.rpcReady = false;
+		handle.pendingRpcCommands = new Map();
 		handle.exitCode = undefined;
-		handle.pendingHeartbeat = undefined;
-		handle.disconnectedAt = undefined;
-		handle.disconnectDeadlineAt = undefined;
-		handle.deathReason = undefined;
-		handle.terminalCleanup = { status: "none", attempts: 0 };
-		handle.terminalStateDurable = false;
-		handle.ipcMutationsClosed = false;
-		handle.lastIpcFrameAt = monotonicNow();
-		await attachServer(handle);
-		let launchPresenceUncertain = false;
+
 		try {
 			const command = getPiInvocation([
+				"--mode",
+				"rpc",
 				"--session",
 				sessionFile,
 				"-e",
@@ -1640,36 +1062,25 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				"--thinking",
 				handle.requestedThinking,
 			]);
-			const env = {
+			const env: NodeJS.ProcessEnv = {
+				...process.env,
 				PI_SUBAGENT_CHILD: "1",
 				PI_SUBAGENT_CHILD_ID: handle.id,
-				PI_SUBAGENT_OWNER_SESSION_FILE: resolvedOwner.ownerSessionFile,
-				PI_SUBAGENT_OWNER_SESSION_ID: resolvedOwner.ownerSessionId,
-				PI_SUBAGENT_CONTROLLER_INSTANCE_ID: controllerInstanceId,
 				PI_SUBAGENT_INCARNATION: incarnation,
-				PI_SUBAGENT_RUN_ID_BASE: String(handle.runSequence),
 				PI_SUBAGENT_SYSTEM_PROMPT: "",
 				PI_SUBAGENT_DEPTH: String(getDepth() + 1),
 				PI_SUBAGENT_PROMPT_PATH: handle.promptPath,
 				PI_SUBAGENT_SESSION_DIR: handle.sessionDir,
-				BRIDGE_SOCKET_PATH: socketPath,
-				BRIDGE_LOG_PATH: join(handle.sessionDir, "child-events.log"),
-				TERM: "xterm-256color",
 			};
-			launchPresenceUncertain = true;
-			const launched = await newTabInSession(
-				zellijSessionName,
-				handle.name || `subagent-${handle.id.slice(0, 8)}`,
-				handle.cwd,
-				command,
+			const child = spawn(command[0]!, command.slice(1), {
+				cwd: handle.cwd,
 				env,
-			);
-			handle.tabId = launched.tabId;
-			handle.zellijSessionName = launched.sessionName;
-			handle.paneId = await discoverPaneIdInSession(zellijSessionName, handle.tabId, paneIdentity(handle));
-			launchPresenceUncertain = false;
+				stdio: ["pipe", "pipe", "pipe"],
+				shell: false,
+			});
+			attachChildProcess(handle, child);
 			update(handle);
-			await awaitReady(handle);
+			await waitForReady(handle);
 			if (task) {
 				const before = handle.runSequence;
 				await sendMessage(handle, "followUp", task);
@@ -1684,12 +1095,11 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				handle,
 				`Child resume failed: ${error instanceof Error ? error.message : String(error)}`,
 			);
-			if (launchPresenceUncertain)
-				return retireAfterUncertainChildLaunch(handle, error, false);
 			await terminate(handle).catch(() => {});
 			throw error;
 		}
 	}
+
 	function waitUntil(
 		predicate: () => boolean,
 		timeoutMs: number,
@@ -1793,6 +1203,11 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		return { model: ref, thinking };
 	}
 
+	/**
+	 * Restore stopped handles from the registry. Live handles cannot be
+	 * reattached with RPC mode — any alive-but-unattached handles are marked
+	 * stopped.
+	 */
 	async function reconcile() {
 		if (!owner || !(await requireCurrentAuthority())) return;
 		const path = ownerRegistryPath(getAgentDir(), owner);
@@ -1801,22 +1216,16 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			const existing = handles.get(entry.childId);
 			const handle = existing || createHandle(entry);
 			if (!existing) handles.set(handle.id, handle);
-			if (handle.processState === "alive" && !handle.ipcServer) {
-				startReconnectGrace(handle);
-				await attachServer(handle).catch((error) => {
-					addDiagnostic(handle, `Reattach listener failed: ${String(error)}`);
-				});
-			}
-			if (handle.cleanupRequired) {
-				handle.terminalCleanup.status = "pending";
-				handle.terminalCleanup.nextAttemptAt = monotonicNow();
-				void attemptTerminalCleanup(handle);
+			// Without an IPC server, alive-but-unattached handles cannot reconnect.
+			if (handle.processState === "alive" && !handle.childProcess) {
+				markStopped(handle, now(), { error: "Process lost across session reload." });
+				notifyWaiters(handle);
 			}
 		}
 		await persist();
-		reconcileWatchdog();
 		refreshUi();
 	}
+
 	function toInspector(handle: SubagentHandle): InspectorHandle {
 		const actualModel = handle.actualModel || {
 			provider: handle.requestedModel.split("/")[0] || "unknown",
@@ -1830,9 +1239,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			processState: handle.processState,
 			runState: handle.runState,
 			runId: handle.runSequence || undefined,
-			tabId: handle.tabId,
-			paneId: handle.paneId,
-			reconnecting: handle.reconnecting,
 			killing: handle.lifecycle === "killing",
 			task: handle.task,
 			cwd: handle.cwd,
@@ -1850,7 +1256,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				? "persisted transcript available"
 				: "no persisted transcript yet",
 			createdAt: handle.createdAt,
-			ipcReadyAt: handle.ipcReadyAt,
 			agentStartedAt: handle.agentStartedAt,
 			lastActivityAt: handle.lastActivityAt,
 			completedAt: handle.completedAt,
@@ -1860,19 +1265,14 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			isStreaming: handle.isStreaming,
 			usage: { ...handle.usage },
 			stopReason: handle.stopReason,
-			error:
-				handle.terminalCleanup.status === "failed"
-					? handle.terminalCleanup.lastError
-					: handle.error,
+			error: handle.error,
 			tentativeError: handle.tentativeError,
 			finalError: handle.finalError,
 			settledAt: handle.settledAt,
 			resultPreview: truncate(handle.resultText),
 			currentAssistantText: handle.currentAssistantText,
 			latestAssistantText: handle.latestAssistantText,
-			activeTools: [...handle.activeTools.values()].map((tool) => ({
-				...tool,
-			})),
+			activeTools: [...handle.activeTools.values()].map((tool) => ({ ...tool })),
 			recentTools: handle.recentTools.map((tool) => ({ ...tool })),
 		};
 	}
@@ -1901,10 +1301,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			clearInterval(leaseRenewTimer);
 			leaseRenewTimer = undefined;
 		}
-		if (watchdogTimer) {
-			clearTimeout(watchdogTimer);
-			watchdogTimer = undefined;
-		}
 	}
 	function startLeaseRenewal() {
 		if (leaseRenewTimer) clearInterval(leaseRenewTimer);
@@ -1915,7 +1311,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 					if (!ok) {
 						leaseHeld = false;
 						suppressAllSettlementNotifications();
-						setDedicatedSessionStatus(latestCtx, undefined);
 						for (const handle of handles.values())
 							addDiagnostic(
 								handle,
@@ -1933,136 +1328,49 @@ export default function subagentExtension(pi: ExtensionAPI) {
 						);
 					leaseHeld = false;
 					suppressAllSettlementNotifications();
-					setDedicatedSessionStatus(latestCtx, undefined);
 					stopTimers();
 				},
 			);
 		}, LEASE_RENEW_INTERVAL_MS);
 		leaseRenewTimer.unref();
 	}
-	function watchdogNeeded() {
-		return [...handles.values()].some(
-			(handle) =>
-				handle.processState === "alive" || handle.terminalCleanup.status === "pending",
-		);
-	}
-	function reconcileWatchdog() {
-		if (watchdogTimer) {
-			clearTimeout(watchdogTimer);
-			watchdogTimer = undefined;
-		}
-		if (!leaseHeld || !watchdogNeeded()) return;
-		const current = monotonicNow();
-		const cleanupDelay = [...handles.values()]
-			.filter(
-				(handle) =>
-					handle.terminalCleanup.status === "pending" &&
-					handle.terminalCleanup.nextAttemptAt !== undefined,
-			)
-			.map((handle) => Math.max(0, handle.terminalCleanup.nextAttemptAt! - current))
-			.reduce((minimum, delay) => Math.min(minimum, delay), HEARTBEAT_SWEEP_MS);
-		watchdogTimer = setTimeout(
-			() => void watchdogSweep(),
-			Math.min(HEARTBEAT_SWEEP_MS, cleanupDelay),
-		);
-		watchdogTimer.unref();
-	}
-	async function watchdogSweep(): Promise<void> {
-		if (watchdogSweepActive) return;
-		watchdogSweepActive = true;
-		try {
-			if (!owner || !(await requireCurrentAuthority())) return;
-			const current = monotonicNow();
-			const stalled = parentStalled(lastWatchdogSweepAt, current);
-			lastWatchdogSweepAt = current;
-			const decisions = [...handles.values()].map((handle) =>
-				enqueueAuthorizedMutation(handle, async () => {
-					const at = monotonicNow();
-					if (handle.terminalCleanup.status === "pending") {
-						if (
-							handle.terminalCleanup.nextAttemptAt === undefined ||
-							handle.terminalCleanup.nextAttemptAt <= at
-							)
-							await attemptTerminalCleanup(handle);
-						return;
-					}
-					if (handle.processState !== "alive") return;
-					if (stalled) {
-						if (handle.ipcConn) {
-							handle.pendingHeartbeat = undefined;
-							handle.lastIpcFrameAt = at;
-						} else startReconnectGrace(handle, at);
-						addDiagnostic(handle, "Watchdog stall reset the IPC observation window.");
-						return;
-					}
-					if (
-						heartbeatExpired(
-							handle.pendingHeartbeat,
-							at,
-							handle.ipcConn?.id,
-							handle.connectionId,
-						)
-					) {
-						await declareDead(handle, "heartbeat_timeout");
-						return;
-					}
-					if (reconnectExpired(handle.disconnectDeadlineAt, at, !!handle.ipcConn)) {
-						await declareDead(handle, "reconnect_timeout");
-						return;
-					}
-					if (
-						pingDue(
-							{
-								processState: handle.processState,
-								connected: !!handle.ipcConn && !!handle.connectionId,
-								lastIpcFrameAt: handle.lastIpcFrameAt,
-								pendingHeartbeat: handle.pendingHeartbeat,
-							},
-							at,
-						) &&
-						handle.ipcConn &&
-						handle.connectionId
-					) {
-						const connection = handle.ipcConn;
-						const childConnectionId = handle.connectionId;
-						const id = createId();
-						handle.pendingHeartbeat = {
-							id,
-							sentAt: at,
-							deadlineAt: at + HEARTBEAT_RESPONSE_MS,
-							parentConnectionId: connection.id,
-							childConnectionId,
-						};
-						try {
-							connection.send({
-								type: "ping",
-								id,
-								ownerSessionFile: handle.ownerSessionFile,
-								ownerSessionId: handle.ownerSessionId,
-								launchControllerInstanceId: handle.controllerInstanceId,
-								incarnation: handle.incarnation,
-							});
-						} catch {
-							if (handle.ipcConn?.id === connection.id) {
-								handle.ipcConn = undefined;
-								startReconnectGrace(handle, at);
-							}
-						}
-					}
-				}),
-			);
-			await Promise.all(decisions);
-		} finally {
-			watchdogSweepActive = false;
-			reconcileWatchdog();
-		}
-	}
 
-	const cleanupLease = (leaseOwner: OwnerIdentity): RetainedCleanupLease => ({
-		agentDir: getAgentDir(),
-		owner: leaseOwner,
-		controllerInstanceId,
-	});
+	/**
+	 * Wall-clock expiry can lapse without any competing controller, most visibly
+	 * across host suspend. Re-extend our own record before concluding that
+	 * authority was lost.
+	 */
+	async function ensureLeaseAuthority(
+		authorityOwner: OwnerIdentity,
+	): Promise<boolean> {
+		const agentDir = getAgentDir();
+		if (
+			await hasLeaseAuthority(
+				agentDir,
+				authorityOwner,
+				controllerInstanceId,
+				now(),
+			)
+		)
+			return true;
+		return renewLease(
+			agentDir,
+			authorityOwner,
+			controllerInstanceId,
+			now(),
+		).catch(() => false);
+	}
+	async function requireCurrentAuthority(): Promise<boolean> {
+		if (!leaseHeld || !owner || !controllerInstanceId) return false;
+		const authoritative = await ensureLeaseAuthority(owner);
+		if (!authoritative) {
+			leaseHeld = false;
+			suppressAllSettlementNotifications();
+			stopTimers();
+			refreshUi();
+		}
+		return authoritative;
+	}
 
 	async function establishController(ctx: ExtensionContext): Promise<void> {
 		const sessionFile = ctx.sessionManager?.getSessionFile();
@@ -2070,7 +1378,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		if (!sessionFile || !sessionId) {
 			owner = null;
 			leaseHeld = false;
-			setDedicatedSessionStatus(ctx, undefined);
 			return;
 		}
 		const canonicalSessionFile = await canonicalOwnerSessionFile(sessionFile);
@@ -2078,16 +1385,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			ownerSessionFile: canonicalSessionFile,
 			ownerSessionId: sessionId,
 		};
-		if (!(await ensureRetainedCleanupLeaseAuthority())) {
-			owner = null;
-			leaseHeld = false;
-			setDedicatedSessionStatus(ctx, undefined);
-			throw new Error(
-				"Retiring subagent cleanup authority is unavailable; refusing to provision a new owner.",
-			);
-		}
-		const resolvedLease = cleanupLease(resolved);
-		const resolvedWasRetained = retainedCleanupLeaseExists(resolvedLease);
 		const result = await acquireLease(
 			getAgentDir(),
 			resolved,
@@ -2097,41 +1394,10 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		if (result.held) {
 			owner = resolved;
 			leaseHeld = true;
-			try {
-				dedicatedLifecycle = await establishDedicatedLifecycle(
-					getAgentDir(),
-					resolved,
-					controllerInstanceId,
-					now(),
-					(error) => {
-						setDedicatedSessionStatus(latestCtx, undefined);
-						console.error(`Subagent Zellij guardian failed: ${error.message}`);
-					},
-					() => settleChildrenAfterWholeSessionDeletion(resolved),
-					(cleanupOwner) => ensureLeaseAuthority(cleanupOwner),
-				);
-				setDedicatedSessionStatus(ctx, dedicatedLifecycle.record.sessionName);
-				await resolveRetainedCleanupLeases(resolvedLease);
-				startLeaseRenewal();
-			} catch (error) {
-				leaseHeld = false;
-				setDedicatedSessionStatus(ctx, undefined);
-				if (hasPendingDedicatedRetirement(resolved, controllerInstanceId)) {
-					const retained = await retainCleanupLease(resolvedLease);
-					if (!retained)
-						console.error(
-							"Subagent startup cleanup authority is unavailable; provisioning remains blocked.",
-						);
-				} else if (!resolvedWasRetained) {
-					await releaseLease(getAgentDir(), resolved, controllerInstanceId);
-				}
-				owner = null;
-				throw error;
-			}
+			startLeaseRenewal();
 		} else {
 			owner = null;
 			leaseHeld = false;
-			setDedicatedSessionStatus(ctx, undefined);
 			const { existing } = result;
 			console.error(
 				`Subagent controller lease for this session file is held by controller ${existing.controllerInstanceId} (pid ${existing.pid}, ${isProcessAlive(existing.pid) ? "running" : "not running"}), expiring ${new Date(existing.expiresAt).toISOString()}. Quit that Pi process, then reload here.`,
@@ -2139,11 +1405,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		}
 	}
 
-	/**
-	 * Distinguishes an unreclaimable-but-ours record, a foreign live holder, and
-	 * a foreign dead holder, because "wait for it to expire" is useless advice
-	 * for every case except an actively held lease.
-	 */
 	async function leaseConflictMessage(): Promise<string> {
 		const base = "Subagent controller lease is not held.";
 		if (!owner)
@@ -2166,46 +1427,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		return releaseLease(getAgentDir(), owner, controllerInstanceId);
 	}
 
-	/** The session is absent before this runs, so every child incarnation is terminal. */
-	async function settleChildrenAfterWholeSessionDeletion(settlementOwner: OwnerIdentity): Promise<void> {
-		// Recovery may run before normal reconcile or after the extension has
-		// switched owners. Capture and write the retiring owner's registry rather
-		// than consulting mutable controller ownership.
-		const saved = registryEntriesForOwner(
-			await loadRegistry(ownerRegistryPath(getAgentDir(), settlementOwner)),
-			settlementOwner,
-		);
-		const settlementHandles = new Map(
-			saved.map((entry) => [entry.childId, createHandle(entry)]),
-		);
-		for (const handle of handles.values())
-			if (
-				handle.ownerSessionFile === settlementOwner.ownerSessionFile &&
-				handle.ownerSessionId === settlementOwner.ownerSessionId
-			)
-				settlementHandles.set(handle.id, handle);
-		for (const handle of settlementHandles.values()) {
-			rejectPendingAcks(handle, handle.ipcConn?.id || "", "Dedicated Zellij session was deleted.");
-			await closeAndDrainIpcMutations(handle, () => cleanupTransport(handle));
-			if (handle.processState !== "stopped") markStopped(handle, now());
-			handle.cleanupRequired = false;
-			handle.terminalStateDurable = true;
-			handle.terminalCleanup = {
-				status: "complete",
-				attempts: Math.max(1, handle.terminalCleanup.attempts),
-			};
-			notifyWaiters(handle);
-		}
-		await Promise.all([...settlementHandles.values()].map((handle) => handle.settlementPersistenceChain));
-		await persistenceChain;
-		await saveRegistry(
-			[...settlementHandles.values()].map(registryEntry),
-			ownerRegistryPath(getAgentDir(), settlementOwner),
-		);
-		reconcileWatchdog();
-		refreshUi();
-	}
-
 	pi.on("session_start", async (_event, ctx) => {
 		sessionShuttingDown = false;
 		latestCtx = ctx;
@@ -2213,7 +1434,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		await reconcile().catch((error) =>
 			console.error(`Subagent reconcile failed: ${String(error)}`),
 		);
-		reconcileWatchdog();
 		refreshUi();
 	});
 	pi.on("session_shutdown", async (event, ctx) => {
@@ -2221,70 +1441,19 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		suppressAllSettlementNotifications();
 		latestCtx = ctx;
 		const reason = event?.reason || "quit";
-		if (reason !== "reload") setDedicatedSessionStatus(ctx, undefined);
-		if (reason === "quit") {
+		if (reason === "quit" || reason === "reload") {
 			stopTimers();
-			if (dedicatedLifecycle && await requireCurrentAuthority()) {
-				const retiringLifecycle = dedicatedLifecycle;
-				try {
-					await retireDedicatedLifecycle(
-						getAgentDir(),
-						retiringLifecycle,
-						() => settleChildrenAfterWholeSessionDeletion(retiringLifecycle.owner),
-					);
-					dedicatedLifecycle = undefined;
-				} catch (error) {
-					console.error(`Subagent dedicated Zellij cleanup failed: ${String(error)}`);
-				}
-			}
-			await releaseLeaseIfHeld();
-			await releaseRetainedCleanupLeasesForQuit();
-		} else if (reason === "reload") {
-			stopTimers();
-			if (owner) preserveDedicatedLifecycleForReload(owner, controllerInstanceId);
-			for (const handle of handles.values()) {
-				handle.reconnecting = true;
-				await handle.ipcServer?.close().catch(() => {});
-				handle.ipcServer = undefined;
-				handle.ipcConn = undefined;
+			// Kill all live children.
+			await Promise.allSettled(sorted().filter(active).map(terminate));
+			if (reason === "quit") await releaseLeaseIfHeld();
+			if (reason === "reload") {
+				handles.clear();
 			}
 		} else {
-			let retirementSucceeded = !dedicatedLifecycle;
-			if (dedicatedLifecycle) {
-				const retiringLifecycle = dedicatedLifecycle;
-				// Transfer renewal to process-global retained authority before the
-				// attempt can block or the extension-local timer is stopped.
-				const retained = await retainCleanupLease(cleanupLease(retiringLifecycle.owner));
-				stopTimers();
-				if (!retained)
-					console.error(
-						"Subagent retiring-owner lease authority is unavailable; later provisioning will remain blocked.",
-					);
-				if (retained && await requireCurrentAuthority()) {
-					try {
-						await retireDedicatedLifecycle(
-							getAgentDir(),
-							retiringLifecycle,
-							() => settleChildrenAfterWholeSessionDeletion(retiringLifecycle.owner),
-						);
-						dedicatedLifecycle = undefined;
-						retirementSucceeded = true;
-						await resolveRetainedCleanupLeases();
-					} catch (error) {
-						console.error(`Subagent dedicated Zellij cleanup failed: ${String(error)}`);
-					}
-				}
-			} else {
-				stopTimers();
-			}
-			for (const handle of handles.values()) {
-				handle.reconnecting = true;
-				await handle.ipcServer?.close().catch(() => {});
-				handle.ipcServer = undefined;
-				handle.ipcConn = undefined;
-			}
+			stopTimers();
+			await Promise.allSettled(sorted().filter(active).map(terminate));
 			handles.clear();
-			if (retirementSucceeded) await releaseLeaseIfHeld();
+			await releaseLeaseIfHeld();
 			owner = null;
 			leaseHeld = false;
 		}
@@ -2295,14 +1464,14 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	pi.on("before_agent_start", async (event) => ({
 		systemPrompt:
 			event.systemPrompt +
-			`\n\nSubagent extension is available. Use it only for explicit delegation. subagent_start requires an explicit provider/model and thinking level; use list_models when needed instead of guessing. Children are persistent interactive Pi TUIs in tabs of a dedicated Pi-owned Zellij session. Start a child, then continue other work or end the current turn. Settlement notifications arrive automatically while children remain alive. These notifications start a follow-up turn. Rely on these notifications for completion. Do not poll subagent_status or use sleep commands to wait for completion. Use subagent_result with the child ID and run ID from the notification for exact settled output. Use subagent_status only for live diagnostics, never as a completion check. Use subagent_follow_up for another turn, subagent_steer during a run, subagent_interrupt to abort a run while keeping the child alive, and subagent_kill only to terminate.`,
+			`\n\nSubagent extension is available. Use it only for explicit delegation. subagent_start requires an explicit provider/model and thinking level; use list_models when needed instead of guessing. Children are persistent Pi RPC subprocesses. Start a child, then continue other work or end the current turn. Settlement notifications arrive automatically while children remain alive. These notifications start a follow-up turn. Rely on these notifications for completion. Do not poll subagent_status or use sleep commands to wait for completion. Use subagent_result with the child ID and run ID from the notification for exact settled output. Use subagent_status only for live diagnostics, never as a completion check. Use subagent_follow_up for another turn, subagent_steer during a run, subagent_interrupt to abort a run while keeping the child alive, and subagent_kill only to terminate.`,
 	}));
 
 	pi.registerTool<typeof TaskSpecSchema, unknown>({
 		name: "subagent_start",
 		label: "Subagent Start",
 		description:
-			"Start a persistent interactive Pi TUI with an explicit model and thinking level in a new tab of the dedicated Pi-owned Zellij session after a bounded IPC handshake. Settlement notifications start a follow-up turn when the child finishes. Rely on these notifications. Do not poll subagent_status or use sleep commands to wait for completion. Call subagent_kill when the child is no longer useful.",
+			"Start a persistent Pi RPC subprocess with an explicit model and thinking level. Settlement notifications start a follow-up turn when the child finishes. Rely on these notifications. Do not poll subagent_status or use sleep commands to wait for completion. Call subagent_kill when the child is no longer useful.",
 		parameters: TaskSpecSchema,
 		async execute(_id, params, _signal, _update, ctx) {
 			latestCtx = ctx;
@@ -2340,7 +1509,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 					content: [
 						{
 							type: "text" as const,
-							text: `Started persistent subagent #${handle.id} in Zellij tab ${handle.tabId}, pane ${handle.paneId}.`,
+							text: `Started persistent subagent #${handle.id} (pid ${handle.pid ?? "?"}).`,
 						},
 					],
 					details: { handle: await serialize(handle) },
@@ -2384,7 +1553,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		name: "subagent_status",
 		label: "Subagent Status",
 		description:
-			"Return process/run lifecycle, live activity, Zellij identity, and artifacts. Use this tool only for live diagnostics. Do not poll this tool for completion.",
+			"Return process/run lifecycle, live activity, and artifacts. Use this tool only for live diagnostics. Do not poll this tool for completion.",
 		parameters: StatusSchema,
 		async execute(_id, params) {
 			const handle = handles.get(params.id);
@@ -2405,7 +1574,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 					...serial,
 					timestamps: {
 						createdAt: serial.createdAt,
-						ipcReadyAt: serial.ipcReadyAt,
 						agentStartedAt: serial.agentStartedAt,
 						lastActivityAt: serial.lastActivityAt,
 						completedAt: serial.completedAt,
@@ -2514,7 +1682,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	pi.registerTool<typeof MessageSchema, unknown>({
 		name: "subagent_steer",
 		label: "Subagent Steer",
-		description: "Deliver guidance during a running child turn over IPC.",
+		description: "Deliver guidance during a running child turn over RPC.",
 		parameters: MessageSchema,
 		async execute(_id, params) {
 			const handle = handles.get(params.id);
@@ -2529,7 +1697,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 					details: {},
 				};
 			try {
-				const ack = await sendMessage(handle, "steer", params.message.trim());
+				await sendMessage(handle, "steer", params.message.trim());
 				return {
 					content: [
 						{
@@ -2540,7 +1708,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 					details: {
 						handle: await serialize(handle),
 						accepted: true,
-						queued: ack.queued,
 					},
 				};
 			} catch (error) {
@@ -2554,7 +1721,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	pi.registerTool<typeof MessageSchema, unknown>({
 		name: "subagent_follow_up",
 		label: "Subagent Follow Up",
-		description: "Send another user turn to a live persistent child over IPC.",
+		description: "Send another user turn to a live persistent child over RPC.",
 		parameters: MessageSchema,
 		async execute(_id, params) {
 			const handle = handles.get(params.id);
@@ -2570,11 +1737,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				};
 			try {
 				const before = handle.runSequence;
-				const ack = await sendMessage(
-					handle,
-					"followUp",
-					params.message.trim(),
-				);
+				await sendMessage(handle, "followUp", params.message.trim());
 				await waitUntil(
 					() =>
 						handle.runSequence > before || handle.processState === "stopped",
@@ -2590,7 +1753,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 					details: {
 						handle: await serialize(handle),
 						accepted: true,
-						queued: ack.queued,
 					},
 				};
 			} catch (error) {
@@ -2605,7 +1767,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		name: "subagent_interrupt",
 		label: "Subagent Interrupt",
 		description:
-			"Cooperatively abort the current run with Esc while keeping the child process alive.",
+			"Cooperatively abort the current run while keeping the child process alive.",
 		parameters: IdSchema,
 		async execute(_id, params) {
 			const handle = handles.get(params.id);
@@ -2627,7 +1789,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 							type: "text" as const,
 							text: interrupted
 								? `Interrupted #${handle.id}; child remains alive.`
-								: `Esc sent to #${handle.id}, but settlement acknowledgement timed out.`,
+								: `Abort sent to #${handle.id}, but settlement acknowledgement timed out.`,
 						},
 					],
 					details: { handle: await serialize(handle), interrupted },
@@ -2644,7 +1806,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		name: "subagent_kill",
 		label: "Subagent Kill",
 		description:
-			"Terminate the child tab after cooperative interrupt and bounded escalation. Use this cleanup action for completed or abandoned children.",
+			"Terminate the child subprocess after cooperative abort and bounded escalation. Use this cleanup action for completed or abandoned children.",
 		parameters: IdSchema,
 		async execute(_id, params) {
 			const handle = handles.get(params.id);
@@ -2687,7 +1849,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		name: "subagent_resume",
 		label: "Subagent Resume",
 		description:
-			"Resume a stopped child from its saved Pi session file in a new process incarnation. The child reopens its prior conversation in a new tab with a new socket and pane. Use this only for stopped children that have a persisted session file.",
+			"Resume a stopped child from its saved Pi session file in a new process incarnation. The child reopens its prior conversation in a new subprocess with a new incarnation. Use this only for stopped children that have a persisted session file.",
 		parameters: ResumeSchema,
 		async execute(_id, params, _signal, _update, ctx) {
 			const handle = handles.get(params.id);
@@ -2707,16 +1869,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 						{
 							type: "text" as const,
 							text: `Subagent #${handle.id} is still alive; resume is for stopped children.`,
-						},
-					],
-					details: { handle: await serialize(handle) },
-				};
-			if (handle.cleanupRequired)
-				return {
-					content: [
-						{
-							type: "text" as const,
-							text: `Subagent #${handle.id} has required terminal cleanup. Resume is blocked until cleanup completes.`,
 						},
 					],
 					details: { handle: await serialize(handle) },
@@ -2797,7 +1949,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 						clearFinished: () => {
 							let count = 0;
 							for (const handle of handles.values())
-								if (!active(handle) && !handle.cleanupRequired) {
+								if (!active(handle)) {
 									handles.delete(handle.id);
 									count++;
 								}

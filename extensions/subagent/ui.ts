@@ -31,9 +31,6 @@ export interface InspectorHandle {
 	processState: "alive" | "stopped";
 	runState: "idle" | "running" | "retrying" | "finishing";
 	runId?: number;
-	tabId?: number;
-	paneId?: number;
-	reconnecting?: boolean;
 	killing: boolean;
 	task: string;
 	cwd: string;
@@ -49,7 +46,6 @@ export interface InspectorHandle {
 	resultKind: "none" | "final" | "partial";
 	transcriptNote: string;
 	createdAt: number;
-	ipcReadyAt?: number;
 	agentStartedAt?: number;
 	lastActivityAt: number;
 	completedAt?: number;
@@ -538,15 +534,15 @@ export class SubagentInspector implements Focusable {
 		this.pushField(
 			lines,
 			"State",
-			`${stateText(handle)} ${activityText(handle)}${handle.reconnecting ? " · reconnecting" : ""}`,
+			`${stateText(handle)} ${activityText(handle)}`,
 			width,
 			stateColor(handle),
 		);
 		this.pushField(lines, "Run", String(handle.runId ?? 0), width);
 		this.pushField(
 			lines,
-			"Zellij",
-			`tab ${handle.tabId ?? "-"} · pane ${handle.paneId ?? "-"}`,
+			"Process",
+			`pid ${handle.pid ?? "-"} · exit ${handle.exitCode ?? "-"}`,
 			width,
 		);
 		this.pushField(

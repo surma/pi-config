@@ -9,13 +9,7 @@ export interface RegistryEntry {
 	name?: string;
 	task: string;
 	cwd: string;
-	tabId?: number;
-	paneId?: number;
-	zellijSessionName?: string;
-	terminalCleanupPending?: boolean;
-	terminalCleanupError?: string;
 	sessionDir: string;
-	socketPath: string;
 	sessionFile?: string;
 	promptPath?: string;
 	requestedModel: string;
@@ -24,9 +18,9 @@ export interface RegistryEntry {
 	runState: RunState;
 	runId?: number;
 	lastSettledRunId?: number;
+	pid?: number;
 	createdAt: number;
 	lastActivityAt: number;
-	detached?: boolean;
 	ownerSessionFile: string;
 	ownerSessionId: string;
 	controllerInstanceId: string;

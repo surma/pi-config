@@ -22,17 +22,12 @@ function entry(overrides: Partial<RegistryEntry> = {}): RegistryEntry {
 		childId: "child",
 		task: "task",
 		cwd: "/tmp",
-		tabId: 1,
-		paneId: 2,
-		zellijSessionName: "world-home",
-		terminalCleanupPending: true,
-		terminalCleanupError: "prior failure",
 		sessionDir: "/tmp/session",
-		socketPath: "/tmp/session/sock",
 		requestedModel: "p/m",
 		requestedThinking: "off",
 		processState: "alive",
 		runState: "idle",
+		pid: 1234,
 		createdAt: 1,
 		lastActivityAt: 1,
 		ownerSessionFile: owner.ownerSessionFile,
@@ -43,26 +38,38 @@ function entry(overrides: Partial<RegistryEntry> = {}): RegistryEntry {
 	};
 }
 
-test("registry writes cleanup intent atomically and reads it back", async () => {
+test("registry writes entries atomically and reads them back", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-registry-"));
 	const path = join(dir, "registry.json");
 	const entries = [entry()];
 	await saveRegistry(entries, path);
 	assert.deepEqual(await loadRegistry(path), entries);
-	assert.match(await readFile(path, "utf8"), /"terminalCleanupPending"/);
+	assert.match(await readFile(path, "utf8"), /"sessionDir"/);
 	await writeFile(`${path}.tmp-crash`, "partial");
 	assert.deepEqual(await loadRegistry(path), entries);
 });
 
-test("old registry entries remain compatible", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "pi-registry-old-"));
+test("optional fields can be omitted and round-trip cleanly", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-registry-optional-"));
 	const path = join(dir, "registry.json");
-	const old = entry();
-	delete old.zellijSessionName;
-	delete old.terminalCleanupPending;
-	delete old.terminalCleanupError;
-	await saveRegistry([old], path);
-	assert.deepEqual(await loadRegistry(path), [old]);
+	const minimal: RegistryEntry = {
+		childId: "child",
+		task: "task",
+		cwd: "/tmp",
+		sessionDir: "/tmp/session",
+		requestedModel: "p/m",
+		requestedThinking: "off",
+		processState: "stopped",
+		runState: "idle",
+		createdAt: 1,
+		lastActivityAt: 1,
+		ownerSessionFile: owner.ownerSessionFile,
+		ownerSessionId: owner.ownerSessionId,
+		controllerInstanceId: "controller-a",
+		incarnation: "incarnation-a",
+	};
+	await saveRegistry([minimal], path);
+	assert.deepEqual(await loadRegistry(path), [minimal]);
 });
 
 test("re-listened sockets reject a hello with the wrong stable child identity", () => {

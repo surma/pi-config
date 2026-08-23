@@ -19,8 +19,6 @@ function handle(
 		processState: "alive",
 		runState: "running",
 		runId: 1,
-		tabId: 2,
-		paneId: 3,
 		killing: false,
 		task: `task-${id}\nwith details`,
 		cwd: "/tmp/work",

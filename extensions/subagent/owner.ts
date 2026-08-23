@@ -73,28 +73,6 @@ export function ownerRegistryPath(
 	return join(controllerDir(agentDir, owner), "registry.json");
 }
 
-/** The durable owner-scoped record for the dedicated Zellij session. */
-export function managedSessionPath(
-	agentDir: string,
-	owner: OwnerIdentity,
-): string {
-	return join(controllerDir(agentDir, owner), "managed-session.json");
-}
-
-export function incarnationSocketDir(
-	agentDir: string,
-	owner: OwnerIdentity,
-	childId: string,
-	incarnation: string,
-): string {
-	return join(
-		controllerDir(agentDir, owner),
-		"children",
-		childId,
-		incarnation,
-		"bridge.sock",
-	);
-}
 
 function isLeaseRecord(value: unknown): value is LeaseRecord {
 	if (!value || typeof value !== "object") return false;
