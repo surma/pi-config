@@ -168,6 +168,47 @@ test("failed retry followed by success has no final error", () => {
 	assert.equal(h.handle.processState, "alive");
 });
 
+test("native agent_settled infers an aborted outcome from the final assistant message", () => {
+	const h = harness();
+	const aborted = assistant(1, "partial", "aborted");
+	dispatchSubagentEvent(h.handle, { type: "agent_start" }, h.options);
+	emitMessage(h, aborted);
+	dispatchSubagentEvent(
+		h.handle,
+		{ type: "agent_end", messages: [aborted], willRetry: false },
+		h.options,
+	);
+	assert.equal(
+		dispatchSubagentEvent(h.handle, { type: "agent_settled" }, h.options),
+		true,
+	);
+	assert.equal(h.handle.runOutcome, "aborted");
+	assert.equal(h.handle.processState, "alive");
+	assert.equal(h.settled, 1);
+});
+
+test("explicit abort fence settles native settlement without message_end", () => {
+	const h = harness();
+	assert.equal(
+		dispatchSubagentEvent(h.handle, { type: "agent_start", runId: 1 }, h.options),
+		true,
+	);
+	h.handle.abortRequestedAt = 2;
+	assert.equal(
+		dispatchSubagentEvent(
+			h.handle,
+			{ type: "agent_settled", runId: 1 },
+			h.options,
+		),
+		true,
+	);
+	assert.equal(h.handle.runOutcome, "aborted");
+	assert.equal(h.handle.runState, "idle");
+	assert.equal(h.handle.processState, "alive");
+	assert.equal(h.handle.lastSettledRunId, 1);
+	assert.equal(h.settled, 1);
+});
+
 test("parallel tools correlate and retained identity history is bounded", () => {
 	const h = harness();
 	dispatchSubagentEvent(h.handle, { type: "agent_start", runId: 1 }, h.options);

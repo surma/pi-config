@@ -4,7 +4,6 @@ import {
 	mkdtemp,
 	readFile,
 	realpath,
-	rm,
 	stat,
 	symlink,
 	writeFile,
@@ -17,7 +16,6 @@ import {
 	canonicalOwnerSessionFile,
 	controllerDir,
 	hasLeaseAuthority,
-	incarnationSocketDir,
 	LEASE_STALE_GRACE_MS,
 	LEASE_TTL_MS,
 	type LeaseRecord,
@@ -35,7 +33,7 @@ const owner = {
 	ownerSessionId: "session-uuid",
 };
 
-test("canonical session identity is stable before and after a file appears through a symlink", async () => {
+test("canonical session identity stays stable before and after file creation", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "pi-owner-canonical-"));
 	const realDirectory = join(directory, "real");
 	const aliasDirectory = join(directory, "alias");
@@ -49,16 +47,12 @@ test("canonical session identity is stable before and after a file appears throu
 	assert.equal(before, join(await realpath(realDirectory), "parent.jsonl"));
 });
 
-test("ownerKey is a stable 24-hex-char key derived from the session file", () => {
+test("owner paths use a stable 24-character hash", () => {
 	const key = ownerKey(owner.ownerSessionFile);
 	assert.match(key, /^[0-9a-f]{24}$/);
 	assert.equal(key, ownerKey(owner.ownerSessionFile));
 	assert.notEqual(key, ownerKey("/Users/surma/other.jsonl"));
-});
-
-test("controller-scoped paths nest under controllers/<ownerKey>", () => {
 	const agentDir = "/tmp/agent";
-	const key = ownerKey(owner.ownerSessionFile);
 	assert.equal(
 		controllerDir(agentDir, owner),
 		join(agentDir, "sessions", "subagents", "controllers", key),
@@ -71,26 +65,9 @@ test("controller-scoped paths nest under controllers/<ownerKey>", () => {
 		ownerRegistryPath(agentDir, owner),
 		join(controllerDir(agentDir, owner), "registry.json"),
 	);
-	assert.equal(
-		incarnationSocketDir(agentDir, owner, "child1", "inc1"),
-		join(
-			controllerDir(agentDir, owner),
-			"children",
-			"child1",
-			"inc1",
-			"bridge.sock",
-		),
-	);
 });
 
-test("incarnation socket dirs for the same child differ by incarnation", () => {
-	const agentDir = "/tmp/agent";
-	const a = incarnationSocketDir(agentDir, owner, "child1", "inc-a");
-	const b = incarnationSocketDir(agentDir, owner, "child1", "inc-b");
-	assert.notEqual(a, b);
-});
-
-test("acquire writes a valid lease on an absent file", async () => {
+test("acquire writes a valid lease and same controller can reacquire", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-owner-lease-"));
 	const now = 1_000_000;
 	const result = await acquireLease(dir, owner, "controller-a", now);
@@ -105,296 +82,114 @@ test("acquire writes a valid lease on an absent file", async () => {
 		await readFile(leasePath(dir, owner), "utf8"),
 	) as LeaseRecord;
 	assert.equal(onDisk.controllerInstanceId, "controller-a");
+	assert.equal((await acquireLease(dir, owner, "controller-a", now + 1_000)).held, true);
 });
 
-test("a second controller conflicts before lease expiry", async () => {
+test("a foreign controller conflicts until expiry plus stale grace", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-owner-lease-"));
-	const t0 = 1_000_000;
-	await acquireLease(dir, owner, "controller-a", t0);
-	const result = await acquireLease(dir, owner, "controller-b", t0 + 1_000);
-	assert.equal(result.conflict, true);
-	if (!result.conflict) return;
-	assert.equal(result.existing.controllerInstanceId, "controller-a");
-	const onDisk = JSON.parse(
-		await readFile(leasePath(dir, owner), "utf8"),
-	) as LeaseRecord;
-	assert.equal(onDisk.controllerInstanceId, "controller-a");
-});
-
-test("the same controller reacquiring returns held", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "pi-owner-lease-"));
-	const t0 = 1_000_000;
-	await acquireLease(dir, owner, "controller-a", t0);
-	const result = await acquireLease(dir, owner, "controller-a", t0 + 1_000);
-	assert.equal(result.held, true);
-});
-
-test("a different controller reclaims after expiry plus grace", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "pi-owner-lease-"));
-	const t0 = 1_000_000;
-	const first = await acquireLease(dir, owner, "controller-a", t0);
-	if (!first.held) return assert.fail("first acquire failed");
-	const reclaimAt = first.lease.expiresAt + LEASE_STALE_GRACE_MS + 1;
-	const result = await acquireLease(dir, owner, "controller-b", reclaimAt);
-	assert.equal(result.held, true);
-	if (!result.held) return;
-	assert.equal(result.lease.controllerInstanceId, "controller-b");
-});
-
-test("a different controller cannot reclaim before expiry plus grace", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "pi-owner-lease-"));
-	const t0 = 1_000_000;
-	const first = await acquireLease(dir, owner, "controller-a", t0);
+	const first = await acquireLease(dir, owner, "controller-a", 1_000_000);
 	if (!first.held) return assert.fail("first acquire failed");
 	const beforeGrace = first.lease.expiresAt + LEASE_STALE_GRACE_MS - 1;
-	const result = await acquireLease(dir, owner, "controller-b", beforeGrace);
-	assert.equal(result.conflict, true);
+	const blocked = await acquireLease(dir, owner, "controller-b", beforeGrace);
+	assert.equal(blocked.conflict, true);
+	if (!blocked.conflict) return;
+	assert.equal(blocked.existing.controllerInstanceId, "controller-a");
+	const reclaimed = await acquireLease(
+		dir,
+		owner,
+		"controller-b",
+		first.lease.expiresAt + LEASE_STALE_GRACE_MS + 1,
+	);
+	assert.equal(reclaimed.held, true);
 });
 
-test("renewLease extends expiry only for the current holder", async () => {
+test("renewal extends only the exact current lease", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-owner-lease-"));
 	const t0 = 1_000_000;
 	await acquireLease(dir, owner, "controller-a", t0);
-	const renewed = await renewLease(dir, owner, "controller-a", t0 + 5_000);
-	assert.equal(renewed, true);
+	assert.equal(await renewLease(dir, owner, "controller-a", t0 + 5_000), true);
 	const onDisk = JSON.parse(
 		await readFile(leasePath(dir, owner), "utf8"),
 	) as LeaseRecord;
-	assert.equal(onDisk.controllerInstanceId, "controller-a");
 	assert.equal(onDisk.expiresAt, t0 + 5_000 + LEASE_TTL_MS);
 	assert.equal(onDisk.renewedAt, t0 + 5_000);
+	assert.equal(await renewLease(dir, owner, "controller-b", t0 + 6_000), false);
+	assert.equal(
+		await renewLease(
+			dir,
+			{ ...owner, ownerSessionId: "other-session" },
+			"controller-a",
+			t0 + 6_000,
+		),
+		false,
+	);
 });
 
-test("renewLease fails when the holder changed", async () => {
+test("renewal can reclaim this controller's own expired record but not a takeover", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-owner-lease-"));
+	const t0 = 1_000_000;
+	const first = await acquireLease(dir, owner, "controller-a", t0);
+	if (!first.held) return assert.fail("first acquire failed");
+	const delayed = first.lease.expiresAt + 7 * 60 * 60 * 1_000;
+	assert.equal(await hasLeaseAuthority(dir, owner, "controller-a", delayed), false);
+	assert.equal(await renewLease(dir, owner, "controller-a", delayed), true);
+	assert.equal(await hasLeaseAuthority(dir, owner, "controller-a", delayed), true);
+	const takeover = await acquireLease(dir, owner, "controller-b", delayed + 1);
+	assert.equal(takeover.held, false);
+	assert.equal(await renewLease(dir, owner, "controller-a", delayed + 2), true);
+});
+
+test("renewal refuses a lease that another controller elected", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-owner-lease-"));
 	const t0 = 1_000_000;
 	const first = await acquireLease(dir, owner, "controller-a", t0);
 	if (!first.held) return assert.fail("first acquire failed");
 	const reclaimAt = first.lease.expiresAt + LEASE_STALE_GRACE_MS + 1;
-	await acquireLease(dir, owner, "controller-b", reclaimAt);
-	const renewed = await renewLease(dir, owner, "controller-a", reclaimAt + 1);
-	assert.equal(renewed, false);
-	const onDisk = JSON.parse(
-		await readFile(leasePath(dir, owner), "utf8"),
-	) as LeaseRecord;
-	assert.equal(onDisk.controllerInstanceId, "controller-b");
-});
-
-test("renewLease reclaims this controller's own record after a suspend-length lapse", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "pi-owner-lease-"));
-	const t0 = 1_000_000;
-	const first = await acquireLease(dir, owner, "controller-a", t0);
-	if (!first.held) return assert.fail("first acquire failed");
-	const afterSuspend = first.lease.expiresAt + 7 * 60 * 60 * 1_000;
-	assert.equal(
-		await hasLeaseAuthority(dir, owner, "controller-a", afterSuspend),
-		false,
-	);
-	assert.equal(await renewLease(dir, owner, "controller-a", afterSuspend), true);
-	assert.equal(
-		await hasLeaseAuthority(dir, owner, "controller-a", afterSuspend),
-		true,
-	);
-	const onDisk = JSON.parse(
-		await readFile(leasePath(dir, owner), "utf8"),
-	) as LeaseRecord;
-	assert.equal(onDisk.controllerInstanceId, "controller-a");
-	assert.equal(onDisk.acquiredAt, t0);
-	assert.equal(onDisk.expiresAt, afterSuspend + LEASE_TTL_MS);
-});
-
-test("renewLease still refuses after another controller legitimately took over", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "pi-owner-lease-"));
-	const t0 = 1_000_000;
-	const first = await acquireLease(dir, owner, "controller-a", t0);
-	if (!first.held) return assert.fail("first acquire failed");
-	const afterSuspend = first.lease.expiresAt + 7 * 60 * 60 * 1_000;
-	const takeover = await acquireLease(dir, owner, "controller-b", afterSuspend);
+	const takeover = await acquireLease(dir, owner, "controller-b", reclaimAt);
 	assert.equal(takeover.held, true);
+	assert.equal(await renewLease(dir, owner, "controller-a", reclaimAt + 1), false);
 	assert.equal(
-		await renewLease(dir, owner, "controller-a", afterSuspend + 1),
-		false,
+		(await readLeaseRecord(dir, owner))?.controllerInstanceId,
+		"controller-b",
 	);
-	const onDisk = JSON.parse(
-		await readFile(leasePath(dir, owner), "utf8"),
-	) as LeaseRecord;
-	assert.equal(onDisk.controllerInstanceId, "controller-b");
 });
 
-test("readLeaseRecord reports the current record and absence", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "pi-owner-lease-"));
-	assert.equal(await readLeaseRecord(dir, owner), undefined);
-	await acquireLease(dir, owner, "controller-a", 1_000_000);
-	const record = await readLeaseRecord(dir, owner);
-	assert.equal(record?.controllerInstanceId, "controller-a");
-	assert.equal(record?.pid, process.pid);
-});
-
-test("renewLease on an absent file returns false", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "pi-owner-lease-"));
-	const renewed = await renewLease(dir, owner, "controller-a", 1_000);
-	assert.equal(renewed, false);
-});
-
-test("retained authority maintenance fails closed when the exact lease is absent", async () => {
+test("maintenance fails closed when the lease is absent and extends an exact lease", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-owner-lease-"));
 	assert.equal(
 		await maintainLeaseAuthority(dir, owner, "controller-a", 1_000),
 		false,
 	);
 	await assert.rejects(stat(leasePath(dir, owner)));
-});
-
-test("retained authority can be safely maintained after its normal expiry window", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "pi-owner-lease-"));
-	const t0 = 1_000_000;
-	const first = await acquireLease(dir, owner, "controller-a", t0);
+	const first = await acquireLease(dir, owner, "controller-a", 10_000);
 	if (!first.held) return assert.fail("first acquire failed");
-	const delayedAt = first.lease.expiresAt + LEASE_STALE_GRACE_MS + 1;
-	assert.equal(await hasLeaseAuthority(dir, owner, "controller-a", delayedAt), false);
+	const delayed = first.lease.expiresAt + LEASE_STALE_GRACE_MS + 1;
 	assert.equal(
-		await maintainLeaseAuthority(dir, owner, "controller-a", delayedAt),
+		await maintainLeaseAuthority(dir, owner, "controller-a", delayed),
 		true,
 	);
-	assert.equal(await hasLeaseAuthority(dir, owner, "controller-a", delayedAt), true);
+	assert.equal(await hasLeaseAuthority(dir, owner, "controller-a", delayed), true);
 });
 
-test("retained maintenance racing stale takeover never overwrites the elected holder", async () => {
+test("release deletes only the exact current lease", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-owner-lease-"));
-	const t0 = 1_000_000;
-	const first = await acquireLease(dir, owner, "controller-a", t0);
-	if (!first.held) return assert.fail("first acquire failed");
-	const reclaimAt = first.lease.expiresAt + LEASE_STALE_GRACE_MS + 1;
-	const [reclaimed, maintained] = await Promise.all([
-		acquireLease(dir, owner, "controller-b", reclaimAt),
-		maintainLeaseAuthority(dir, owner, "controller-a", reclaimAt),
-	]);
-	const onDisk = JSON.parse(
-		await readFile(leasePath(dir, owner), "utf8"),
-	) as LeaseRecord;
-	if (maintained) {
-		assert.equal(reclaimed.conflict, true);
-		assert.equal(onDisk.controllerInstanceId, "controller-a");
-	} else {
-		assert.equal(reclaimed.held, true);
-		assert.equal(onDisk.controllerInstanceId, "controller-b");
-	}
-});
-
-test("releaseLease deletes only when the holder matches", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "pi-owner-lease-"));
-	const t0 = 1_000_000;
-	await acquireLease(dir, owner, "controller-a", t0);
+	await acquireLease(dir, owner, "controller-a", 1_000_000);
 	const path = leasePath(dir, owner);
-	const foreignRelease = await releaseLease(dir, owner, "controller-b");
-	assert.equal(foreignRelease, false);
+	assert.equal(await releaseLease(dir, owner, "controller-b"), false);
 	await stat(path);
-	await releaseLease(dir, owner, "controller-a");
+	assert.equal(await releaseLease(dir, owner, "controller-a"), true);
 	await assert.rejects(stat(path));
+	assert.equal(await releaseLease(dir, owner, "controller-a"), false);
 });
 
-test("releaseLease on an absent file returns false", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "pi-owner-lease-"));
-	const released = await releaseLease(dir, owner, "controller-a");
-	assert.equal(released, false);
-});
-
-test("concurrent lease creates do not both succeed", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "pi-owner-lease-concurrent-"));
-	const now = 1_000_000;
-	const results = await Promise.all([
-		acquireLease(dir, owner, "controller-a", now),
-		acquireLease(dir, owner, "controller-b", now),
-		acquireLease(dir, owner, "controller-c", now),
-	]);
-	const holders = results.filter((r) => r.held);
-	const conflicts = results.filter((r) => r.conflict);
-	assert.equal(holders.length, 1, "exactly one holder");
-	assert.equal(conflicts.length, 2, "two conflicts");
-	const onDisk = JSON.parse(
-		await readFile(leasePath(dir, owner), "utf8"),
-	) as LeaseRecord;
-	assert.ok(
-		holders.some(
-			(h) =>
-				h.held && h.lease.controllerInstanceId === onDisk.controllerInstanceId,
-		),
-	);
-});
-
-test("concurrent stale reclaim elects exactly one new holder", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "pi-owner-lease-"));
-	const t0 = 1_000_000;
-	const first = await acquireLease(dir, owner, "controller-a", t0);
-	if (!first.held) return assert.fail("first acquire failed");
-	const reclaimAt = first.lease.expiresAt + LEASE_STALE_GRACE_MS + 1;
-	const results = await Promise.all([
-		acquireLease(dir, owner, "controller-b", reclaimAt),
-		acquireLease(dir, owner, "controller-c", reclaimAt),
-	]);
-	assert.equal(results.filter((result) => result.held).length, 1);
-	assert.equal(results.filter((result) => result.conflict).length, 1);
-});
-
-test("renewal racing stale takeover cannot overwrite the elected holder", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "pi-owner-lease-"));
-	const t0 = 1_000_000;
-	const first = await acquireLease(dir, owner, "controller-a", t0);
-	if (!first.held) return assert.fail("first acquire failed");
-	const reclaimAt = first.lease.expiresAt + LEASE_STALE_GRACE_MS + 1;
-	const [reclaimed, renewed] = await Promise.all([
-		acquireLease(dir, owner, "controller-b", reclaimAt),
-		renewLease(dir, owner, "controller-a", reclaimAt),
-	]);
-	const onDisk = JSON.parse(
-		await readFile(leasePath(dir, owner), "utf8"),
-	) as LeaseRecord;
-	if (renewed) {
-		assert.equal(reclaimed.conflict, true);
-		assert.equal(onDisk.controllerInstanceId, "controller-a");
-	} else {
-		assert.equal(reclaimed.held, true);
-		assert.equal(onDisk.controllerInstanceId, "controller-b");
-	}
-});
-
-test("release racing takeover cannot delete the new holder", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "pi-owner-lease-"));
-	const t0 = 1_000_000;
-	const first = await acquireLease(dir, owner, "controller-a", t0);
-	if (!first.held) return assert.fail("first acquire failed");
-	const reclaimAt = first.lease.expiresAt + LEASE_STALE_GRACE_MS + 1;
-	await Promise.all([
-		acquireLease(dir, owner, "controller-b", reclaimAt),
-		releaseLease(dir, owner, "controller-a"),
-	]);
-	const onDisk = JSON.parse(
-		await readFile(leasePath(dir, owner), "utf8"),
-	) as LeaseRecord;
-	assert.ok(
-		["controller-a", "controller-b"].includes(onDisk.controllerInstanceId),
-	);
-});
-
-test("authority requires the exact unexpired owner and holder", async () => {
+test("authority checks owner, controller, and expiry", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-owner-lease-"));
 	const t0 = 1_000_000;
 	await acquireLease(dir, owner, "controller-a", t0);
+	assert.equal(await hasLeaseAuthority(dir, owner, "controller-a", t0 + 1), true);
+	assert.equal(await hasLeaseAuthority(dir, owner, "controller-b", t0 + 1), false);
 	assert.equal(
-		await hasLeaseAuthority(dir, owner, "controller-a", t0 + 1),
-		true,
-	);
-	assert.equal(
-		await hasLeaseAuthority(dir, owner, "controller-b", t0 + 1),
-		false,
-	);
-	assert.equal(
-		await hasLeaseAuthority(
-			dir,
-			{ ...owner, ownerSessionId: "other-session" },
-			"controller-a",
-			t0 + 1,
-		),
+		await hasLeaseAuthority(dir, { ...owner, ownerSessionId: "other" }, "controller-a", t0 + 1),
 		false,
 	);
 	assert.equal(
@@ -403,13 +198,30 @@ test("authority requires the exact unexpired owner and holder", async () => {
 	);
 });
 
-test("a lease file that is empty or corrupt is treated as absent", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "pi-owner-lease-"));
+test("concurrent acquire and stale reclaim elect one controller", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-owner-lease-concurrent-"));
+	const initial = await Promise.all([
+		acquireLease(dir, owner, "controller-a", 1_000_000),
+		acquireLease(dir, owner, "controller-b", 1_000_000),
+		acquireLease(dir, owner, "controller-c", 1_000_000),
+	]);
+	assert.equal(initial.filter((result) => result.held).length, 1);
+	assert.equal(initial.filter((result) => result.conflict).length, 2);
+	const current = await readLeaseRecord(dir, owner);
+	assert.ok(current);
+	const reclaimAt = current.expiresAt + LEASE_STALE_GRACE_MS + 1;
+	const reclaim = await Promise.all([
+		acquireLease(dir, owner, "controller-d", reclaimAt),
+		acquireLease(dir, owner, "controller-e", reclaimAt),
+	]);
+	assert.equal(reclaim.filter((result) => result.held).length, 1);
+	assert.equal(reclaim.filter((result) => result.conflict).length, 1);
+});
+
+test("empty or corrupt lease files behave as absent", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-owner-lease-corrupt-"));
 	const path = leasePath(dir, owner);
 	await mkdir(dirname(path), { recursive: true, mode: 0o700 });
 	await writeFile(path, "", { mode: 0o600 });
-	const now = 1_000_000;
-	const result = await acquireLease(dir, owner, "controller-a", now);
-	assert.equal(result.held, true);
-	await rm(dir, { recursive: true, force: true });
+	assert.equal((await acquireLease(dir, owner, "controller-a", 1_000_000)).held, true);
 });

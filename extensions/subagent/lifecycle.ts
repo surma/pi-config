@@ -132,7 +132,10 @@ export function recordAssistantEnd(
 		rawError && rawError.length > MAX_RUN_ERROR_LENGTH
 			? `${rawError.slice(0, MAX_RUN_ERROR_LENGTH)}…`
 			: rawError;
-	if (message.stopReason === "error" || error) {
+	if (message.stopReason === "aborted") {
+		run.outcome = "aborted";
+		state.tentativeError = undefined;
+	} else if (message.stopReason === "error" || error) {
 		run.outcome = "failed";
 		run.error = error || "Assistant response failed";
 		state.tentativeError = run.error;
@@ -155,6 +158,16 @@ export function endRun(
 	state.runState = willRetry ? "retrying" : "finishing";
 	state.lifecycle = state.killRequestedAt ? "killing" : state.runState;
 	return true;
+}
+
+/** Explicitly end an interrupted run when native settlement omits message_end. */
+export function abortRun(state: LifecycleState, at: number): boolean {
+	if (isLifecycleTerminal(state)) return false;
+	const run = currentRun(state);
+	if (run?.phase !== "active") return false;
+	run.outcome = "aborted";
+	run.stopReason = "aborted";
+	return endRun(state, at, false);
 }
 
 export function requestKill(state: LifecycleState, at: number): void {
@@ -200,8 +213,13 @@ export function settleRunToIdle(
 	const settled = currentRun(state);
 	if (settled?.phase !== "ended" || settled.id <= state.lastSettledRunId)
 		return undefined;
-	if (outcome) settled.outcome = outcome;
 	if (stopReason) settled.stopReason = stopReason;
+	if (stopReason === "aborted") settled.outcome = "aborted";
+	else if (
+		outcome &&
+		!(settled.outcome === "aborted" && outcome === "succeeded")
+	)
+		settled.outcome = outcome;
 	if (errorMessage) settled.error = errorMessage;
 	state.lastSettledRunId = Math.max(state.lastSettledRunId, settled.id);
 	state.settledAt = at;

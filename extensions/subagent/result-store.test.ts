@@ -7,6 +7,7 @@ import {
 	persistRunResult,
 	readRunResult,
 	runResultPaths,
+	scanRunArtifacts,
 } from "./result-store.ts";
 
 test("each run keeps a unique exact result", async () => {
@@ -117,6 +118,28 @@ test("concurrent writers converge on one immutable complete pair", async () => {
 	const stored = await readRunResult(directory, 4);
 	assert.equal(stored.status, "available");
 	if (stored.status === "available") assert.deepEqual(stored.record, winner);
+});
+
+test("artifact scans reserve numeric directories and identify complete pairs", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "pi-run-results-scan-"));
+	await persistRunResult(directory, {
+		runId: 2,
+		outcome: "succeeded",
+		incarnation: "inc-a",
+		settledAt: 20,
+		result: "published",
+	});
+	const incomplete = runResultPaths(directory, 7);
+	await mkdir(incomplete.directory, { recursive: true });
+	await writeFile(incomplete.resultPath, "partial");
+	const invalid = runResultPaths(directory, 9);
+	await mkdir(invalid.directory, { recursive: true });
+	await writeFile(invalid.resultPath, "result");
+	await writeFile(invalid.metadataPath, "not-json");
+	assert.deepEqual(await scanRunArtifacts(directory), {
+		highestExistingRunId: 9,
+		highestPublishedRunId: 2,
+	});
 });
 
 test("reader distinguishes missing, incomplete, and invalid artifacts", async () => {

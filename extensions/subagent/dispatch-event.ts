@@ -1,4 +1,5 @@
 import {
+	abortRun,
 	corroborateRun,
 	currentRun,
 	endRun,
@@ -46,6 +47,7 @@ export interface SubagentDispatchHandle
 	usage: SubagentUsageStats;
 	stopReason?: string;
 	error?: string;
+	abortRequestedAt?: number;
 	completionSettled: boolean;
 }
 
@@ -174,6 +176,7 @@ export function dispatchSubagentEvent(
 				);
 				return false;
 			}
+			handle.abortRequestedAt = undefined;
 			handle.agentStartedAt ||= at;
 			handle.agentEndedAt = undefined;
 			handle.resultText = "";
@@ -399,11 +402,18 @@ export function dispatchSubagentEvent(
 				record.runOutcome === "aborted"
 					? record.runOutcome
 					: undefined;
+			const stopReason =
+				typeof record.stopReason === "string" ? record.stopReason : undefined;
+			const abortFence =
+				handle.abortRequestedAt !== undefined ||
+				outcome === "aborted" ||
+				stopReason === "aborted";
+			if (current?.phase === "active" && abortFence) abortRun(handle, at);
 			const state = settleRunToIdle(
 				handle,
 				at,
 				outcome,
-				typeof record.stopReason === "string" ? record.stopReason : undefined,
+				stopReason,
 				typeof record.errorMessage === "string"
 					? record.errorMessage
 					: undefined,
@@ -414,6 +424,7 @@ export function dispatchSubagentEvent(
 				);
 				return false;
 			}
+			handle.abortRequestedAt = undefined;
 			handle.error = handle.finalError;
 			const settled = currentRun(handle);
 			if (!settled) return false;
