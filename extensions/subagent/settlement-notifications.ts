@@ -2,9 +2,10 @@ import type { RunOutcome } from "./lifecycle.js";
 
 export type SettledRunOutcome = Exclude<RunOutcome, "pending">;
 
-/** Delay delivery until the settlement callback returns to the RPC host. */
+/** Schedule delivery after the settlement callback returns to the RPC host. */
 export const SETTLEMENT_NOTIFICATION_DELAY_MS = 0;
 const MAX_SEND_RETRIES = 1;
+const MAX_ACCEPTED_KEYS = 4096;
 
 export interface SettlementNotificationRecord {
 	ownerSessionFile: string;
@@ -19,8 +20,10 @@ export interface SettlementNotificationRecord {
 export interface SettlementCustomMessage {
 	customType: "subagent-settlement";
 	content: string;
-	display: true;
-	details: { settlements: SettlementNotificationRecord[] };
+	display: boolean;
+	details: SettlementNotificationRecord & {
+		settlements: SettlementNotificationRecord[];
+	};
 }
 
 function isSettledRunOutcome(value: unknown): value is SettledRunOutcome {
@@ -37,14 +40,11 @@ function isRealSettlement(record: SettlementNotificationRecord): boolean {
 		record.childId.length > 0 &&
 		typeof record.incarnation === "string" &&
 		record.incarnation.length > 0 &&
-		numberIsPositiveSafeInteger(record.runId) &&
+		Number.isSafeInteger(record.runId) &&
+		record.runId > 0 &&
 		record.eventKind === "run_settled" &&
 		isSettledRunOutcome(record.outcome)
 	);
-}
-
-function numberIsPositiveSafeInteger(value: unknown): value is number {
-	return Number.isSafeInteger(value) && Number(value) > 0;
 }
 
 function key(record: SettlementNotificationRecord): string {
@@ -63,7 +63,10 @@ function messageFor(record: SettlementNotificationRecord): SettlementCustomMessa
 		customType: "subagent-settlement",
 		content: `Subagent ${record.childId} reached idle after run ${record.runId}. Check subagent_status with messages=3.`,
 		display: true,
-		details: { settlements: [record] },
+		details: {
+			...record,
+			settlements: [record],
+		},
 	};
 }
 
@@ -71,20 +74,24 @@ function messageFor(record: SettlementNotificationRecord): SettlementCustomMessa
  * Delivers one non-durable wake for each accepted run settlement.
  *
  * The queue accepts only succeeded, failed, and aborted `run_settled` records.
- * It delivers each record in its own steering message. It does not persist
- * records, recover records after process loss, or report idle and process events.
+ * It sends each record in its own steering message and retries one failure.
+ * It does not persist records, recover records after process loss, or report stalls.
  */
 export class SettlementNotificationQueue {
 	private readonly pending = new Map<string, SettlementNotificationRecord>();
 	private readonly attempts = new Map<string, number>();
 	private readonly accepted = new Set<string>();
+	private readonly acceptedOrder: string[] = [];
+	private readonly childSuppressionEpochs = new Map<string, number>();
+	private suppressionEpoch = 0;
 	private timer: NodeJS.Timeout | undefined;
+	private flushing = false;
 
 	constructor(
 		private readonly send: (
 			message: SettlementCustomMessage,
 			options: { triggerTurn: true; deliverAs: "steer" },
-		) => void,
+		) => void | Promise<void>,
 		private readonly eligible: (record: SettlementNotificationRecord) => boolean = () => true,
 	) {}
 
@@ -93,71 +100,103 @@ export class SettlementNotificationQueue {
 		const recordKey = key(record);
 		if (this.accepted.has(recordKey)) return;
 		this.accepted.add(recordKey);
+		this.acceptedOrder.push(recordKey);
+		if (this.acceptedOrder.length > MAX_ACCEPTED_KEYS) {
+			const oldest = this.acceptedOrder.shift();
+			if (oldest) this.accepted.delete(oldest);
+		}
 		this.pending.set(recordKey, record);
 		this.schedule(SETTLEMENT_NOTIFICATION_DELAY_MS);
 	}
 
 	suppressChild(childId: string): void {
+		this.childSuppressionEpochs.set(
+			childId,
+			(this.childSuppressionEpochs.get(childId) ?? 0) + 1,
+		);
 		for (const [recordKey, record] of this.pending) {
 			if (record.childId !== childId) continue;
 			this.pending.delete(recordKey);
 			this.attempts.delete(recordKey);
 		}
-		this.clearEmptyTimer();
 	}
 
 	suppressAll(): void {
+		this.suppressionEpoch++;
 		this.pending.clear();
 		this.attempts.clear();
-		if (this.timer) clearTimeout(this.timer);
-		this.timer = undefined;
+		if (this.timer) {
+			clearTimeout(this.timer);
+			this.timer = undefined;
+		}
 	}
 
 	private schedule(delayMs: number): void {
-		if (this.timer) return;
+		if (this.timer || this.flushing) return;
 		this.timer = setTimeout(() => {
 			this.timer = undefined;
-			this.flush();
+			void this.flush();
 		}, delayMs);
 		this.timer.unref?.();
 	}
 
-	private clearEmptyTimer(): void {
-		if (this.pending.size > 0 || !this.timer) return;
-		clearTimeout(this.timer);
-		this.timer = undefined;
-	}
-
-	private flush(): void {
-		const entries = [...this.pending.entries()];
-		this.pending.clear();
-		for (const [recordKey, record] of entries) {
-			let eligible = false;
-			try {
-				eligible = this.eligible(record);
-			} catch {
-				eligible = false;
-			}
-			if (!eligible) {
-				this.attempts.delete(recordKey);
-				continue;
-			}
-			try {
-				this.send(messageFor(record), {
-					triggerTurn: true,
-					deliverAs: "steer",
-				});
-				this.attempts.delete(recordKey);
-			} catch {
-				const attempts = (this.attempts.get(recordKey) ?? 0) + 1;
-				if (attempts <= MAX_SEND_RETRIES) {
-					this.attempts.set(recordKey, attempts);
-					this.pending.set(recordKey, record);
-				} else {
+	private async flush(): Promise<void> {
+		if (this.flushing) return;
+		this.flushing = true;
+		try {
+			const entries = [...this.pending.entries()];
+			this.pending.clear();
+			const suppressionEpoch = this.suppressionEpoch;
+			const childSuppressionEpochs = new Map(
+				entries.map(([_, record]) => [
+					record.childId,
+					this.childSuppressionEpochs.get(record.childId) ?? 0,
+				]),
+			);
+			for (const [recordKey, record] of entries) {
+				const childSuppressionEpoch =
+					childSuppressionEpochs.get(record.childId) ?? 0;
+				const suppressed = () =>
+					this.suppressionEpoch !== suppressionEpoch ||
+					(this.childSuppressionEpochs.get(record.childId) ?? 0) !==
+						childSuppressionEpoch;
+				if (suppressed()) {
 					this.attempts.delete(recordKey);
+					continue;
+				}
+				let eligible = false;
+				try {
+					eligible = this.eligible(record);
+				} catch {
+					eligible = false;
+				}
+				if (!eligible || suppressed()) {
+					this.attempts.delete(recordKey);
+					continue;
+				}
+				try {
+					await this.send(messageFor(record), {
+						triggerTurn: true,
+						deliverAs: "steer",
+					});
+					this.attempts.delete(recordKey);
+				} catch {
+					if (suppressed()) {
+						this.attempts.delete(recordKey);
+						continue;
+					}
+					const attempts = (this.attempts.get(recordKey) ?? 0) + 1;
+					if (attempts <= MAX_SEND_RETRIES) {
+						this.attempts.set(recordKey, attempts);
+						this.pending.set(recordKey, record);
+					} else {
+						this.attempts.delete(recordKey);
+					}
 				}
 			}
+		} finally {
+			this.flushing = false;
+			if (this.pending.size > 0) this.schedule(SETTLEMENT_NOTIFICATION_DELAY_MS);
 		}
-		if (this.pending.size > 0) this.schedule(SETTLEMENT_NOTIFICATION_DELAY_MS);
 	}
 }

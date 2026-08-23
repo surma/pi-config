@@ -125,9 +125,26 @@ function withTimestamp(
 	return timestamp === undefined ? { role, text } : { role, text, timestamp };
 }
 
+function errorFromEntry(entry: SessionRecord): TranscriptMessage | undefined {
+	if (entry.type !== "error") return undefined;
+	const rawError = entry.error;
+	const text =
+		typeof rawError === "string"
+			? rawError
+			: isRecord(rawError) && typeof rawError.message === "string"
+				? rawError.message
+				: typeof entry.message === "string"
+					? entry.message
+					: "";
+	if (!text) return undefined;
+	return withTimestamp("error", text, timestampFor(entry, {}));
+}
+
 function messageFromEntry(
 	entry: SessionRecord,
 ): { message?: TranscriptMessage; malformed: boolean } {
+	const error = errorFromEntry(entry);
+	if (error) return { message: error, malformed: false };
 	if (entry.type !== "message") return { malformed: false };
 	const rawMessage = entry.message;
 	if (!isRecord(rawMessage) || typeof rawMessage.role !== "string")

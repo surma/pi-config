@@ -13,6 +13,7 @@ import {
 import {
 	type AssistantLiveState,
 	assistantMessageMatchesFinalized,
+	deactivateAssistantMessage,
 	finalizeAssistantMessage,
 	startAssistantMessage,
 	type ToolActivity,
@@ -48,7 +49,6 @@ export interface SubagentDispatchHandle
 	stopReason?: string;
 	error?: string;
 	abortRequestedAt?: number;
-	completionSettled: boolean;
 }
 
 export interface SubagentDispatchOptions {
@@ -165,6 +165,13 @@ export function dispatchSubagentEvent(
 		case "agent_start": {
 			if (isLifecycleTerminal(handle))
 				return ignoreTerminal(options, "agent_start");
+			if (
+				record.runId !== undefined &&
+				(!Number.isSafeInteger(record.runId) || Number(record.runId) < 1)
+			) {
+				options.diagnostic("Ignored malformed agent_start run id.");
+				return false;
+			}
 			const run = startRun(
 				handle,
 				at,
@@ -385,6 +392,13 @@ export function dispatchSubagentEvent(
 		case "agent_settled": {
 			if (isLifecycleTerminal(handle))
 				return ignoreTerminal(options, "agent_settled");
+			if (
+				record.runId !== undefined &&
+				(!Number.isSafeInteger(record.runId) || Number(record.runId) < 1)
+			) {
+				options.diagnostic("Ignored malformed agent_settled run id.");
+				return false;
+			}
 			const current = currentRun(handle);
 			if (
 				typeof record.runId === "number" &&
@@ -425,11 +439,17 @@ export function dispatchSubagentEvent(
 				return false;
 			}
 			handle.abortRequestedAt = undefined;
+			handle.isStreaming = false;
+			handle.activeTools.clear();
+			handle.currentTool = undefined;
+			handle.currentToolStartedAt = undefined;
+			deactivateAssistantMessage(handle);
 			handle.error = handle.finalError;
 			const settled = currentRun(handle);
 			if (!settled) return false;
-			options.update();
+			// Notify the parent before it starts any optional persistence or output work.
 			options.onSettled(settled);
+			options.update();
 			return true;
 		}
 		case "extension_error":

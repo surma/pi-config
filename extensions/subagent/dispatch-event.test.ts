@@ -54,7 +54,6 @@ function createHandle(): SubagentDispatchHandle {
 			cost: 0,
 			turns: 0,
 		},
-		completionSettled: false,
 	};
 }
 function harness() {
@@ -209,6 +208,43 @@ test("explicit abort fence settles native settlement without message_end", () =>
 	assert.equal(h.settled, 1);
 });
 
+test("an abort settlement clears an unfinished assistant before the next run", () => {
+	const h = harness();
+	const first = assistant(1, "partial");
+	assert.equal(
+		dispatchSubagentEvent(h.handle, { type: "agent_start", runId: 1 }, h.options),
+		true,
+	);
+	assert.equal(
+		dispatchSubagentEvent(
+			h.handle,
+			{ type: "message_start", message: { ...first, content: [] } },
+			h.options,
+		),
+		true,
+	);
+	h.handle.abortRequestedAt = 3;
+	assert.equal(
+		dispatchSubagentEvent(h.handle, { type: "agent_settled", runId: 1 }, h.options),
+		true,
+	);
+	assert.equal(h.handle.isStreaming, false);
+	assert.equal(h.handle.assistantMessageActive, false);
+	assert.equal(
+		dispatchSubagentEvent(h.handle, { type: "agent_start", runId: 2 }, h.options),
+		true,
+	);
+	const second = assistant(2, "next");
+	assert.equal(
+		dispatchSubagentEvent(
+			h.handle,
+			{ type: "message_start", message: { ...second, content: [] } },
+			h.options,
+		),
+		true,
+	);
+});
+
 test("parallel tools correlate and retained identity history is bounded", () => {
 	const h = harness();
 	dispatchSubagentEvent(h.handle, { type: "agent_start", runId: 1 }, h.options);
@@ -305,4 +341,41 @@ test("tool updates require an active known tool", () => {
 		false,
 	);
 	assert.match(h.diagnostics.join("\n"), /unknown/);
+});
+
+test("supplied run ids must increase and settlement ids must match the current run", () => {
+	const h = harness();
+	completeRun(h, 5, "first");
+	assert.equal(
+		dispatchSubagentEvent(h.handle, { type: "agent_start", runId: 5 }, h.options),
+		false,
+	);
+	assert.equal(
+		dispatchSubagentEvent(h.handle, { type: "agent_start", runId: 4 }, h.options),
+		false,
+	);
+	assert.equal(
+		dispatchSubagentEvent(h.handle, { type: "agent_start", runId: 0 }, h.options),
+		false,
+	);
+	assert.equal(
+		dispatchSubagentEvent(h.handle, { type: "agent_start", runId: 6 }, h.options),
+		true,
+	);
+	assert.equal(
+		dispatchSubagentEvent(h.handle, { type: "agent_settled", runId: 5 }, h.options),
+		false,
+	);
+	assert.equal(h.handle.runSequence, 6);
+	assert.match(h.diagnostics.join("\n"), /run id|unexpected/);
+});
+
+test("settlement notification runs before the optional update callback", () => {
+	const h = harness();
+	const order: string[] = [];
+	h.options.update = () => order.push("update");
+	h.options.onSettled = () => order.push("settled");
+	completeRun(h, 1, "first");
+	assert.equal(order.at(-2), "settled");
+	assert.equal(order.at(-1), "update");
 });

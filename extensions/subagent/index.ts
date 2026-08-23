@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { accessSync, constants, promises as fs } from "node:fs";
 import { spawn, type ChildProcess } from "node:child_process";
-import { basename, delimiter, dirname, join } from "node:path";
+import { basename, delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
@@ -9,7 +9,6 @@ import {
 	type ExtensionContext,
 	getAgentDir,
 } from "@mariozechner/pi-coding-agent";
-import { Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import {
 	dispatchSubagentEvent,
@@ -20,9 +19,10 @@ import {
 	lifecycleActivity,
 	markStopped,
 	requestKill,
-	resetRunViewForSession,
 	reviveForResume,
+	type RunOutcome,
 	type SessionLifecycle,
+	type SettlementStatus,
 	type SubagentRun,
 } from "./lifecycle.js";
 import { isProcessAlive } from "./lock.js";
@@ -46,12 +46,17 @@ import {
 	saveRegistry,
 } from "./registry.js";
 import {
-	persistRunResult,
-	readRunResult,
-	scanRunArtifacts,
-	type SettledRunOutcome,
-	writeLatestResult,
-} from "./result-store.js";
+	writeCallerOutput,
+	type OutputStatus,
+} from "./output-store.js";
+import {
+	deactivateAssistantMessage,
+} from "./live-state.js";
+import {
+	readTranscript,
+	type TranscriptOptions,
+	type TranscriptStatus,
+} from "./transcript.js";
 import {
 	SettlementNotificationQueue,
 	type SettlementNotificationRecord,
@@ -73,13 +78,13 @@ const childExtensionPath = join(__dirname, "child.ts");
 const STARTUP_TIMEOUT_MS = 10_000;
 const REQUEST_TIMEOUT_MS = 30_000;
 const ABORT_TIMEOUT_MS = 1_000;
-const ABORT_SETTLEMENT_TIMEOUT_MS = 1_000;
 const ASSISTANT_DISPLAY_MAX = 64 * 1024;
 const TOOL_OUTPUT_TAIL_MAX = 16 * 1024;
 const MAX_RECENT_TOOLS = 8;
 const MAX_RETAINED_HANDLES = 24;
 const MAX_DIAGNOSTICS = 20;
-const SUBAGENT_RESULT_PREVIEW_LINES = 5;
+const MAX_DIAGNOSTIC_LENGTH = 2_048;
+const MAX_STDERR_TAIL = 8 * 1024;
 const controllerInstanceKey = Symbol.for("pi.subagent.controllerInstanceId");
 const controllerGlobal = globalThis as typeof globalThis & {
 	[controllerInstanceKey]?: string;
@@ -96,7 +101,6 @@ type ThinkingLevel =
 	| "high"
 	| "xhigh"
 	| "max";
-type ResultKind = "none" | "final" | "partial";
 interface ActualModel {
 	provider: string;
 	id: string;
@@ -117,6 +121,7 @@ interface TaskSpec {
 	model: string;
 	thinking: ThinkingLevel;
 	systemPrompt?: string;
+	outputPath?: string;
 }
 interface AssistantAssembly {
 	message: Record<string, unknown>;
@@ -129,6 +134,7 @@ interface RuntimeChild {
 	consumer?: (record: RpcRecord) => void;
 	closeConsumer?: (close: RpcProcessClose) => void;
 	closed?: RpcProcessClose;
+	diagnostics: string[];
 	handle?: SubagentHandle;
 }
 
@@ -172,6 +178,47 @@ function isThinking(value: unknown): value is ThinkingLevel {
 function truncate(value: string | undefined, max = 240) {
 	const text = (value || "").replace(/\s+/g, " ").trim();
 	return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
+function tail(
+	value: string | undefined,
+	max = MAX_STDERR_TAIL,
+): string | undefined {
+	if (!value) return undefined;
+	return value.length > max ? value.slice(-max) : value;
+}
+
+function isSettlementStatus(value: unknown): value is SettlementStatus {
+	return (
+		value === "pending" ||
+		value === "settled" ||
+		value === "closed_without_settlement"
+	);
+}
+
+function isRunOutcome(value: unknown): value is RunOutcome {
+	return (
+		value === "pending" ||
+		value === "succeeded" ||
+		value === "failed" ||
+		value === "aborted"
+	);
+}
+
+function nonnegativeSafeInteger(value: unknown): number | undefined {
+	return Number.isSafeInteger(value) && Number(value) >= 0
+		? Number(value)
+		: undefined;
+}
+
+function isOutputStatus(value: unknown): value is OutputStatus {
+	return (
+		value === "not_requested" ||
+		value === "pending" ||
+		value === "written" ||
+		value === "collision" ||
+		value === "failed"
+	);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -292,6 +339,10 @@ function detachRuntime(runtime: RuntimeChild): void {
 	runtime.closeConsumer = undefined;
 }
 
+function runtimeMatches(handle: SubagentHandle, runtime: RuntimeChild): boolean {
+	return handle.runtime === runtime && handle.incarnation === runtime.incarnation;
+}
+
 interface SubagentHandle extends SubagentDispatchHandle {
 	id: string;
 	name?: string;
@@ -306,7 +357,7 @@ interface SubagentHandle extends SubagentDispatchHandle {
 	sessionPath?: string;
 	sessionId?: string;
 	pid?: number;
-	exitCode?: number;
+	exitCode?: number | null;
 	exitSignal?: NodeJS.Signals | null;
 	rpcReady: boolean;
 	rpc?: RpcChildTransport;
@@ -315,9 +366,11 @@ interface SubagentHandle extends SubagentDispatchHandle {
 	rpcReadyAt?: number;
 	lastActivityAt: number;
 	completedAt?: number;
-	transcriptPersisted?: boolean;
-	resultPath?: string;
-	settlementPersistenceChain: Promise<void>;
+	outputPath?: string;
+	outputStatus: OutputStatus;
+	outputError?: string;
+	transcriptStatus: TranscriptStatus;
+	outputWriteChain: Promise<void>;
 	stderr: string;
 	diagnostics: string[];
 	waiters: Set<() => void>;
@@ -347,17 +400,25 @@ const TaskSpecSchema = Type.Object(
 		model: Type.String({ minLength: 1 }),
 		thinking: ThinkingSchema,
 		systemPrompt: Type.Optional(Type.String()),
+		outputPath: Type.Optional(
+			Type.String({
+				minLength: 1,
+				description: "Optional caller-owned output path. Relative paths use the caller cwd.",
+			}),
+		),
 	},
 	{ additionalProperties: false },
 );
 const ListSchema = Type.Object({
 	includeFinished: Type.Optional(Type.Boolean({ default: true })),
 });
-const StatusSchema = Type.Object({ id: Type.String() });
-const ResultSchema = Type.Object(
+const StatusSchema = Type.Object(
 	{
-		id: Type.String({ description: "Logical child id." }),
-		runId: Type.Integer({ minimum: 1, description: "Exact settled run id." }),
+		id: Type.String(),
+		messageOffset: Type.Optional(Type.Integer({ minimum: 0, default: 0 })),
+		numMessages: Type.Optional(
+			Type.Integer({ minimum: 0, maximum: 20, default: 3 }),
+		),
 	},
 	{ additionalProperties: false },
 );
@@ -493,7 +554,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	let leaseRenewTimer: NodeJS.Timeout | undefined;
 	let authorityLossPromise: Promise<void> | undefined;
 	let sessionShuttingDown = false;
-	let settlementNotificationEpoch = 0;
 	const settlementNotifications = new SettlementNotificationQueue(
 		(message, options) => pi.sendMessage(message, options),
 		(record) => {
@@ -509,7 +569,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		},
 	);
 	const suppressAllSettlementNotifications = () => {
-		settlementNotificationEpoch++;
 		settlementNotifications.suppressAll();
 	};
 
@@ -558,7 +617,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	}
 
 	const addDiagnostic = (handle: SubagentHandle, message: string) => {
-		handle.diagnostics.push(message.slice(0, 2048));
+		handle.diagnostics.push(message.slice(0, MAX_DIAGNOSTIC_LENGTH));
 		if (handle.diagnostics.length > MAX_DIAGNOSTICS)
 			handle.diagnostics.splice(0, handle.diagnostics.length - MAX_DIAGNOSTICS);
 	};
@@ -572,6 +631,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		cwd: handle.cwd,
 		pid: handle.pid,
 		exitCode: handle.exitCode,
+		exitSignal: handle.exitSignal,
 		sessionDir: handle.sessionDir,
 		sessionFile: handle.sessionPath,
 		promptPath: handle.promptPath,
@@ -580,9 +640,18 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		processState: handle.processState,
 		runState: handle.runState,
 		runId: handle.runSequence || undefined,
+		runCursor: handle.runSequence || undefined,
 		lastSettledRunId: handle.lastSettledRunId || undefined,
+		runOutcome: handle.runOutcome,
+		settlementStatus: handle.settlementStatus,
 		createdAt: handle.createdAt,
 		lastActivityAt: handle.lastActivityAt,
+		error: handle.error || handle.finalError,
+		stderrTail: tail(handle.stderr),
+		diagnostics: handle.diagnostics.length ? [...handle.diagnostics] : undefined,
+		outputPath: handle.outputPath,
+		outputStatus: handle.outputStatus,
+		outputError: handle.outputError,
 		ownerSessionFile: handle.ownerSessionFile,
 		ownerSessionId: handle.ownerSessionId,
 		incarnation: handle.incarnation,
@@ -637,105 +706,62 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	function acceptSettlement(
 		handle: SubagentHandle,
 		runId: number,
-		outcome: SettledRunOutcome,
+		outcome: Exclude<RunOutcome, "pending">,
 		result: string,
 		settledAt: number,
 	): void {
-		const incarnation = handle.incarnation;
-		const fallbackResult = result;
-		const notificationEpoch = settlementNotificationEpoch;
 		const notification: SettlementNotificationRecord = {
 			ownerSessionFile: handle.ownerSessionFile,
 			ownerSessionId: handle.ownerSessionId,
 			childId: handle.id,
-			name: handle.name,
-			incarnation,
+			incarnation: handle.incarnation,
 			runId,
 			eventKind: "run_settled",
 			outcome,
-			childAlive: handle.processState === "alive",
-			preview: truncate(fallbackResult),
 		};
-		handle.settlementPersistenceChain = handle.settlementPersistenceChain.then(
-			async () => {
-				let exact = await readRunResult(handle.sessionDir, runId);
-				try {
-					if (exact.status !== "available") {
-						await persistRunResult(handle.sessionDir, {
-							runId,
-							outcome,
-							incarnation,
-							settledAt,
-							result: fallbackResult,
-						});
-						exact = await readRunResult(handle.sessionDir, runId);
-					}
-				} catch (error) {
-					addDiagnostic(
-						handle,
-						`Run ${runId} result persistence failed: ${String(error)}`,
-					);
-				}
-				if (exact.status === "available") {
-					notification.preview = truncate(exact.record.result);
-					if (
-						handle.incarnation === incarnation &&
-						handle.runSequence === runId &&
-						handle.lastSettledRunId === runId &&
-						handle.runState === "idle"
-					)
-						handle.resultText = exact.record.result;
-					try {
-						handle.resultPath = await writeLatestResult(
-							handle.sessionDir,
-							exact.record.result,
-						);
-					} catch (error) {
-						addDiagnostic(
-							handle,
-							`Latest result persistence failed for run ${runId}: ${String(error)}`,
-						);
-					}
-				}
-				if (
-					notificationEpoch !== settlementNotificationEpoch ||
-					sessionShuttingDown ||
-					!leaseHeld ||
-					handle.killRequestedAt
-				)
-					return;
-				settlementNotifications.queue(notification);
-			},
-		).catch((error) => {
-			addDiagnostic(
-				handle,
-				`Run ${runId} settlement processing failed: ${String(error)}`,
-			);
+
+		// Queue the non-durable wake before any optional persistence or output work.
+		if (!sessionShuttingDown && leaseHeld && !handle.killRequestedAt)
+			settlementNotifications.queue(notification);
+
+		handle.outputStatus = handle.outputPath ? "pending" : "not_requested";
+		handle.outputError = undefined;
+		if (!handle.outputPath) return;
+
+		const outputPath = handle.outputPath;
+		const outputContent = result;
+		const write = handle.outputWriteChain.then(async () => {
+			const written = await writeCallerOutput({
+				path: outputPath,
+				content: outputContent,
+			});
+			handle.outputStatus = written.status;
+			if (written.status === "failed") {
+				handle.outputError = written.error;
+				addDiagnostic(
+					handle,
+					`Run ${runId} caller output failed: ${written.error}`,
+				);
+			} else {
+				handle.outputError = undefined;
+			}
+			update(handle);
 		});
+		handle.outputWriteChain = write.catch((error) => {
+			handle.outputStatus = "failed";
+			handle.outputError = error instanceof Error ? error.message : String(error);
+			addDiagnostic(handle, `Run ${runId} caller output failed: ${handle.outputError}`);
+			update(handle);
+		});
+		void handle.outputWriteChain;
 	}
 
-	async function transcriptStatus(handle: SubagentHandle) {
-		if (!handle.sessionPath)
-			return { persisted: false, note: "no persisted transcript yet" };
-		const persisted = await fs
-			.stat(handle.sessionPath)
-			.then((stat) => stat.isFile())
-			.catch(() => false);
-		handle.transcriptPersisted = persisted;
-		return {
-			persisted,
-			note: persisted
-				? "persisted transcript available"
-				: "no persisted transcript yet",
-		};
-	}
-	function resultKind(handle: SubagentHandle): ResultKind {
-		if (!handle.resultText) return "none";
-		return handle.runOutcome === "succeeded" ? "final" : "partial";
-	}
-	async function serialize(handle: SubagentHandle) {
-		await handle.settlementPersistenceChain;
-		const transcript = await transcriptStatus(handle);
+	async function serialize(
+		handle: SubagentHandle,
+		transcriptOptions: TranscriptOptions = {},
+	) {
+		const transcript = await readTranscript(handle.sessionPath, transcriptOptions);
+		handle.transcriptStatus = transcript.status;
 		const actualModel =
 			handle.actualModel ||
 			(() => {
@@ -746,13 +772,31 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		return {
 			id: handle.id,
 			name: handle.name,
+			ownerSessionFile: handle.ownerSessionFile,
+			ownerSessionId: handle.ownerSessionId,
+			incarnation: handle.incarnation,
 			state: handle.state,
 			lifecycle: handle.lifecycle,
 			processState: handle.processState,
 			runState: handle.runState,
 			runId: handle.runSequence || undefined,
 			lastSettledRunId: handle.lastSettledRunId || undefined,
-			runOutcome: handle.runOutcome,
+			runOutcome: handle.runOutcome || "pending",
+			sessionPath: handle.sessionPath || "",
+			lastActivityAt: handle.lastActivityAt,
+			settlement: { status: handle.settlementStatus },
+			transcript: {
+				status: transcript.status,
+				messages: transcript.messages,
+				nextMessageOffset: transcript.nextMessageOffset,
+			},
+			error: handle.error || handle.finalError || undefined,
+			stderrTail: tail(handle.stderr),
+			output: {
+				path: handle.outputPath,
+				status: handle.outputStatus,
+				...(handle.outputError ? { error: handle.outputError } : {}),
+			},
 			task: handle.task,
 			cwd: handle.cwd,
 			sessionDir: handle.sessionDir,
@@ -764,16 +808,10 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			requestedThinking: handle.requestedThinking,
 			actualModel,
 			actualThinking: handle.actualThinking || handle.requestedThinking,
-			sessionPath: handle.sessionPath || "",
 			promptPath: handle.promptPath,
-			resultPath: handle.resultPath,
-			resultKind: resultKind(handle),
-			transcriptPersisted: transcript.persisted,
-			transcriptNote: transcript.note,
 			createdAt: handle.createdAt,
 			rpcReadyAt: handle.rpcReadyAt,
 			agentStartedAt: handle.agentStartedAt,
-			lastActivityAt: handle.lastActivityAt,
 			completedAt: handle.completedAt,
 			currentTool: handle.currentTool,
 			currentToolStartedAt: handle.currentToolStartedAt,
@@ -781,11 +819,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			isStreaming: handle.isStreaming,
 			usage: { ...handle.usage },
 			stopReason: handle.stopReason,
-			error: handle.error || handle.finalError,
-			stderrPreview: truncate(handle.stderr, 2_048) || undefined,
-			resultPreview: handle.resultText
-				? truncate(handle.resultText)
-				: undefined,
 			currentAssistantText: handle.currentAssistantText || undefined,
 			latestAssistantText: handle.latestAssistantText || undefined,
 			activeTools: [...handle.activeTools.values()].map((tool) => ({
@@ -803,7 +836,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	async function summary(handle: SubagentHandle) {
 		const serial = await serialize(handle);
 		return sanitizeTerminalText(
-			`#${handle.id}${handle.name ? ` ${handle.name}` : ""} ${handle.processState}/${handle.runState} · run:${handle.runSequence || 0}\n  actual ${formatModel(serial.actualModel)} · thinking:${serial.actualThinking}\n  process ${handle.pid ?? "?"}${handle.exitCode !== undefined ? ` · exit ${handle.exitCode}` : ""}${handle.rpcReady ? " · RPC ready" : ""}\n  session ${serial.sessionPath} (${serial.transcriptNote})${serial.error ? `\n  error ${truncate(serial.error, 180)}` : ""}`,
+			`#${handle.id}${handle.name ? ` ${handle.name}` : ""} ${handle.processState}/${handle.runState} · run:${handle.runSequence || 0}\n  actual ${formatModel(serial.actualModel)} · thinking:${serial.actualThinking}\n  process ${handle.pid ?? "?"}${handle.exitCode !== undefined ? ` · exit ${handle.exitCode}` : ""}${handle.rpcReady ? " · RPC ready" : ""}\n  session ${serial.sessionPath} (transcript ${serial.transcript.status})${serial.error ? `\n  error ${truncate(serial.error, 180)}` : ""}`,
 		);
 	}
 
@@ -823,6 +856,33 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		},
 	): SubagentHandle {
 		const stopped = entry.processState === "stopped";
+		const runSequence = Math.max(
+			nonnegativeSafeInteger(entry.runCursor) ??
+				nonnegativeSafeInteger(entry.runId) ??
+				0,
+			nonnegativeSafeInteger(entry.lastSettledRunId) ?? 0,
+		);
+		const lastSettledRunId = Math.min(
+			runSequence,
+			nonnegativeSafeInteger(entry.lastSettledRunId) ?? 0,
+		);
+		const outputPath =
+			typeof entry.outputPath === "string" && entry.outputPath.length > 0
+				? entry.outputPath
+				: undefined;
+		const outputStatus = outputPath
+			? isOutputStatus(entry.outputStatus) && entry.outputStatus !== "not_requested"
+				? entry.outputStatus
+				: "pending"
+			: "not_requested";
+		const runOutcome = isRunOutcome(entry.runOutcome)
+			? entry.runOutcome
+			: "pending";
+		const restoredState = stopped
+			? runOutcome === "failed" || entry.error
+				? "error"
+				: "done"
+			: "starting";
 		return {
 			...createLifecycleState(),
 			id: entry.childId,
@@ -840,13 +900,18 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			sessionPath: entry.sessionFile,
 			pid: entry.pid,
 			exitCode: entry.exitCode,
+			exitSignal: entry.exitSignal,
 			processState: stopped ? "stopped" : "alive",
 			runState: entry.runState || "idle",
-			runSequence: entry.runId || 0,
-			lastSettledRunId: entry.lastSettledRunId || 0,
-			state: stopped ? "done" : "starting",
+			runSequence,
+			lastSettledRunId,
+			runOutcome,
+			settlementStatus: isSettlementStatus(entry.settlementStatus)
+				? entry.settlementStatus
+				: "pending",
+			state: restoredState,
 			lifecycle: stopped
-				? "done"
+				? restoredState
 				: ((entry.runState || "idle") as SessionLifecycle),
 			resultText: "",
 			currentAssistantText: "",
@@ -859,13 +924,25 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			knownToolCallIds: [],
 			isStreaming: false,
 			usage: createUsage(),
-			completionSettled: false,
 			createdAt: entry.createdAt,
 			lastActivityAt: entry.lastActivityAt,
-			stderr: "",
-			diagnostics: [],
+			outputPath,
+			outputStatus,
+			outputError: entry.outputError,
+			transcriptStatus: "missing",
+			outputWriteChain: Promise.resolve(),
+			stderr: typeof entry.stderrTail === "string" ? tail(entry.stderrTail) || "" : "",
+			error: entry.error,
+			finalError:
+				entry.error && (stopped || runOutcome === "failed")
+					? entry.error
+					: undefined,
+			diagnostics: Array.isArray(entry.diagnostics)
+				? entry.diagnostics
+						.filter((item): item is string => typeof item === "string")
+						.slice(-MAX_DIAGNOSTICS)
+				: [],
 			waiters: new Set(),
-			settlementPersistenceChain: Promise.resolve(),
 			processCloseHandled: stopped,
 			rpcReady: false,
 			ownerSessionFile: entry.ownerSessionFile,
@@ -902,13 +979,30 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		};
 	}
 
-	function handleProcessClose(handle: SubagentHandle, close: RpcProcessClose): void {
+	function handleProcessClose(
+		handle: SubagentHandle,
+		close: RpcProcessClose,
+		runtime?: RuntimeChild,
+	): void {
+		if (runtime && !runtimeMatches(handle, runtime)) return;
 		if (handle.processCloseHandled) return;
 		handle.processCloseHandled = true;
 		handle.rpcReady = false;
-		handle.exitCode = close.code === null ? undefined : close.code;
+		handle.isStreaming = false;
+		handle.activeTools.clear();
+		handle.currentTool = undefined;
+		handle.currentToolStartedAt = undefined;
+		deactivateAssistantMessage(handle);
+		handle.assistantAssembly = undefined;
+		handle.exitCode = close.code;
 		handle.exitSignal = close.signal;
-		if (handle.rpc) handle.stderr = handle.rpc.stderr;
+		handle.stderr = (runtime?.transport || handle.rpc)?.stderr || handle.stderr;
+		addDiagnostic(
+			handle,
+			`RPC child process closed (code=${close.code ?? "null"} signal=${close.signal ?? "none"}).`,
+		);
+		if (close.error)
+			addDiagnostic(handle, `RPC child process close error: ${close.error.message}`);
 		if (handle.processState !== "stopped") {
 			markStopped(handle, now(), {
 				code: close.code,
@@ -920,7 +1014,12 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		update(handle);
 	}
 
-	function handleRpcRecord(handle: SubagentHandle, record: RpcRecord): void {
+	function handleRpcRecord(
+		handle: SubagentHandle,
+		runtime: RuntimeChild,
+		record: RpcRecord,
+	): void {
+		if (!runtimeMatches(handle, runtime)) return;
 		if (handle.processState === "stopped") {
 			addDiagnostic(handle, `Ignored RPC event ${String(record.type)} after process close.`);
 			return;
@@ -936,7 +1035,9 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			return;
 		}
 		if (record.type === "agent_start") handle.assistantAssembly = undefined;
-		dispatchSubagentEvent(handle, record, dispatchOptions(handle));
+		const accepted = dispatchSubagentEvent(handle, record, dispatchOptions(handle));
+		if (record.type === "agent_settled" && accepted)
+			handle.assistantAssembly = undefined;
 	}
 
 	function bindRuntime(handle: SubagentHandle, runtime: RuntimeChild): void {
@@ -946,10 +1047,12 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		handle.pid = runtime.transport.process.pid;
 		handle.rpcReady = !runtime.transport.isClosed;
 		if (handle.rpcReady) handle.rpcReadyAt ||= now();
+		for (const diagnostic of runtime.diagnostics.splice(0))
+			addDiagnostic(handle, diagnostic);
 		attachRuntime(
 			runtime,
-			(record) => handleRpcRecord(handle, record),
-			(close) => handleProcessClose(handle, close),
+			(record) => handleRpcRecord(handle, runtime, record),
+			(close) => handleProcessClose(handle, close, runtime),
 		);
 	}
 
@@ -967,23 +1070,29 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		} catch (error) {
 			throw new Error(`Could not start RPC child: ${error instanceof Error ? error.message : String(error)}`);
 		}
-		const runtime = {} as RuntimeChild;
+		const runtime = {
+			id: handle.id,
+			incarnation: handle.incarnation,
+			queuedRecords: [],
+			diagnostics: [],
+		} as RuntimeChild;
 		const transport = new RpcChildTransport(child, {
 			onRecord: (record) => {
 				if (runtime.consumer) runtime.consumer(record);
 				else runtime.queuedRecords.push(record);
 			},
-			onDiagnostic: (message) => addDiagnostic(handle, message),
+			onDiagnostic: (message) => {
+				if (runtime.handle && runtimeMatches(runtime.handle, runtime))
+					addDiagnostic(runtime.handle, message);
+				else if (!runtime.handle) runtime.diagnostics.push(message);
+			},
 			onClose: (close) => {
 				runtime.closed = close;
 				if (runtime.closeConsumer) runtime.closeConsumer(close);
 			},
 			requestTimeoutMs: REQUEST_TIMEOUT_MS,
 		});
-		runtime.id = handle.id;
-		runtime.incarnation = handle.incarnation;
 		runtime.transport = transport;
-		runtime.queuedRecords = [];
 		runtimeChildren.set(handle.id, runtime);
 		bindRuntime(handle, runtime);
 		return new Promise((resolve, reject) => {
@@ -1094,7 +1203,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				});
 			}
 			handle.completedAt ||= now();
-			await handle.settlementPersistenceChain;
 			await persistenceChain;
 			return handle;
 		})();
@@ -1140,27 +1248,16 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			throw new Error(`Subagent #${handle.id} is no longer running.`);
 		if (!(await requireCurrentAuthority()))
 			throw new Error(await leaseConflictMessage());
-		const isIdle = () => handle.runState === "idle";
-		if (isIdle()) return true;
-		const cursor = handle.lastSettledRunId;
+		if (handle.runState === "idle") return true;
 		handle.abortRequestedAt = now();
 		try {
 			await sendRpc(handle, { type: "abort" }, ABORT_TIMEOUT_MS);
+			return true;
 		} catch (error) {
 			handle.abortRequestedAt = undefined;
 			addDiagnostic(handle, `RPC abort failed: ${String(error)}`);
 			return false;
 		}
-		const deadline = now() + ABORT_SETTLEMENT_TIMEOUT_MS;
-		while (
-			handle.processState === "alive" &&
-			handle.lastSettledRunId <= cursor &&
-			!isIdle() &&
-			now() < deadline
-		) {
-			await new Promise((resolve) => setTimeout(resolve, 20));
-		}
-		return handle.lastSettledRunId > cursor || isIdle();
 	}
 
 	async function launch(
@@ -1168,6 +1265,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		cwd: string,
 		requestedModel: string,
 		requestedThinking: ThinkingLevel,
+		outputPath?: string,
 	): Promise<SubagentHandle> {
 		if (!(await requireCurrentAuthority()))
 			throw new Error(await leaseConflictMessage());
@@ -1190,6 +1288,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			sessionDir,
 			requestedModel,
 			requestedThinking,
+			outputPath,
 			processState: "alive",
 			runState: "idle",
 			createdAt: now(),
@@ -1259,12 +1358,9 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			.catch(() => false);
 		if (!usable)
 			throw new Error(`No usable child session file exists for #${handle.id}; resume is not possible.`);
-		const artifacts = await scanRunArtifacts(handle.sessionDir);
 		const runIdBase = Math.max(
 			handle.runSequence,
 			handle.lastSettledRunId,
-			artifacts.highestExistingRunId,
-			artifacts.highestPublishedRunId,
 		);
 		handle.runSequence = runIdBase;
 		const oldIncarnation = handle.incarnation;
@@ -1283,6 +1379,11 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		handle.processCloseHandled = false;
 		handle.exitCode = undefined;
 		handle.exitSignal = undefined;
+		handle.isStreaming = false;
+		handle.activeTools.clear();
+		handle.currentTool = undefined;
+		handle.currentToolStartedAt = undefined;
+		deactivateAssistantMessage(handle);
 		handle.assistantAssembly = undefined;
 		try {
 			const invocation = buildRpcChildInvocation({
@@ -1395,11 +1496,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			const retained = runtime?.handle;
 			const handle = existing || retained || createHandle(entry);
 			if (!existing) handles.set(handle.id, handle);
-			if (
-				runtime &&
-				runtime.incarnation === handle.incarnation &&
-				!runtime.transport.isClosed
-			) {
+			if (runtime && runtime.incarnation === handle.incarnation) {
 				bindRuntime(handle, runtime);
 			} else if (handle.processState === "alive") {
 				markStopped(handle, now(), {
@@ -1425,23 +1522,24 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			processState: handle.processState,
 			runState: handle.runState,
 			runId: handle.runSequence || undefined,
+			runOutcome: handle.runOutcome || "pending",
+			settlementStatus: handle.settlementStatus,
 			rpcReady: handle.rpcReady,
 			killing: handle.lifecycle === "killing",
 			task: handle.task,
 			cwd: handle.cwd,
 			pid: handle.pid,
 			exitCode: handle.exitCode,
+			exitSignal: handle.exitSignal,
 			requestedModel: handle.requestedModel,
 			requestedThinking: handle.requestedThinking,
 			actualModel,
 			actualThinking: handle.actualThinking || handle.requestedThinking,
 			sessionPath: handle.sessionPath || "",
 			promptPath: handle.promptPath,
-			resultPath: handle.resultPath,
-			resultKind: resultKind(handle),
-			transcriptNote: handle.transcriptPersisted
-				? "persisted transcript available"
-				: "no persisted transcript yet",
+			outputPath: handle.outputPath,
+			outputStatus: handle.outputStatus,
+			transcriptStatus: handle.transcriptStatus,
 			createdAt: handle.createdAt,
 			rpcReadyAt: handle.rpcReadyAt,
 			agentStartedAt: handle.agentStartedAt,
@@ -1454,11 +1552,10 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			usage: { ...handle.usage },
 			stopReason: handle.stopReason,
 			error: handle.error || handle.finalError,
-			stderrPreview: truncate(handle.stderr, 2_048) || undefined,
+			stderrTail: tail(handle.stderr),
 			tentativeError: handle.tentativeError,
 			finalError: handle.finalError,
 			settledAt: handle.settledAt,
-			resultPreview: truncate(handle.resultText),
 			currentAssistantText: handle.currentAssistantText,
 			latestAssistantText: handle.latestAssistantText,
 			activeTools: [...handle.activeTools.values()].map((tool) => ({ ...tool })),
@@ -1569,13 +1666,17 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		return releaseLease(getAgentDir(), owner, controllerInstanceId);
 	}
 
+	async function waitForOutputWrites(): Promise<void> {
+		await Promise.all([...handles.values()].map((handle) => handle.outputWriteChain));
+	}
+
 	async function stopAllChildren(): Promise<void> {
 		await Promise.allSettled(
 			sorted()
 				.filter(active)
 				.map((handle) => terminate(handle, false)),
 		);
-		await Promise.all([...handles.values()].map((handle) => handle.settlementPersistenceChain));
+		await waitForOutputWrites();
 		await persistenceChain;
 	}
 
@@ -1601,10 +1702,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				handle.runtime.handle = handle;
 				detachRuntime(handle.runtime);
 			}
-			await Promise.all([
-				persistenceChain,
-				...([...handles.values()].map((handle) => handle.settlementPersistenceChain)),
-			]);
+			await waitForOutputWrites();
+			await persistenceChain;
 			if (ctx.mode === "tui") ctx.ui.setWidget("subagent", undefined);
 			latestCtx = null;
 			return;
@@ -1627,14 +1726,14 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	pi.on("before_agent_start", async (event) => ({
 		systemPrompt:
 			event.systemPrompt +
-			`\n\nSubagent extension is available. Use it only for explicit delegation. subagent_start requires an explicit provider/model and thinking level; use list_models when needed instead of guessing. Children are persistent Pi child processes controlled through RPC. Start a child, then continue other work or end the current turn. Settlement notifications arrive automatically while children remain alive. These notifications start a follow-up turn. Rely on these notifications for completion. Do not poll subagent_status or use sleep commands to wait for completion. Use subagent_result with the child ID and run ID from the notification for exact settled output. Use subagent_status only for live diagnostics, never as a completion check. Use subagent_follow_up for another turn, subagent_steer during a run, subagent_interrupt to abort a run while keeping the child alive, and subagent_kill only to terminate.`,
+			`\n\nSubagent extension is available. Use it only for explicit delegation. subagent_start requires an explicit provider/model and thinking level; use list_models when needed instead of guessing. Children are persistent Pi RPC processes. Native agent_end is intermediate. Native agent_settled is the only run completion edge, and the child remains alive and idle after settlement. Prompt, follow-up, steer, and abort responses confirm acceptance or queueing only. The start command observes run acceptance for at most one second and does not wait for the model response. Settlement wakes are best effort, non-durable steering messages for success, failure, and abort. Do not poll subagent_status or use sleep commands to wait for completion. Use subagent_status for bounded run diagnosis, transcript pages, output status, process-close evidence, and stale or missing evidence. Transcript pages read bounded JSONL projections with available, missing, incomplete, or unreadable status, and transcript text never proves completion. A process close before agent_settled is terminal closed_without_settlement evidence with exit code, signal, stderr, and diagnostics, and it never emits a settlement wake. Set outputPath when the caller needs one atomic, non-overwriting output file; output status is independent of run outcome. The owner lease, incarnation, and durable run cursor survive reload and resume, and stale runtime callbacks are ignored. A cooperative abort is acknowledged when accepted; agent_settled with outcome aborted is the completion edge. There is no watchdog. Use subagent_follow_up for another turn, subagent_steer during a run, subagent_interrupt to abort while keeping the child alive, and subagent_kill for bounded termination.`,
 	}));
 
 	pi.registerTool<typeof TaskSpecSchema, unknown>({
 		name: "subagent_start",
 		label: "Subagent Start",
 		description:
-			"Start a persistent Pi RPC child process with an explicit model and thinking level. Settlement notifications start a follow-up turn when the child finishes. Rely on these notifications. Do not poll subagent_status or use sleep commands to wait for completion. Call subagent_kill when the child is no longer useful.",
+			"Start a persistent Pi RPC child with an explicit model and thinking level. The response confirms acceptance only. Use outputPath for optional caller-owned atomic output. A best-effort settlement wake reports success, failure, or abort. Diagnose runs with subagent_status instead of polling for completion. Call subagent_kill when the child is no longer useful.",
 		parameters: TaskSpecSchema,
 		async execute(_id, params, _signal, _update, ctx) {
 			latestCtx = ctx;
@@ -1661,11 +1760,17 @@ export default function subagentExtension(pi: ExtensionAPI) {
 					details: {},
 				};
 			try {
+				const callerCwd = ctx.cwd;
+				const childCwd = spec.cwd ? resolve(callerCwd, spec.cwd) : callerCwd;
+				const outputPath = spec.outputPath
+					? resolve(callerCwd, spec.outputPath)
+					: undefined;
 				const handle = await launch(
 					spec,
-					spec.cwd || ctx.cwd,
+					childCwd,
 					choice.model,
 					choice.thinking,
+					outputPath,
 				);
 				return {
 					content: [
@@ -1707,7 +1812,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 							: "No subagents tracked yet.",
 					},
 				],
-				details: { handles: await Promise.all(chosen.map(serialize)) },
+				details: { handles: await Promise.all(chosen.map((handle) => serialize(handle))) },
 			};
 		},
 	});
@@ -1715,7 +1820,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		name: "subagent_status",
 		label: "Subagent Status",
 		description:
-			"Return process/run lifecycle, live RPC activity, and artifacts. Use this tool only for live diagnostics. Do not poll this tool for completion.",
+			"Return bounded process/run diagnostics, settlement evidence, transcript text, and caller output status. Use this tool for diagnosis only. Do not infer completion from polling, silence, transcript text, or output files.",
 		parameters: StatusSchema,
 		async execute(_id, params) {
 			const handle = handles.get(params.id);
@@ -1724,7 +1829,10 @@ export default function subagentExtension(pi: ExtensionAPI) {
 					content: [{ type: "text" as const, text: `Unknown subagent id: ${params.id}` }],
 					details: {},
 				};
-			const serial = await serialize(handle);
+			const serial = await serialize(handle, {
+				messageOffset: params.messageOffset,
+				numMessages: params.numMessages,
+			});
 			return {
 				content: [{ type: "text" as const, text: await summary(handle) }],
 				details: {
@@ -1745,87 +1853,10 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			};
 		},
 	});
-	pi.registerTool<typeof ResultSchema, unknown>({
-		name: "subagent_result",
-		label: "Subagent Result",
-		description:
-			"Return the exact persisted output and outcome for one child run. This retrieval is idempotent and never falls back to another run.",
-		parameters: ResultSchema,
-		renderResult(result, options, theme) {
-			const text = result.content
-				.filter((item) => item.type === "text")
-				.map((item) => item.text)
-				.join("\n");
-			const lines = text.split("\n");
-			const visibleText =
-				options.expanded || lines.length <= SUBAGENT_RESULT_PREVIEW_LINES
-					? text
-					: `${lines.slice(0, SUBAGENT_RESULT_PREVIEW_LINES).join("\n")}\n${theme.fg("dim", "...")}`;
-			return new Text(visibleText, 0, 0);
-		},
-		async execute(_id, params) {
-			const handle = handles.get(params.id);
-			if (!handle)
-				return {
-					content: [{ type: "text" as const, text: `Unknown subagent id: ${params.id}` }],
-					details: {
-						status: "unknown_child",
-						reason: "unknown_child",
-						available: false,
-						childId: params.id,
-						runId: params.runId,
-					},
-				};
-			await handle.settlementPersistenceChain;
-			const exact = await readRunResult(handle.sessionDir, params.runId);
-			if (exact.status === "available")
-				return {
-					content: [{ type: "text" as const, text: exact.record.result }],
-					details: {
-						status: "available",
-						reason: exact.reason,
-						available: true,
-						childId: handle.id,
-						...exact.record,
-					},
-				};
-			if (
-				params.runId === handle.runSequence &&
-				handle.processState === "alive" &&
-				handle.runState !== "idle"
-			)
-				return {
-					content: [{ type: "text" as const, text: `Subagent #${handle.id} run ${params.runId} is active.` }],
-					details: {
-						status: "pending",
-						reason: "run_active",
-						available: false,
-						childId: handle.id,
-						runId: params.runId,
-					},
-				};
-			const reason =
-				exact.status === "missing" && params.runId > handle.runSequence
-					? "run_not_known"
-					: exact.reason;
-			return {
-				content: [{ type: "text" as const, text: exact.message }],
-				details: {
-					status: exact.status,
-					reason,
-					available: false,
-					childId: handle.id,
-					runId: params.runId,
-					resultPath: exact.resultPath,
-					metadataPath: exact.metadataPath,
-				},
-			};
-		},
-	});
 	pi.registerTool<typeof MessageSchema, unknown>({
 		name: "subagent_steer",
 		label: "Subagent Steer",
-		description: "Deliver guidance during a running child turn over RPC.",
+		description: "Accept or queue guidance during a child turn over RPC. The response does not mean completion.",
 		parameters: MessageSchema,
 		async execute(_id, params) {
 			const handle = handles.get(params.id);
@@ -1857,7 +1888,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	pi.registerTool<typeof MessageSchema, unknown>({
 		name: "subagent_follow_up",
 		label: "Subagent Follow Up",
-		description: "Send another user turn to a live persistent child over RPC.",
+		description: "Accept or queue another user turn for a live persistent child. The response does not mean completion.",
 		parameters: MessageSchema,
 		async execute(_id, params) {
 			const handle = handles.get(params.id);
@@ -1889,7 +1920,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	pi.registerTool<typeof IdSchema, unknown>({
 		name: "subagent_interrupt",
 		label: "Subagent Interrupt",
-		description: "Cooperatively abort the current run while keeping the child process alive.",
+		description: "Accept a cooperative abort while keeping the child process alive. Native settlement reports the eventual aborted outcome.",
 		parameters: IdSchema,
 		async execute(_id, params) {
 			const handle = handles.get(params.id);
@@ -1905,11 +1936,16 @@ export default function subagentExtension(pi: ExtensionAPI) {
 						{
 							type: "text" as const,
 							text: interrupted
-								? `Interrupted #${handle.id}; child remains alive.`
-								: `Abort sent to #${handle.id}, but settlement acknowledgement timed out.`,
+								? `Abort accepted by #${handle.id}; the child remains alive until native settlement.`
+								: `Abort was not accepted by #${handle.id}.`,
 						},
 					],
-					details: { handle: await serialize(handle), interrupted },
+					details: {
+						handle: await serialize(handle),
+						interrupted,
+						accepted: interrupted,
+						settlementPending: interrupted && handle.runState !== "idle",
+					},
 				};
 			} catch (error) {
 				return { content: [{ type: "text" as const, text: String(error) }], details: { interrupted: false } };

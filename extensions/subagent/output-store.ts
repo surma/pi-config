@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
-import { promises as fs, type FileHandle } from "node:fs";
+import { promises as fs } from "node:fs";
+import type { FileHandle } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 export interface CallerOutputRequest {
@@ -9,11 +10,14 @@ export interface CallerOutputRequest {
 	content: string;
 }
 
-export type OutputWriteStatus =
+export type OutputStatus =
 	| "not_requested"
+	| "pending"
 	| "written"
 	| "collision"
 	| "failed";
+
+export type OutputWriteStatus = Exclude<OutputStatus, "pending">;
 
 export type OutputWriteResult =
 	| { status: "not_requested" }

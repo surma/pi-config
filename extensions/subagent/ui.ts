@@ -31,21 +31,24 @@ export interface InspectorHandle {
 	processState: "alive" | "stopped";
 	runState: "idle" | "running" | "retrying" | "finishing";
 	runId?: number;
+	runOutcome: "pending" | "succeeded" | "failed" | "aborted";
+	settlementStatus: "pending" | "settled" | "closed_without_settlement";
 	rpcReady?: boolean;
 	killing: boolean;
 	task: string;
 	cwd: string;
 	pid?: number;
-	exitCode?: number;
+	exitCode?: number | null;
+	exitSignal?: NodeJS.Signals | null;
 	requestedModel: string;
 	requestedThinking: string;
 	actualModel: { provider: string; id: string; name?: string };
 	actualThinking: string;
 	sessionPath: string;
 	promptPath: string;
-	resultPath?: string;
-	resultKind: "none" | "final" | "partial";
-	transcriptNote: string;
+	outputPath?: string;
+	outputStatus: "not_requested" | "pending" | "written" | "collision" | "failed";
+	transcriptStatus: "available" | "missing" | "incomplete" | "unreadable";
 	createdAt: number;
 	rpcReadyAt?: number;
 	agentStartedAt?: number;
@@ -68,8 +71,7 @@ export interface InspectorHandle {
 	tentativeError?: string;
 	finalError?: string;
 	settledAt?: number;
-	stderrPreview?: string;
-	resultPreview?: string;
+	stderrTail?: string;
 	currentAssistantText?: string;
 	latestAssistantText?: string;
 	activeTools: InspectorToolActivity[];
@@ -586,7 +588,7 @@ export class SubagentInspector implements Focusable {
 		this.pushField(
 			lines,
 			"Process",
-			`${handle.processState} · PID ${handle.pid ?? "-"} · exit ${handle.exitCode ?? "-"}`,
+			`${handle.processState} · PID ${handle.pid ?? "-"} · exit ${handle.exitCode ?? "-"}${handle.exitSignal ? ` · signal ${handle.exitSignal}` : ""}`,
 			width,
 		);
 		this.pushField(
@@ -596,12 +598,8 @@ export class SubagentInspector implements Focusable {
 			width,
 		);
 		this.pushHeading(lines, "OUTCOME", width, true);
-		this.pushField(
-			lines,
-			"Response",
-			handle.resultKind === "none" ? "none captured" : handle.resultKind,
-			width,
-		);
+		this.pushField(lines, "Settlement", handle.settlementStatus, width);
+		this.pushField(lines, "Run outcome", handle.runOutcome || "pending", width);
 		this.pushField(lines, "Stop reason", handle.stopReason || "(none)", width);
 		if (handle.finalError || handle.error)
 			this.pushField(
@@ -611,14 +609,15 @@ export class SubagentInspector implements Focusable {
 				width,
 				"error",
 			);
-		if (handle.stderrPreview)
-			this.pushField(lines, "Stderr", handle.stderrPreview, width, "warning");
+		if (handle.stderrTail)
+			this.pushField(lines, "Stderr tail", handle.stderrTail, width, "warning");
 
 		this.pushHeading(lines, "ARTIFACTS", width, true);
 		this.pushField(lines, "Session", handle.sessionPath, width);
-		this.pushField(lines, "Transcript", handle.transcriptNote, width);
+		this.pushField(lines, "Transcript", handle.transcriptStatus, width);
 		this.pushField(lines, "Prompt", handle.promptPath, width);
-		this.pushField(lines, "Result", handle.resultPath || "(none)", width);
+		this.pushField(lines, "Output", handle.outputPath || "(not requested)", width);
+		this.pushField(lines, "Output status", handle.outputStatus, width);
 		if (width >= 80) this.pushField(lines, "Cwd", handle.cwd, width);
 		return lines;
 	}
@@ -674,7 +673,7 @@ export class SubagentInspector implements Focusable {
 		for (const tool of handle.recentTools.slice(-4))
 			this.pushTool(lines, tool, width, false);
 		const body = this.transcriptContent || [
-			handle.transcriptNote,
+			`Transcript: ${handle.transcriptStatus}`,
 			"Loading persisted transcript history…",
 		];
 		if (handle.activeTools.length > 0 || handle.recentTools.length > 0)

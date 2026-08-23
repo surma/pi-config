@@ -77,6 +77,7 @@ test("projection keeps user text, assistant text, and normalized errors only", (
 		line(message("user", [{ type: "image", data: "ignored", mimeType: "image/png" }])),
 		line(message("assistant", [], { timestamp: 103, stopReason: "error", errorMessage: "quota" })),
 		line(message("assistant", [{ type: "text", text: "partial" }], { errorMessage: "failed" })),
+		line({ type: "error", timestamp: 104, error: { message: "provider disconnected" } }),
 	].join("");
 
 	const result = parseTranscript(content, { numMessages: 20 });
@@ -90,8 +91,9 @@ test("projection keeps user text, assistant text, and normalized errors only", (
 			text: "failed",
 			timestamp: Date.parse("2026-01-01T00:00:00.000Z"),
 		},
+		{ role: "error", text: "provider disconnected", timestamp: 104 },
 	] satisfies TranscriptMessage[]);
-	assert.equal(result.nextMessageOffset, 4);
+	assert.equal(result.nextMessageOffset, 5);
 });
 
 test("offsets count filtered messages and remain stable when lines append", () => {

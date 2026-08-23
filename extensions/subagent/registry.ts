@@ -1,7 +1,12 @@
 import { promises as fs } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import type { RunState } from "./lifecycle.js";
+import type {
+	RunOutcome,
+	RunState,
+	SettlementStatus,
+} from "./lifecycle.js";
+import type { OutputStatus } from "./output-store.js";
 import type { OwnerIdentity } from "./owner.js";
 
 export interface RegistryEntry {
@@ -10,7 +15,8 @@ export interface RegistryEntry {
 	task: string;
 	cwd: string;
 	pid?: number;
-	exitCode?: number;
+	exitCode?: number | null;
+	exitSignal?: NodeJS.Signals | null;
 	sessionDir: string;
 	sessionFile?: string;
 	promptPath?: string;
@@ -19,9 +25,18 @@ export interface RegistryEntry {
 	processState: "alive" | "stopped";
 	runState: RunState;
 	runId?: number;
+	runCursor?: number;
 	lastSettledRunId?: number;
+	runOutcome?: RunOutcome;
+	settlementStatus?: SettlementStatus;
 	createdAt: number;
 	lastActivityAt: number;
+	error?: string;
+	stderrTail?: string;
+	diagnostics?: string[];
+	outputPath?: string;
+	outputStatus?: OutputStatus;
+	outputError?: string;
 	ownerSessionFile: string;
 	ownerSessionId: string;
 	incarnation: string;

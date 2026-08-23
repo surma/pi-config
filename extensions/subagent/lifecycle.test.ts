@@ -25,6 +25,7 @@ test("agent settlement is non-terminal idle and a second run can start", () => {
 	assert.equal(settleRunToIdle(state, 3), "done");
 	assert.equal(state.processState, "alive");
 	assert.equal(state.runState, "idle");
+	assert.equal(state.settlementStatus, "settled");
 	assert.equal(isLifecycleTerminal(state), false);
 	assert.equal(state.lastSettledRunId, 1);
 	assert.equal(startRun(state, 4)?.id, 2);
@@ -119,6 +120,7 @@ test("resume revival clears the kill fence and preserves monotonic cursors", () 
 	assert.equal(state.runSequence, 2);
 	assert.equal(state.lastSettledRunId, 2);
 	assert.equal(state.settledAt, undefined);
+	assert.equal(state.settlementStatus, "pending");
 	assert.equal(startRun(state, 6, 3)?.id, 3);
 	assert.equal(state.lifecycle, "running");
 });
@@ -130,8 +132,37 @@ test("markStopped is the terminal transition", () => {
 	assert.equal(state.processState, "stopped");
 	assert.equal(isLifecycleTerminal(state), true);
 	assert.equal(state.state, "error");
+	assert.equal(state.settlementStatus, "closed_without_settlement");
 	assert.match(state.finalError || "", /code 7/);
 	assert.equal(startRun(state, 3), undefined);
+});
+
+test("an initial close keeps settlement status pending", () => {
+	const state = createLifecycleState();
+	markStopped(state, 1, { code: 0, signal: null });
+	assert.equal(state.settlementStatus, "pending");
+});
+
+test("durable run cursors classify an unavailable active run as unsettled", () => {
+	const state = createLifecycleState();
+	state.runSequence = 2;
+	state.lastSettledRunId = 1;
+	state.runOutcome = "pending";
+	markStopped(state, 3, { code: null, signal: "SIGTERM" });
+	assert.equal(state.settlementStatus, "closed_without_settlement");
+	assert.match(state.finalError || "", /before agent_settled/);
+});
+
+test("a close after a durable settlement keeps the completed outcome", () => {
+	const state = createLifecycleState();
+	state.runSequence = 1;
+	state.lastSettledRunId = 1;
+	state.runOutcome = "succeeded";
+	state.settlementStatus = "settled";
+	markStopped(state, 2, { code: 0, signal: null, error: "transport closed" });
+	assert.equal(state.settlementStatus, "settled");
+	assert.equal(state.state, "done");
+	assert.equal(state.lifecycle, "done");
 });
 
 test("kill and close fallback stop exactly once", () => {

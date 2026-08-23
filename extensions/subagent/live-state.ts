@@ -190,6 +190,16 @@ export function assistantMessageMatchesFinalized(
 	);
 }
 
+/** Mark an assistant stream as finished when native settlement omits message_end. */
+export function deactivateAssistantMessage(state: AssistantLiveState): void {
+	state.assistantMessageActive = false;
+	state.assistantMessageKey = undefined;
+	state.assistantMessageFallbackKey = undefined;
+	state.assistantMessageResponseId = undefined;
+	state.assistantMessageTimestamp = undefined;
+	state.assistantTextTruncated = false;
+}
+
 export function startAssistantMessage(
 	state: AssistantLiveState,
 	message: Record<string, unknown> | undefined,
