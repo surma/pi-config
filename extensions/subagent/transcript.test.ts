@@ -119,6 +119,29 @@ test("offsets count filtered messages and remain stable when lines append", () =
 	assert.equal(second.nextMessageOffset, 3);
 });
 
+test("an offset beyond the current end stays unchanged until appends catch up", () => {
+	const initial = line(message("user", "first"));
+	const requestedOffset = 5;
+	const beforeAppend = parseTranscript(initial, {
+		messageOffset: requestedOffset,
+		numMessages: 3,
+	});
+	assert.deepEqual(beforeAppend.messages, []);
+	assert.equal(beforeAppend.nextMessageOffset, requestedOffset);
+
+	const appended = `${initial}${Array.from({ length: 5 }, (_, index) =>
+		line(message("user", `appended-${index}`)),
+	).join("")}`;
+	const afterAppend = parseTranscript(appended, {
+		messageOffset: beforeAppend.nextMessageOffset,
+		numMessages: 3,
+	});
+	assert.deepEqual(afterAppend.messages.map(({ role, text }) => ({ role, text })), [
+		{ role: "user", text: "appended-4" },
+	]);
+	assert.equal(afterAppend.nextMessageOffset, 6);
+});
+
 test("a final record without LF remains incomplete and never appears", () => {
 	const complete = line({ type: "session", id: "session" }) + line(message("user", "complete"));
 	const finalRecord = JSON.stringify(message("assistant", [
@@ -134,6 +157,34 @@ test("a final record without LF remains incomplete and never appears", () => {
 		},
 	]);
 	assert.equal(result.nextMessageOffset, 1);
+});
+
+test("an incomplete trailing record becomes visible when its LF arrives", () => {
+	const prefix = line(message("user", "saved"));
+	const trailing = JSON.stringify(message("assistant", [
+		{ type: "text", text: "finished later" },
+	]));
+	const incomplete = parseTranscript(`${prefix}${trailing}`, {
+		messageOffset: 1,
+		numMessages: 3,
+	});
+	assert.equal(incomplete.status, "incomplete");
+	assert.deepEqual(incomplete.messages, []);
+	assert.equal(incomplete.nextMessageOffset, 1);
+
+	const complete = parseTranscript(`${prefix}${trailing}\n`, {
+		messageOffset: incomplete.nextMessageOffset,
+		numMessages: 3,
+	});
+	assert.equal(complete.status, "available");
+	assert.deepEqual(complete.messages, [
+		{
+			role: "assistant",
+			text: "finished later",
+			timestamp: Date.parse("2026-01-01T00:00:00.000Z"),
+		},
+	]);
+	assert.equal(complete.nextMessageOffset, 2);
 });
 
 test("LF framing accepts CRLF but does not treat CR as a record separator", () => {

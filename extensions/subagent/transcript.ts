@@ -167,7 +167,7 @@ function page(
 	status: TranscriptStatus,
 	options: { messageOffset: number; numMessages: number },
 ): TranscriptResult {
-	const start = Math.min(options.messageOffset, candidates.length);
+	const start = options.messageOffset;
 	const messages: TranscriptMessage[] = [];
 	let totalText = 0;
 	let nextMessageOffset = start;
