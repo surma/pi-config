@@ -18,6 +18,10 @@ export type ProcessState = "alive" | "stopped";
 export type RunState = "idle" | "running" | "retrying" | "finishing";
 export type RunPhase = "active" | "ended";
 export type RunOutcome = "pending" | "succeeded" | "failed" | "aborted";
+export type SettlementStatus =
+	| "pending"
+	| "settled"
+	| "closed_without_settlement";
 
 export interface SubagentRun {
 	id: number;
@@ -41,6 +45,7 @@ export interface LifecycleState {
 	lastSettledRunId: number;
 	runs: SubagentRun[];
 	runOutcome?: RunOutcome;
+	settlementStatus: SettlementStatus;
 	tentativeError?: string;
 	finalError?: string;
 	settledAt?: number;
@@ -59,6 +64,7 @@ export function createLifecycleState(): LifecycleState {
 		runSequence: 0,
 		lastSettledRunId: 0,
 		runs: [],
+		settlementStatus: "pending",
 	};
 }
 
@@ -81,10 +87,14 @@ export function startRun(
 ): SubagentRun | undefined {
 	if (isLifecycleTerminal(state) || currentRun(state)?.phase === "active")
 		return undefined;
-	const id =
-		suppliedRunId && suppliedRunId > state.runSequence
-			? suppliedRunId
-			: state.runSequence + 1;
+	if (
+		suppliedRunId !== undefined &&
+		(!Number.isSafeInteger(suppliedRunId) ||
+			suppliedRunId < 1 ||
+			suppliedRunId <= state.runSequence)
+	)
+		return undefined;
+	const id = suppliedRunId ?? state.runSequence + 1;
 	state.runSequence = id;
 	const run: SubagentRun = {
 		id,
@@ -100,6 +110,7 @@ export function startRun(
 	state.runState = "running";
 	state.lifecycle = state.killRequestedAt ? "killing" : "running";
 	state.runOutcome = "pending";
+	state.settlementStatus = "pending";
 	state.tentativeError = undefined;
 	state.finalError = undefined;
 	return run;
@@ -160,13 +171,22 @@ export function endRun(
 	return true;
 }
 
-/** Explicitly end an interrupted run when native settlement omits message_end. */
+/** Fence an interrupted run, including one that native agent_end already ended. */
 export function abortRun(state: LifecycleState, at: number): boolean {
 	if (isLifecycleTerminal(state)) return false;
 	const run = currentRun(state);
+	if (run?.phase === "ended") {
+		run.outcome = "aborted";
+		run.stopReason = "aborted";
+		run.error = undefined;
+		state.tentativeError = undefined;
+		return true;
+	}
 	if (run?.phase !== "active") return false;
 	run.outcome = "aborted";
 	run.stopReason = "aborted";
+	run.error = undefined;
+	state.tentativeError = undefined;
 	return endRun(state, at, false);
 }
 
@@ -181,6 +201,7 @@ export function reviveForResume(state: LifecycleState): void {
 	state.processState = "alive";
 	state.killRequestedAt = undefined;
 	state.settledAt = undefined;
+	state.settlementStatus = "pending";
 	resetRunViewForSession(state);
 }
 
@@ -223,6 +244,7 @@ export function settleRunToIdle(
 	if (errorMessage) settled.error = errorMessage;
 	state.lastSettledRunId = Math.max(state.lastSettledRunId, settled.id);
 	state.settledAt = at;
+	state.settlementStatus = "settled";
 	state.runState = "idle";
 	state.lifecycle = "idle";
 	state.tentativeError = undefined;
@@ -259,6 +281,12 @@ export function markStopped(
 	},
 ): SubagentState {
 	if (isLifecycleTerminal(state)) return state.state;
+	const last = currentRun(state);
+	const closedWithoutSettlement =
+		state.runSequence > state.lastSettledRunId ||
+		(last !== undefined && last.id > state.lastSettledRunId);
+	if (closedWithoutSettlement)
+		state.settlementStatus = "closed_without_settlement";
 	state.processState = "stopped";
 	state.settledAt = at;
 	state.runState = "idle";
@@ -269,13 +297,16 @@ export function markStopped(
 		state.finalError = state.finalError || "Killed";
 		return state.state;
 	}
-	const last = currentRun(state);
-	if (last && last.id <= state.lastSettledRunId) {
-		state.state = last.outcome === "failed" ? "error" : "done";
+	const settledOutcome = last?.outcome || state.runOutcome;
+	if (
+		(last && last.id <= state.lastSettledRunId) ||
+		(!last && state.settlementStatus === "settled")
+	) {
+		state.state = settledOutcome === "failed" ? "error" : "done";
 		state.lifecycle = state.state;
 		state.finalError =
-			last.outcome === "failed"
-				? last.error || "Assistant response failed"
+			settledOutcome === "failed"
+				? last?.error || state.finalError || "Assistant response failed"
 				: undefined;
 		return state.state;
 	}

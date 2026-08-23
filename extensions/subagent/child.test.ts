@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { isValidChildLeaseRecord } from "./child.ts";
+import childSubagentExtension, { isValidChildLeaseRecord } from "./child.ts";
 
 const identity = {
 	ownerSessionFile: "/tmp/parent.jsonl",
@@ -16,6 +16,22 @@ function record(expiresAt: number): Record<string, unknown> {
 		expiresAt,
 	};
 }
+
+test("child extension leaves native run settlement with the RPC host", () => {
+	const registered: string[] = [];
+	childSubagentExtension({
+		on(name: string) {
+			registered.push(name);
+			return undefined;
+		},
+	} as never);
+	assert.deepEqual(registered, [
+		"session_start",
+		"session_shutdown",
+		"agent_start",
+		"before_agent_start",
+	]);
+});
 
 test("child lease validation requires exact identity and an unexpired finite expiry", () => {
 	assert.equal(isValidChildLeaseRecord(record(1_001), identity, 1_000), true);

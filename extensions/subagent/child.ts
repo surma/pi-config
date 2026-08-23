@@ -1,16 +1,9 @@
 import * as fs from "node:fs/promises";
 import { dirname } from "node:path";
-import type {
-	ExtensionAPI,
-	ExtensionContext,
-} from "@mariozechner/pi-coding-agent";
-import { persistRunResult } from "./result-store.js";
+import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
-const childId = process.env.PI_SUBAGENT_CHILD_ID || "unknown-child";
-const incarnation = process.env.PI_SUBAGENT_INCARNATION || "unknown-incarnation";
 const delegatedPrompt = process.env.PI_SUBAGENT_SYSTEM_PROMPT || "";
 const promptPath = process.env.PI_SUBAGENT_PROMPT_PATH;
-const sessionDir = process.env.PI_SUBAGENT_SESSION_DIR;
 const leaseFilePath = process.env.PI_SUBAGENT_LEASE_PATH;
 const leaseOwnerSessionFile = process.env.PI_SUBAGENT_OWNER_SESSION_FILE;
 const leaseOwnerSessionId = process.env.PI_SUBAGENT_OWNER_SESSION_ID;
@@ -111,18 +104,6 @@ function startLeaseMonitor(): void {
 	leaseMonitorTimer = timer;
 }
 
-function textFromContent(content: unknown): string {
-	if (typeof content === "string") return content;
-	if (!Array.isArray(content)) return "";
-	return content
-		.map((part) => {
-			if (!isRecord(part) || part.type !== "text") return "";
-			return typeof part.text === "string" ? part.text : "";
-		})
-		.filter(Boolean)
-		.join("\n");
-}
-
 async function captureEffectivePrompt(prompt: string): Promise<void> {
 	if (!promptPath) return;
 	try {
@@ -153,15 +134,7 @@ function delegatedSystemPrompt(systemPrompt: string): string {
 }
 
 export default function childSubagentExtension(pi: ExtensionAPI) {
-	let context: ExtensionContext | undefined;
-	let runId =
-		Number.parseInt(process.env.PI_SUBAGENT_RUN_ID_BASE || "0", 10) || 0;
-	let resultText = "";
-	let stopReason: string | undefined;
-	let errorMessage: string | undefined;
-
 	pi.on("session_start", async (_event, ctx) => {
-		context = ctx;
 		startLeaseMonitor();
 		await captureEffectivePrompt(ctx.getSystemPrompt());
 	});
@@ -170,74 +143,13 @@ export default function childSubagentExtension(pi: ExtensionAPI) {
 		stopLeaseMonitor();
 	});
 
+	pi.on("agent_start", async (_event, ctx) => {
+		await captureEffectivePrompt(ctx.getSystemPrompt());
+	});
+
 	pi.on("before_agent_start", async (event) => {
 		const systemPrompt = delegatedSystemPrompt(event.systemPrompt);
 		await captureEffectivePrompt(systemPrompt);
 		return { systemPrompt };
-	});
-
-	pi.on("agent_start", async (_event, ctx) => {
-		context = ctx;
-		runId++;
-		resultText = "";
-		stopReason = undefined;
-		errorMessage = undefined;
-		await captureEffectivePrompt(ctx.getSystemPrompt());
-	});
-
-	pi.on("message_end", async (event) => {
-		const message = event.message as unknown as Record<string, unknown>;
-		if (message.role !== "assistant") return;
-		resultText = textFromContent(message.content);
-		if (typeof message.stopReason === "string") stopReason = message.stopReason;
-		if (typeof message.errorMessage === "string")
-			errorMessage = message.errorMessage;
-	});
-
-	pi.on("agent_end", async (event) => {
-		const details = event as unknown as Record<string, unknown>;
-		const messages = details.messages;
-		if (!Array.isArray(messages)) return;
-		for (let index = messages.length - 1; index >= 0; index--) {
-			const message = messages[index];
-			if (!isRecord(message) || message.role !== "assistant") continue;
-			resultText = textFromContent(message.content);
-			if (typeof message.stopReason === "string") stopReason = message.stopReason;
-			if (typeof message.errorMessage === "string")
-				errorMessage = message.errorMessage;
-			break;
-		}
-	});
-
-	pi.on("agent_settled", async (event) => {
-		const details = event as unknown as Record<string, unknown>;
-		const reportedOutcome = details.runOutcome;
-		const outcome =
-			reportedOutcome === "succeeded" ||
-			reportedOutcome === "failed" ||
-			reportedOutcome === "aborted"
-				? reportedOutcome
-				: stopReason === "aborted"
-					? "aborted"
-					: errorMessage || stopReason === "error"
-						? "failed"
-						: "succeeded";
-		if (sessionDir && runId > 0) {
-			try {
-				await persistRunResult(sessionDir, {
-					runId,
-					outcome,
-					incarnation,
-					settledAt: Date.now(),
-					result: resultText,
-				});
-			} catch (error) {
-				process.stderr.write(
-					`Failed to persist exact result for child ${childId} run ${runId}: ${error instanceof Error ? error.message : String(error)}\n`,
-				);
-			}
-		}
-		// The RPC host owns the process lifetime. Settlement must not shut it down.
-		void context;
 	});
 }

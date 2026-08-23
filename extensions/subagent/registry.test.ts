@@ -80,3 +80,20 @@ test("registry loader ignores non-entry top-level values", async () => {
 	const loaded = await loadRegistry(path);
 	assert.deepEqual(loaded, [entry()]);
 });
+
+test("registry loader rejects malformed owner-matching entries before reconciliation", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-registry-malformed-"));
+	const path = join(dir, "registry.json");
+	await writeFile(
+		path,
+		JSON.stringify([
+			entry({ cwd: undefined as unknown as string }),
+			entry({ processState: "unknown" as never }),
+			entry({ runState: "unknown" as never }),
+			entry({ createdAt: Number.NaN }),
+			entry({ ownerSessionId: undefined as unknown as string }),
+			entry(),
+		]),
+	);
+	assert.deepEqual(await loadRegistry(path), [entry()]);
+});

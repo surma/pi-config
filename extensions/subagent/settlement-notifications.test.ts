@@ -18,61 +18,75 @@ function record(
 		ownerSessionFile: "/tmp/owner.jsonl",
 		ownerSessionId: "owner-session",
 		childId,
-		name: `name-${childId}`,
 		incarnation: `inc-${childId}`,
 		runId,
 		eventKind: "run_settled",
 		outcome,
-		childAlive: true,
-		preview: `preview ${childId}/${runId}`,
 	};
 }
 
-test("one accepted settlement sends one steering notification", async () => {
+test("one accepted settlement sends one exact steering wake", async () => {
 	const sent: { message: SettlementCustomMessage; options: unknown }[] = [];
 	const queue = new SettlementNotificationQueue(
-		(message, options) => sent.push({ message, options }),
+		(message, options) => {
+			sent.push({ message, options });
+		},
 		() => true,
 	);
 	const settlement = record("a", 1);
 	queue.queue(settlement);
 	queue.queue(settlement);
-	await delay(75);
+	await delay(25);
 	assert.equal(sent.length, 1);
 	assert.deepEqual(sent[0]?.options, {
 		triggerTurn: true,
 		deliverAs: "steer",
 	});
+	assert.equal(
+		sent[0]?.message.content,
+		"Subagent a reached idle after run 1. Check subagent_status with messages=3.",
+	);
 	assert.deepEqual(sent[0]?.message.details.settlements, [settlement]);
-	assert.match(sent[0]?.message.content || "", /subagent_result/);
 });
 
-test("nearby child settlements form one batch with accurate outcomes", async () => {
-	const sent: SettlementCustomMessage[] = [];
+test("nearby settlements each send one wake with complete details", async () => {
+	const sent: { message: SettlementCustomMessage; options: unknown }[] = [];
 	const queue = new SettlementNotificationQueue(
-		(message) => sent.push(message),
+		(message, options) => {
+			sent.push({ message, options });
+		},
 		() => true,
 	);
 	queue.queue(record("a", 1, "failed"));
 	queue.queue(record("b", 1, "aborted"));
 	queue.queue(record("a", 2, "succeeded"));
-	await delay(75);
-	assert.equal(sent.length, 1);
+	await delay(25);
+	assert.equal(sent.length, 3);
 	assert.deepEqual(
-		sent[0]?.details.settlements.map((item) => [
-			item.childId,
-			item.runId,
-			item.outcome,
+		sent.map(({ message }) => [
+			message.content,
+			message.details.settlements[0],
 		]),
 		[
-			["a", 1, "failed"],
-			["b", 1, "aborted"],
-			["a", 2, "succeeded"],
+			[
+				"Subagent a reached idle after run 1. Check subagent_status with messages=3.",
+				record("a", 1, "failed"),
+			],
+			[
+				"Subagent b reached idle after run 1. Check subagent_status with messages=3.",
+				record("b", 1, "aborted"),
+			],
+			[
+				"Subagent a reached idle after run 2. Check subagent_status with messages=3.",
+				record("a", 2, "succeeded"),
+			],
 		],
 	);
+	for (const { options } of sent)
+		assert.deepEqual(options, { triggerTurn: true, deliverAs: "steer" });
 });
 
-test("a synchronous send failure retries once without losing deduplication", async () => {
+test("a synchronous send failure retries once without throwing or duplicating", async () => {
 	const sent: SettlementCustomMessage[] = [];
 	let attempts = 0;
 	const queue = new SettlementNotificationQueue(
@@ -83,42 +97,109 @@ test("a synchronous send failure retries once without losing deduplication", asy
 		},
 		() => true,
 	);
-	let failedAttempts = 0;
-	const failingQueue = new SettlementNotificationQueue(
+	const settlement = record("retry", 1);
+	queue.queue(settlement);
+	await delay(50);
+	assert.equal(attempts, 2);
+	assert.equal(sent.length, 1);
+	queue.queue(settlement);
+	await delay(25);
+	assert.equal(attempts, 2);
+	assert.deepEqual(sent[0]?.details.settlements, [settlement]);
+});
+
+test("child suppression cancels a retry after an asynchronous send failure", async () => {
+	let attempts = 0;
+	let started!: () => void;
+	let rejectSend!: (error: Error) => void;
+	const sendStarted = new Promise<void>((resolve) => {
+		started = resolve;
+	});
+	const queue = new SettlementNotificationQueue(
 		() => {
-			failedAttempts++;
+			attempts++;
+			if (attempts !== 1) return;
+			started();
+			return new Promise<void>((_resolve, reject) => {
+				rejectSend = reject;
+			});
+		},
+		() => true,
+	);
+	queue.queue(record("async-race", 1));
+	await sendStarted;
+	queue.suppressChild("async-race");
+	rejectSend(new Error("send failed"));
+	await delay(25);
+	assert.equal(attempts, 1);
+});
+
+test("global suppression cancels records that await behind an in-flight send", async () => {
+	let attempts = 0;
+	let started!: () => void;
+	let release!: () => void;
+	const sendStarted = new Promise<void>((resolve) => {
+		started = resolve;
+	});
+	const send = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const queue = new SettlementNotificationQueue(
+		() => {
+			attempts++;
+			if (attempts === 1) {
+				started();
+				return send;
+			}
+		},
+		() => true,
+	);
+	queue.queue(record("global-first", 1));
+	queue.queue(record("global-second", 1));
+	await sendStarted;
+	queue.suppressAll();
+	release();
+	await delay(25);
+	assert.equal(attempts, 1);
+});
+
+test("persistent send failure is bounded and duplicate records stay suppressed", async () => {
+	let attempts = 0;
+	const queue = new SettlementNotificationQueue(
+		() => {
+			attempts++;
 			throw new Error("persistent send failure");
 		},
 		() => true,
 	);
-	const settlement = record("retry", 1);
+	const settlement = record("drop", 1);
 	queue.queue(settlement);
-	failingQueue.queue(record("drop-after-retry", 1));
-	await delay(125);
+	await delay(50);
 	assert.equal(attempts, 2);
-	assert.equal(failedAttempts, 2);
-	assert.equal(sent.length, 1);
-	assert.deepEqual(sent[0]?.details.settlements, [settlement]);
 	queue.queue(settlement);
-	await delay(75);
+	await delay(25);
 	assert.equal(attempts, 2);
-	assert.equal(failedAttempts, 2);
 });
 
-test("shutdown, lease loss, and explicit kill suppress pending records", async () => {
+test("invalid events, ineligible records, and suppressed records never wake the owner", async () => {
 	const sent: SettlementCustomMessage[] = [];
 	let eligible = true;
 	const queue = new SettlementNotificationQueue(
-		(message) => sent.push(message),
+		(message) => {
+			sent.push(message);
+		},
 		() => eligible,
 	);
+	queue.queue({ ...record("pending", 1), outcome: "pending" } as never);
+	queue.queue({ ...record("idle", 1), eventKind: "idle" } as never);
+	queue.queue({ ...record("invalid-run", 0) });
 	queue.queue(record("killed", 1));
 	queue.suppressChild("killed");
-	queue.queue(record("lease-lost", 1));
+	queue.queue(record("ineligible", 1));
 	eligible = false;
-	await delay(75);
+	await delay(25);
 	queue.queue(record("shutdown", 1));
 	queue.suppressAll();
-	await delay(75);
+	await delay(25);
 	assert.deepEqual(sent, []);
 });
