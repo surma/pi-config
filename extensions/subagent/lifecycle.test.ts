@@ -101,7 +101,8 @@ test("failed and aborted outcomes classify the run without stopping process", ()
 	startRun(aborted, 1);
 	corroborateRun(aborted);
 	endRun(aborted, 2, false);
-	assert.equal(settleRunToIdle(aborted, 3, "aborted", "aborted"), "running");
+	assert.equal(settleRunToIdle(aborted, 3, "aborted", "aborted"), "done");
+	assert.equal(aborted.lifecycle, "idle");
 	assert.equal(aborted.runOutcome, "aborted");
 	assert.equal(aborted.processState, "alive");
 });

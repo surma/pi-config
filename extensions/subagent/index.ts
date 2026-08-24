@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
-import { accessSync, constants, promises as fs } from "node:fs";
+import { promises as fs } from "node:fs";
 import { spawn, type ChildProcess } from "node:child_process";
-import { basename, delimiter, dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
@@ -20,6 +20,7 @@ import {
 	markStopped,
 	requestKill,
 	reviveForResume,
+	syncLifecycleCompatibility,
 	type RunOutcome,
 	type SessionLifecycle,
 	type SettlementStatus,
@@ -56,6 +57,7 @@ import {
 import {
 	readTranscript,
 	type TranscriptOptions,
+	type TranscriptResult,
 	type TranscriptStatus,
 } from "./transcript.js";
 import {
@@ -67,6 +69,7 @@ import {
 	SubagentInspector,
 	sanitizeTerminalText,
 } from "./ui.js";
+import * as childProtocol from "./child.js";
 import {
 	RpcChildTransport,
 	type RpcProcessClose,
@@ -78,14 +81,39 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const childExtensionPath = join(__dirname, "child.ts");
 const STARTUP_TIMEOUT_MS = 10_000;
 const REQUEST_TIMEOUT_MS = 30_000;
-const ABORT_TIMEOUT_MS = 1_000;
+const ABORT_TIMEOUT_MS = 2_000;
+const FILE_OPERATION_TIMEOUT_MS = 5_000;
+const PERSISTENCE_TIMEOUT_MS = 5_000;
+const OUTPUT_WRITE_TIMEOUT_MS = 5_000;
+const TRANSCRIPT_TIMEOUT_MS = 5_000;
+const SHUTDOWN_TIMEOUT_MS = 5_000;
+const CHILD_OPERATION_TIMEOUT_MS = 5_000;
 const ASSISTANT_DISPLAY_MAX = 64 * 1024;
 const TOOL_OUTPUT_TAIL_MAX = 16 * 1024;
 const MAX_RECENT_TOOLS = 8;
+const MAX_ACTIVE_CHILDREN = 8;
 const MAX_RETAINED_HANDLES = 24;
+const MAX_RELOAD_QUEUE_RECORDS = 512;
+const MAX_RELOAD_DRAIN_BATCH = 32;
 const MAX_DIAGNOSTICS = 20;
 const MAX_DIAGNOSTIC_LENGTH = 2_048;
 const MAX_STDERR_TAIL = 8 * 1024;
+
+const childHealthProtocol = childProtocol as unknown as {
+	childExtensionHealthPath?: (sessionDir: string, incarnation: string) => string;
+	verifyChildExtensionHealth?: (path: string) => Promise<boolean>;
+	CHILD_EXTENSION_HEALTH_SIGNAL?: string;
+	CHILD_EXTENSION_HEALTH_MAX_BYTES?: number;
+};
+const CHILD_EXTENSION_HEALTH_SIGNAL =
+	childHealthProtocol.CHILD_EXTENSION_HEALTH_SIGNAL ||
+	"pi-subagent-child-extension-ready/v1\n";
+const CHILD_EXTENSION_HEALTH_MAX_BYTES =
+	childHealthProtocol.CHILD_EXTENSION_HEALTH_MAX_BYTES || 128;
+const childExtensionHealthPath =
+	childHealthProtocol.childExtensionHealthPath ||
+	((sessionDir: string, incarnation: string) =>
+		join(sessionDir, `child-extension-health-${incarnation}.marker`));
 const controllerInstanceKey = Symbol.for("pi.subagent.controllerInstanceId");
 const controllerGlobal = globalThis as typeof globalThis & {
 	[controllerInstanceKey]?: string;
@@ -137,6 +165,121 @@ interface RuntimeChild {
 	closed?: RpcProcessClose;
 	diagnostics: string[];
 	handle?: SubagentHandle;
+	forced?: boolean;
+	drainTimer?: NodeJS.Timeout;
+	drainBlocked?: boolean;
+}
+
+interface PendingPersistence {
+	entries: RegistryEntry[];
+	owner: OwnerIdentity;
+	path: string;
+	waiters: Array<(result: boolean) => void>;
+}
+
+type PersistedRegistryEntry = RegistryEntry & {
+	killRequestedAt?: number;
+};
+
+function abortError(): Error {
+	const error = new Error("The operation was aborted.");
+	error.name = "AbortError";
+	return error;
+}
+
+function isAbortError(error: unknown): boolean {
+	return error instanceof Error && error.name === "AbortError";
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+	if (signal?.aborted) throw abortError();
+}
+
+/** Observe an operation while bounding both cancellation and slow dependencies. */
+function bounded<T>(
+	promise: Promise<T>,
+	timeoutMs: number,
+	signal: AbortSignal | undefined,
+	timeoutMessage: string,
+): Promise<T> {
+	return new Promise<T>((resolve, reject) => {
+		let settled = false;
+		const timer = setTimeout(() => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			const error = new Error(timeoutMessage);
+			error.name = "TimeoutError";
+			reject(error);
+		}, timeoutMs);
+		timer.unref?.();
+		const onAbort = () => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			reject(abortError());
+		};
+		const cleanup = () => {
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", onAbort);
+		};
+		signal?.addEventListener("abort", onAbort, { once: true });
+		if (signal?.aborted) onAbort();
+		void promise.then(
+			(value) => {
+				if (settled) return;
+				settled = true;
+				cleanup();
+				resolve(value);
+			},
+			(error) => {
+				if (settled) return;
+				settled = true;
+				cleanup();
+				reject(error);
+			},
+		);
+	});
+}
+
+function emptyTranscriptResult(): TranscriptResult {
+	return { status: "unreadable", messages: [], nextMessageOffset: 0 };
+}
+
+async function verifyChildExtensionHealth(
+	path: string,
+	signal?: AbortSignal,
+): Promise<boolean> {
+	try {
+		if (childHealthProtocol.verifyChildExtensionHealth)
+			return await bounded(
+				childHealthProtocol.verifyChildExtensionHealth(path),
+				FILE_OPERATION_TIMEOUT_MS,
+				signal,
+				"Timed out checking the child extension health marker.",
+			);
+		const stat = await bounded(
+			fs.stat(path),
+			FILE_OPERATION_TIMEOUT_MS,
+			signal,
+			"Timed out checking the child extension health marker.",
+			);
+		if (!stat.isFile() || stat.size < 0 || stat.size > CHILD_EXTENSION_HEALTH_MAX_BYTES)
+			return false;
+		const content = await bounded(
+			fs.readFile(path),
+			FILE_OPERATION_TIMEOUT_MS,
+			signal,
+			"Timed out reading the child extension health marker.",
+			);
+		return (
+			content.byteLength <= CHILD_EXTENSION_HEALTH_MAX_BYTES &&
+			content.toString("utf8") === CHILD_EXTENSION_HEALTH_SIGNAL
+		);
+	} catch (error) {
+		if (isAbortError(error)) throw error;
+		return false;
+	}
 }
 
 const runtimeChildrenKey = Symbol.for("pi.subagent.rpcChildren");
@@ -235,24 +378,11 @@ function copyMessage(message: Record<string, unknown>): Record<string, unknown> 
 	};
 }
 
-function executableOnPath(name: string): string | undefined {
-	for (const directory of (process.env.PATH || "").split(delimiter)) {
-		const candidate = join(directory || ".", name);
-		try {
-			accessSync(candidate, constants.X_OK);
-			return candidate;
-		} catch {
-			// Keep searching PATH.
-		}
-	}
-	return undefined;
-}
-
 export function getPiInvocation(args: string[]): string[] {
 	const offlineArgs = ["--offline", "--approve", ...args];
 	if (process.env.PI_SUBAGENT_PI_BIN)
 		return [process.env.PI_SUBAGENT_PI_BIN, ...offlineArgs];
-	const devx = process.env.PI_SUBAGENT_DEVX_BIN || executableOnPath("devx");
+	const devx = process.env.PI_SUBAGENT_DEVX_BIN;
 	if (devx) return [devx, "pi", ...offlineArgs];
 	const script = process.argv[1];
 	if (
@@ -293,10 +423,10 @@ function childEnvironment(values: {
 	childId: string;
 	incarnation: string;
 	depth: number;
-	runIdBase: number;
 	systemPrompt: string;
 	promptPath: string;
 	sessionDir: string;
+	healthPath: string;
 	leasePath: string;
 	ownerSessionFile: string;
 	ownerSessionId: string;
@@ -310,17 +440,50 @@ function childEnvironment(values: {
 		PI_SUBAGENT_CHILD: "1",
 		PI_SUBAGENT_CHILD_ID: values.childId,
 		PI_SUBAGENT_INCARNATION: values.incarnation,
-		PI_SUBAGENT_RUN_ID_BASE: String(values.runIdBase),
 		PI_SUBAGENT_SYSTEM_PROMPT: values.systemPrompt,
 		PI_SUBAGENT_DEPTH: String(values.depth),
 		PI_SUBAGENT_PROMPT_PATH: values.promptPath,
 		PI_SUBAGENT_SESSION_DIR: values.sessionDir,
+		PI_SUBAGENT_HEALTH_PATH: values.healthPath,
 		PI_SUBAGENT_LEASE_PATH: values.leasePath,
 		PI_SUBAGENT_OWNER_SESSION_FILE: values.ownerSessionFile,
 		PI_SUBAGENT_OWNER_SESSION_ID: values.ownerSessionId,
 		PI_SUBAGENT_CONTROLLER_INSTANCE_ID: values.controllerInstanceId,
 	});
 	return env;
+}
+
+function addRuntimeDiagnostic(runtime: RuntimeChild, message: string): void {
+	runtime.diagnostics.push(message.slice(0, MAX_DIAGNOSTIC_LENGTH));
+	if (runtime.diagnostics.length > MAX_DIAGNOSTICS)
+		runtime.diagnostics.splice(0, runtime.diagnostics.length - MAX_DIAGNOSTICS);
+}
+
+function removeRuntime(runtime: RuntimeChild, clearQueue = true): void {
+	if (runtime.drainTimer) {
+		clearTimeout(runtime.drainTimer);
+		runtime.drainTimer = undefined;
+	}
+	runtime.consumer = undefined;
+	runtime.closeConsumer = undefined;
+	runtime.handle = undefined;
+	runtime.drainBlocked = undefined;
+	if (clearQueue) runtime.queuedRecords.length = 0;
+	if (runtimeChildren.get(runtime.id) === runtime) runtimeChildren.delete(runtime.id);
+}
+
+function queueRuntimeRecord(runtime: RuntimeChild, record: RpcRecord): void {
+	if (runtime.queuedRecords.length >= MAX_RELOAD_QUEUE_RECORDS) {
+		runtime.queuedRecords.shift();
+		if (!runtime.drainBlocked) {
+			runtime.drainBlocked = true;
+			addRuntimeDiagnostic(
+				runtime,
+				`Reload event queue reached ${MAX_RELOAD_QUEUE_RECORDS} records. Older records were discarded.`,
+			);
+		}
+	}
+	runtime.queuedRecords.push(record);
 }
 
 function attachRuntime(
@@ -330,12 +493,47 @@ function attachRuntime(
 ): void {
 	runtime.consumer = consumer;
 	runtime.closeConsumer = closeConsumer;
-	const queued = runtime.queuedRecords.splice(0);
-	for (const record of queued) consumer(record);
-	if (runtime.closed) closeConsumer(runtime.closed);
+	runtime.drainBlocked = false;
+	const drain = () => {
+		runtime.drainTimer = undefined;
+		if (runtime.consumer !== consumer) return;
+		const batch = runtime.queuedRecords.splice(0, MAX_RELOAD_DRAIN_BATCH);
+		for (let index = 0; index < batch.length; index++) {
+			const record = batch[index];
+			if (!record) continue;
+			try {
+				consumer(record);
+			} catch (error) {
+				runtime.queuedRecords.unshift(...batch.slice(index));
+				runtime.drainBlocked = true;
+				addRuntimeDiagnostic(
+					runtime,
+					`Reload event handling failed: ${error instanceof Error ? error.message : String(error)}`,
+				);
+				return;
+			}
+		}
+		if (runtime.queuedRecords.length > 0) {
+			runtime.drainTimer = setTimeout(drain, 0);
+			runtime.drainTimer.unref?.();
+			return;
+		}
+		if (runtime.closed && runtime.closeConsumer === closeConsumer)
+			closeConsumer(runtime.closed);
+	};
+	if (runtime.queuedRecords.length > 0) {
+		runtime.drainTimer = setTimeout(drain, 0);
+		runtime.drainTimer.unref?.();
+	} else if (runtime.closed) {
+		closeConsumer(runtime.closed);
+	}
 }
 
 function detachRuntime(runtime: RuntimeChild): void {
+	if (runtime.drainTimer) {
+		clearTimeout(runtime.drainTimer);
+		runtime.drainTimer = undefined;
+	}
 	runtime.consumer = undefined;
 	runtime.closeConsumer = undefined;
 }
@@ -365,6 +563,7 @@ interface SubagentHandle extends SubagentDispatchHandle {
 	exitCode?: number | null;
 	exitSignal?: NodeJS.Signals | null;
 	rpcReady: boolean;
+	extensionReady: boolean;
 	rpc?: RpcChildTransport;
 	runtime?: RuntimeChild;
 	createdAt: number;
@@ -374,6 +573,7 @@ interface SubagentHandle extends SubagentDispatchHandle {
 	outputPath?: string;
 	outputStatus: OutputStatus;
 	outputError?: string;
+	extensionError?: string;
 	transcriptStatus: TranscriptStatus;
 	outputWriteChain: Promise<void>;
 	stderr: string;
@@ -381,6 +581,8 @@ interface SubagentHandle extends SubagentDispatchHandle {
 	waiters: Set<() => void>;
 	terminationPromise?: Promise<SubagentHandle>;
 	processCloseHandled: boolean;
+	osCloseObserved?: boolean;
+	forced?: boolean;
 	ownerSessionFile: string;
 	ownerSessionId: string;
 	incarnation: string;
@@ -557,7 +759,10 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	const controllerInstanceId = processControllerInstanceId;
 	let leaseHeld = false;
 	let leaseRenewTimer: NodeJS.Timeout | undefined;
+	let leaseRenewGeneration = 0;
+	let leaseRenewPromise: Promise<void> | undefined;
 	let authorityLossPromise: Promise<void> | undefined;
+	let pendingLaunches = 0;
 	let sessionShuttingDown = false;
 	const settlementNotifications = new SettlementNotificationQueue(
 		(message, options) => pi.sendMessage(message, options),
@@ -569,7 +774,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				owner?.ownerSessionFile === record.ownerSessionFile &&
 				owner.ownerSessionId === record.ownerSessionId &&
 				handle?.incarnation === record.incarnation &&
-				!handle.killRequestedAt
+				handle.killRequestedAt === undefined
 			);
 		},
 	);
@@ -582,7 +787,62 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			(a, b) => b.createdAt - a.createdAt || b.id.localeCompare(a.id),
 		);
 	const active = (handle: SubagentHandle) => handle.processState === "alive";
+	const activeCount = () => sorted().filter(active).length;
 	const requireLease = (): boolean => leaseHeld && owner !== null;
+	const childOperationTails = new Map<string, Promise<void>>();
+	let launchReservationTail = Promise.resolve();
+	async function withLaunchReservation<T>(
+		signal: AbortSignal | undefined,
+		operation: () => Promise<T>,
+	): Promise<T> {
+		const previous = launchReservationTail;
+		let release!: () => void;
+		const current = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		launchReservationTail = current;
+		try {
+			await bounded(
+				previous,
+				CHILD_OPERATION_TIMEOUT_MS,
+				signal,
+				"Timed out waiting for another subagent launch reservation.",
+			);
+			throwIfAborted(signal);
+			return await operation();
+		} finally {
+			release();
+			if (launchReservationTail === current)
+				launchReservationTail = Promise.resolve();
+		}
+	}
+	async function withChildOperation<T>(
+		handle: SubagentHandle,
+		signal: AbortSignal | undefined,
+		operation: () => Promise<T>,
+	): Promise<T> {
+		throwIfAborted(signal);
+		const previous = childOperationTails.get(handle.id) || Promise.resolve();
+		let release!: () => void;
+		const current = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		childOperationTails.set(handle.id, current);
+		try {
+			await bounded(
+				previous,
+				CHILD_OPERATION_TIMEOUT_MS,
+				signal,
+				`Timed out waiting for another operation on subagent #${handle.id}.`,
+			);
+			throwIfAborted(signal);
+			return await operation();
+		} finally {
+			release();
+			if (childOperationTails.get(handle.id) === current)
+				childOperationTails.delete(handle.id);
+		}
+	}
 	const setControllerStatus = (
 		ctx: ExtensionContext | null,
 		text: string | undefined,
@@ -592,29 +852,51 @@ export default function subagentExtension(pi: ExtensionAPI) {
 
 	async function ensureLeaseAuthority(
 		authorityOwner: OwnerIdentity,
+		signal?: AbortSignal,
 	): Promise<boolean> {
 		const agentDir = getAgentDir();
-		if (
-			await hasLeaseAuthority(
-				agentDir,
-				authorityOwner,
-				controllerInstanceId,
-				now(),
+		try {
+			if (
+				await bounded(
+					hasLeaseAuthority(
+						agentDir,
+						authorityOwner,
+						controllerInstanceId,
+						now(),
+					),
+					FILE_OPERATION_TIMEOUT_MS,
+					signal,
+					"Timed out checking subagent controller authority.",
+				)
 			)
-		)
-			return true;
-		return renewLease(
-			agentDir,
-			authorityOwner,
-			controllerInstanceId,
-			now(),
-		).catch(() => false);
+				return true;
+			return await bounded(
+				renewLease(
+					agentDir,
+					authorityOwner,
+					controllerInstanceId,
+					now(),
+				),
+				FILE_OPERATION_TIMEOUT_MS,
+				signal,
+				"Timed out renewing subagent controller authority.",
+			);
+		} catch (error) {
+			if (isAbortError(error)) throw error;
+			return false;
+		}
 	}
 
-	async function requireCurrentAuthority(): Promise<boolean> {
+	async function requireCurrentAuthority(signal?: AbortSignal): Promise<boolean> {
+		throwIfAborted(signal);
 		if (!leaseHeld || !owner) return false;
-		const authoritative = await ensureLeaseAuthority(owner);
-		if (!authoritative)
+		const authorityOwner = owner;
+		const authoritative = await ensureLeaseAuthority(authorityOwner, signal);
+		if (
+			!authoritative &&
+			owner === authorityOwner &&
+			leaseHeld
+		)
 			void loseAuthority(
 				"Controller lease lost. Run /reload to re-establish it.",
 			);
@@ -629,7 +911,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	const notifyWaiters = (handle: SubagentHandle) => {
 		for (const waiter of [...handle.waiters]) waiter();
 	};
-	const registryEntry = (handle: SubagentHandle): RegistryEntry => ({
+	const registryEntry = (handle: SubagentHandle): PersistedRegistryEntry => ({
 		childId: handle.id,
 		name: handle.name,
 		task: handle.task,
@@ -652,6 +934,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		createdAt: handle.createdAt,
 		lastActivityAt: handle.lastActivityAt,
 		error: handle.error || handle.finalError,
+		killRequestedAt: handle.killRequestedAt,
 		stderrTail: tail(handle.stderr),
 		diagnostics: handle.diagnostics.length ? [...handle.diagnostics] : undefined,
 		outputPath: handle.outputPath,
@@ -665,49 +948,123 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		resumedFrom: handle.resumedFrom,
 	});
 	const registryEntries = (): RegistryEntry[] => sorted().map(registryEntry);
-	const persist = (snapshot?: RegistryEntry[]): Promise<boolean> => {
+	let pendingPersistence: PendingPersistence | undefined;
+	let persistenceWorkerActive = false;
+	const persistFailure = (error: unknown): void => {
+		for (const handle of handles.values())
+			addDiagnostic(
+				handle,
+				`Registry persistence failed: ${error instanceof Error ? error.message : String(error)}`,
+			);
+	};
+	const startPersistenceWorker = (): void => {
+		if (persistenceWorkerActive) return;
+		persistenceWorkerActive = true;
+		const previous = persistenceChain;
+		const run = previous.then(async () => {
+			while (pendingPersistence) {
+				const request = pendingPersistence;
+				pendingPersistence = undefined;
+				let result = false;
+				try {
+					if (
+						owner &&
+						owner.ownerSessionFile === request.owner.ownerSessionFile &&
+						owner.ownerSessionId === request.owner.ownerSessionId &&
+						leaseHeld &&
+						(await requireCurrentAuthority())
+					) {
+						await bounded(
+							saveRegistry(request.entries, request.path),
+							PERSISTENCE_TIMEOUT_MS,
+							undefined,
+							"Timed out saving the subagent registry.",
+						);
+						result = true;
+					}
+				} catch (error) {
+					persistFailure(error);
+				}
+				for (const waiter of request.waiters) waiter(result);
+			}
+		});
+		persistenceChain = run.catch((error) => {
+			persistFailure(error);
+		});
+		void persistenceChain.then(() => {
+			persistenceWorkerActive = false;
+			if (pendingPersistence) startPersistenceWorker();
+		});
+	};
+	const persist = (
+		snapshot?: RegistryEntry[],
+		_options: { important?: boolean } = {},
+	): Promise<boolean> => {
 		const persistenceOwner = owner;
 		if (!persistenceOwner || !leaseHeld) return Promise.resolve(false);
 		const path = ownerRegistryPath(getAgentDir(), persistenceOwner);
 		const entries = snapshot || registryEntries();
-		const write = persistenceChain.then(async () => {
+		return new Promise<boolean>((resolve) => {
 			if (
-				!owner ||
-				owner.ownerSessionFile !== persistenceOwner.ownerSessionFile ||
-				owner.ownerSessionId !== persistenceOwner.ownerSessionId ||
-				!(await requireCurrentAuthority())
-			)
-				return false;
-			await saveRegistry(entries, path);
-			return true;
+				pendingPersistence &&
+				(pendingPersistence.owner.ownerSessionFile !== persistenceOwner.ownerSessionFile ||
+					pendingPersistence.owner.ownerSessionId !== persistenceOwner.ownerSessionId)
+			) {
+				for (const waiter of pendingPersistence.waiters) waiter(false);
+				pendingPersistence = undefined;
+			}
+			if (!pendingPersistence) {
+				pendingPersistence = {
+					entries,
+					owner: persistenceOwner,
+					path,
+					waiters: [resolve],
+				};
+			} else {
+				pendingPersistence.entries = entries;
+				pendingPersistence.path = path;
+				pendingPersistence.waiters.push(resolve);
+			}
+			startPersistenceWorker();
 		});
-		persistenceChain = write.then(
-			() => undefined,
-			(error) => {
-				for (const handle of handles.values())
-					addDiagnostic(
-						handle,
-						`Registry persistence failed: ${error instanceof Error ? error.message : String(error)}`,
-					);
-			},
-		);
-		return write.catch(() => false);
 	};
 	const trimRetained = () => {
 		if (handles.size <= MAX_RETAINED_HANDLES) return;
 		const stopped = [...handles.values()]
-			.filter((candidate) => candidate.processState === "stopped")
+			.filter(
+				(candidate) =>
+					candidate.processState === "stopped" &&
+					(!candidate.runtime || candidate.runtime.transport.isClosed),
+			)
 			.sort((a, b) => a.lastActivityAt - b.lastActivityAt);
 		while (handles.size > MAX_RETAINED_HANDLES && stopped.length) {
 			const candidate = stopped.shift();
 			if (candidate) handles.delete(candidate.id);
 		}
 	};
-	const update = (handle: SubagentHandle, shouldPersist = true) => {
-		handle.lastActivityAt = now();
-		trimRetained();
+	let updateScheduled = false;
+	let updatePersistenceRequested = false;
+	const flushUpdates = (): void => {
+		updateScheduled = false;
+		const shouldPersist = updatePersistenceRequested;
+		updatePersistenceRequested = false;
 		refreshUi();
 		if (shouldPersist && leaseHeld) void persist();
+	};
+	const update = (
+		handle: SubagentHandle,
+		shouldPersist = true,
+		important = false,
+	): void => {
+		handle.lastActivityAt = now();
+		trimRetained();
+		if (shouldPersist && leaseHeld && !important)
+			updatePersistenceRequested = true;
+		if (important && leaseHeld) void persist();
+		if (!updateScheduled) {
+			updateScheduled = true;
+			queueMicrotask(flushUpdates);
+		}
 	};
 
 	function acceptSettlement(
@@ -728,7 +1085,11 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		};
 
 		// Queue the non-durable wake before any optional persistence or output work.
-		if (!sessionShuttingDown && leaseHeld && !handle.killRequestedAt)
+		if (
+			!sessionShuttingDown &&
+			leaseHeld &&
+			handle.killRequestedAt === undefined
+		)
 			settlementNotifications.queue(notification);
 
 		handle.outputStatus = handle.outputPath ? "pending" : "not_requested";
@@ -738,10 +1099,15 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		const outputPath = handle.outputPath;
 		const outputContent = result;
 		const write = handle.outputWriteChain.then(async () => {
-			const written = await writeCallerOutput({
-				path: outputPath,
-				content: outputContent,
-			});
+			const written = await bounded(
+				writeCallerOutput({
+					path: outputPath,
+					content: outputContent,
+				}),
+				OUTPUT_WRITE_TIMEOUT_MS,
+				undefined,
+				`Timed out writing caller output for subagent #${handle.id}.`,
+			);
 			handle.outputStatus = written.status;
 			if (written.status === "failed") {
 				handle.outputError = written.error;
@@ -766,8 +1132,24 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	async function serialize(
 		handle: SubagentHandle,
 		transcriptOptions: TranscriptOptions = {},
+		signal?: AbortSignal,
 	) {
-		const transcript = await readTranscript(handle.sessionPath, transcriptOptions);
+		let transcript: Awaited<ReturnType<typeof readTranscript>>;
+		try {
+			transcript = await bounded(
+				readTranscript(handle.sessionPath, transcriptOptions),
+				TRANSCRIPT_TIMEOUT_MS,
+				signal,
+				`Timed out reading the transcript for subagent #${handle.id}.`,
+			);
+		} catch (error) {
+			if (isAbortError(error)) throw error;
+			addDiagnostic(
+				handle,
+				`Transcript read failed: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			transcript = emptyTranscriptResult();
+		}
 		handle.transcriptStatus = transcript.status;
 		const actualModel =
 			handle.actualModel ||
@@ -792,6 +1174,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			sessionPath: handle.sessionPath || "",
 			lastActivityAt: handle.lastActivityAt,
 			settlement: { status: handle.settlementStatus },
+			killRequestedAt: handle.killRequestedAt,
 			transcript: {
 				status: transcript.status,
 				messages: transcript.messages,
@@ -806,6 +1189,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 					? { error: boundOutputError(handle.outputError) }
 					: {}),
 			},
+			extensionError: handle.extensionError,
 			task: handle.task,
 			cwd: handle.cwd,
 			sessionDir: handle.sessionDir,
@@ -837,15 +1221,20 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			tentativeError: handle.tentativeError,
 			finalError: handle.finalError,
 			settledAt: handle.settledAt,
+			osCloseObserved: handle.osCloseObserved,
+			forced: handle.forced,
 			diagnostics: handle.diagnostics.length
 				? [...handle.diagnostics]
 				: undefined,
 		};
 	}
-	async function summary(handle: SubagentHandle) {
-		const serial = await serialize(handle);
+	async function summary(
+		handle: SubagentHandle,
+		serial?: Awaited<ReturnType<typeof serialize>>,
+	) {
+		const details = serial || (await serialize(handle));
 		return sanitizeTerminalText(
-			`#${handle.id}${handle.name ? ` ${handle.name}` : ""} ${handle.processState}/${handle.runState} · run:${handle.runSequence || 0}\n  actual ${formatModel(serial.actualModel)} · thinking:${serial.actualThinking}\n  process ${handle.pid ?? "?"}${handle.exitCode !== undefined ? ` · exit ${handle.exitCode}` : ""}${handle.rpcReady ? " · RPC ready" : ""}\n  session ${serial.sessionPath} (transcript ${serial.transcript.status})${serial.error ? `\n  error ${truncate(serial.error, 180)}` : ""}`,
+			`#${handle.id}${handle.name ? ` ${handle.name}` : ""} ${handle.processState}/${handle.runState} · run:${handle.runSequence || 0}\n  actual ${formatModel(details.actualModel)} · thinking:${details.actualThinking}\n  process ${handle.pid ?? "?"}${handle.exitCode !== undefined ? ` · exit ${handle.exitCode}` : ""}${handle.rpcReady ? " · RPC ready" : ""}\n  session ${details.sessionPath} (transcript ${details.transcript.status})${details.error ? `\n  error ${truncate(details.error, 180)}` : ""}`,
 		);
 	}
 
@@ -887,12 +1276,22 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		const runOutcome = isRunOutcome(entry.runOutcome)
 			? entry.runOutcome
 			: "pending";
+		const persistedKillRequestedAt = nonnegativeSafeInteger(
+			(entry as Partial<RegistryEntry> & { killRequestedAt?: unknown })
+				.killRequestedAt,
+		);
+		const killRequestedAt =
+			persistedKillRequestedAt ??
+			(stopped && entry.error === "Killed" ? entry.lastActivityAt : undefined);
+		const killed = stopped && killRequestedAt !== undefined;
 		const restoredState = stopped
-			? runOutcome === "failed" || entry.error
-				? "error"
-				: "done"
+			? killed
+				? "killed"
+				: runOutcome === "failed" || entry.error
+					? "error"
+					: "done"
 			: "starting";
-		return {
+		const handle = {
 			...createLifecycleState(),
 			id: entry.childId,
 			name: entry.name,
@@ -911,6 +1310,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			exitCode: entry.exitCode,
 			exitSignal: entry.exitSignal,
 			processState: stopped ? "stopped" : "alive",
+			killRequestedAt,
 			runState: entry.runState || "idle",
 			runSequence,
 			lastSettledRunId,
@@ -941,9 +1341,12 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				entry.outputError === undefined
 					? undefined
 					: boundOutputError(entry.outputError),
+			extensionError: undefined,
 			transcriptStatus: "missing",
 			outputWriteChain: Promise.resolve(),
 			stderr: typeof entry.stderrTail === "string" ? tail(entry.stderrTail) || "" : "",
+			osCloseObserved: undefined,
+			forced: undefined,
 			error: entry.error,
 			finalError:
 				entry.error && (stopped || runOutcome === "failed")
@@ -957,11 +1360,38 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			waiters: new Set(),
 			processCloseHandled: stopped,
 			rpcReady: false,
+			extensionReady: false,
 			ownerSessionFile: entry.ownerSessionFile,
 			ownerSessionId: entry.ownerSessionId,
 			incarnation: entry.incarnation,
 			resumedFrom: entry.resumedFrom,
-		};
+		} as SubagentHandle;
+		syncLifecycleCompatibility(handle);
+		return handle;
+	}
+
+	function resetHandleForRun(handle: SubagentHandle): void {
+		handle.agentStartedAt = undefined;
+		handle.agentEndedAt = undefined;
+		handle.completedAt = undefined;
+		handle.stopReason = undefined;
+		handle.error = undefined;
+		handle.tentativeError = undefined;
+		handle.finalError = undefined;
+		handle.currentTool = undefined;
+		handle.currentToolStartedAt = undefined;
+		handle.lastTool = undefined;
+		handle.isStreaming = false;
+		handle.resultText = "";
+		handle.currentAssistantText = "";
+		handle.latestAssistantText = "";
+		handle.activeTools.clear();
+		handle.recentTools = [];
+		handle.usage = createUsage();
+		handle.outputStatus = handle.outputPath ? "pending" : "not_requested";
+		handle.outputError = undefined;
+		deactivateAssistantMessage(handle);
+		handle.assistantAssembly = undefined;
 	}
 
 	function dispatchOptions(handle: SubagentHandle) {
@@ -970,7 +1400,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			assistantDisplayMax: ASSISTANT_DISPLAY_MAX,
 			toolOutputTailMax: TOOL_OUTPUT_TAIL_MAX,
 			maxRecentTools: MAX_RECENT_TOOLS,
-			update: () => update(handle),
+			update: (streaming?: boolean) => update(handle, streaming !== true),
 			diagnostic: (message: string) => addDiagnostic(handle, message),
 			onAssistantFinalized: () => {},
 			onSettled: (run: SubagentRun) => {
@@ -986,7 +1416,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 					);
 				}
 				notifyWaiters(handle);
-				update(handle);
+				update(handle, false);
+				void persist(undefined, { important: true });
 			},
 		};
 	}
@@ -997,7 +1428,11 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		runtime?: RuntimeChild,
 	): void {
 		if (runtime && !runtimeMatches(handle, runtime)) return;
-		if (handle.processCloseHandled) return;
+		if (handle.processCloseHandled) {
+			if (runtime && runtimeChildren.get(runtime.id) === runtime)
+				removeRuntime(runtime);
+			return;
+		}
 		handle.processCloseHandled = true;
 		handle.rpcReady = false;
 		handle.isStreaming = false;
@@ -1008,6 +1443,13 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		handle.assistantAssembly = undefined;
 		handle.exitCode = close.code;
 		handle.exitSignal = close.signal;
+		const closeEvidence = close as RpcProcessClose & {
+			osCloseObserved?: boolean;
+			forced?: boolean;
+		};
+		handle.osCloseObserved =
+			closeEvidence.osCloseObserved ?? !(runtime?.forced ?? false);
+		handle.forced = closeEvidence.forced ?? runtime?.forced ?? false;
 		handle.stderr = (runtime?.transport || handle.rpc)?.stderr || handle.stderr;
 		addDiagnostic(
 			handle,
@@ -1023,7 +1465,13 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			});
 		}
 		notifyWaiters(handle);
-		update(handle);
+		update(handle, false);
+		void persist(undefined, { important: true });
+		if (runtime && runtimeChildren.get(runtime.id) === runtime) {
+			removeRuntime(runtime);
+			handle.runtime = undefined;
+			handle.rpc = undefined;
+		}
 	}
 
 	function handleRpcRecord(
@@ -1046,7 +1494,21 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			}
 			return;
 		}
-		if (record.type === "agent_start") handle.assistantAssembly = undefined;
+		if (record.type === "extension_error") {
+			const extensionPath =
+				typeof record.extensionPath === "string" && record.extensionPath
+					? record.extensionPath
+					: "extension";
+			const error =
+				typeof record.error === "string" && record.error
+					? record.error
+					: "Unknown extension error";
+			handle.extensionError = `${extensionPath}: ${error}`;
+		}
+		if (record.type === "agent_start") {
+			if (handle.runState !== "running") resetHandleForRun(handle);
+			handle.assistantAssembly = undefined;
+		}
 		const accepted = dispatchSubagentEvent(handle, record, dispatchOptions(handle));
 		if (record.type === "agent_settled" && accepted)
 			handle.assistantAssembly = undefined;
@@ -1068,7 +1530,17 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		);
 	}
 
-	function startRuntime(handle: SubagentHandle, invocation: string[], env: NodeJS.ProcessEnv): Promise<void> {
+	function startRuntime(
+		handle: SubagentHandle,
+		invocation: string[],
+		env: NodeJS.ProcessEnv,
+		signal?: AbortSignal,
+	): Promise<void> {
+		throwIfAborted(signal);
+		const existing = runtimeChildren.get(handle.id);
+		if (existing && !existing.transport.isClosed)
+			throw new Error(`Subagent #${handle.id} already has a live RPC runtime.`);
+		if (existing) removeRuntime(existing);
 		const [command, ...args] = invocation;
 		if (!command) throw new Error("Pi invocation is empty.");
 		let child: ChildProcess;
@@ -1091,16 +1563,25 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		const transport = new RpcChildTransport(child, {
 			onRecord: (record) => {
 				if (runtime.consumer) runtime.consumer(record);
-				else runtime.queuedRecords.push(record);
+				else queueRuntimeRecord(runtime, record);
 			},
 			onDiagnostic: (message) => {
 				if (runtime.handle && runtimeMatches(runtime.handle, runtime))
 					addDiagnostic(runtime.handle, message);
-				else if (!runtime.handle) runtime.diagnostics.push(message);
+				else if (!runtime.handle) addRuntimeDiagnostic(runtime, message);
 			},
 			onClose: (close) => {
 				runtime.closed = close;
-				if (runtime.closeConsumer) runtime.closeConsumer(close);
+				try {
+					if (runtime.closeConsumer) runtime.closeConsumer(close);
+				} catch (error) {
+					addRuntimeDiagnostic(
+						runtime,
+						`RPC close handling failed: ${error instanceof Error ? error.message : String(error)}`,
+					);
+					if (runtime.handle && runtimeMatches(runtime.handle, runtime))
+						handleProcessClose(runtime.handle, close, runtime);
+				}
 			},
 			requestTimeoutMs: REQUEST_TIMEOUT_MS,
 		});
@@ -1112,13 +1593,27 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			const timer = setTimeout(() => {
 				if (settled) return;
 				settled = true;
+				cleanup();
 				reject(new Error(`Timed out waiting for RPC child #${handle.id} to spawn.`));
 			}, STARTUP_TIMEOUT_MS);
+			const onAbort = () => {
+				if (settled) return;
+				settled = true;
+				cleanup();
+				reject(abortError());
+			};
+			const cleanup = () => {
+				clearTimeout(timer);
+				signal?.removeEventListener("abort", onAbort);
+				child.off("spawn", onSpawn);
+				child.off("error", onError);
+			};
 			timer.unref?.();
+			signal?.addEventListener("abort", onAbort, { once: true });
 			const onSpawn = () => {
 				if (settled) return;
 				settled = true;
-				clearTimeout(timer);
+				cleanup();
 				handle.pid = child.pid;
 				handle.rpcReady = true;
 				handle.rpcReadyAt = now();
@@ -1128,51 +1623,107 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			const onError = (error: Error) => {
 				if (settled) return;
 				settled = true;
-				clearTimeout(timer);
+				cleanup();
 				reject(error);
 			};
 			child.once("spawn", onSpawn);
 			child.once("error", onError);
 			if (child.pid !== undefined) onSpawn();
+			if (signal?.aborted) onAbort();
 		});
 	}
 
-	function awaitReady(handle: SubagentHandle): Promise<void> {
+	function awaitReady(
+		handle: SubagentHandle,
+		signal?: AbortSignal,
+	): Promise<void> {
+		throwIfAborted(signal);
 		if (handle.rpcReady && handle.rpc) return Promise.resolve();
 		return new Promise((resolve, reject) => {
-			const timer = setTimeout(() => {
+			let settled = false;
+			const finish = (error?: Error) => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timer);
 				handle.waiters.delete(check);
-				reject(new Error(`Timed out waiting for RPC child #${handle.id} to become ready.`));
+				signal?.removeEventListener("abort", onAbort);
+				if (error) reject(error);
+				else resolve();
+			};
+			const timer = setTimeout(() => {
+				finish(new Error(`Timed out waiting for RPC child #${handle.id} to become ready.`));
 			}, STARTUP_TIMEOUT_MS);
 			timer.unref?.();
+			const onAbort = () => finish(abortError());
 			const check = () => {
-				if (handle.rpcReady && handle.rpc) {
-					clearTimeout(timer);
-					handle.waiters.delete(check);
-					resolve();
-				} else if (handle.processState === "stopped") {
-					clearTimeout(timer);
-					handle.waiters.delete(check);
-					reject(new Error(`RPC child #${handle.id} closed before it became ready.`));
-				}
+				if (handle.rpcReady && handle.rpc) finish();
+				else if (handle.processState === "stopped")
+					finish(new Error(`RPC child #${handle.id} closed before it became ready.`));
 			};
 			handle.waiters.add(check);
+			signal?.addEventListener("abort", onAbort, { once: true });
 			check();
 		});
+	}
+
+	async function awaitExtensionHealth(
+		handle: SubagentHandle,
+		signal?: AbortSignal,
+	): Promise<void> {
+		throwIfAborted(signal);
+		if (handle.extensionReady) return;
+		const path = childExtensionHealthPath(handle.sessionDir, handle.incarnation);
+		const deadline = now() + STARTUP_TIMEOUT_MS;
+		for (;;) {
+			throwIfAborted(signal);
+			if (handle.extensionError)
+				throw new Error(
+					`Child extension health confirmation failed: ${handle.extensionError}`,
+				);
+			if (await verifyChildExtensionHealth(path, signal)) {
+				handle.extensionReady = true;
+				return;
+			}
+			if (handle.processState === "stopped")
+				throw new Error(
+					`RPC child #${handle.id} closed before child extension health confirmation.`,
+				);
+			const remaining = deadline - now();
+			if (remaining <= 0)
+				throw new Error(
+					`Timed out waiting for child extension #${handle.id} health confirmation.`,
+				);
+			await bounded(
+				new Promise<void>((resolve) => {
+					const timer = setTimeout(resolve, Math.min(25, remaining));
+					timer.unref?.();
+				}),
+				Math.min(25, remaining),
+				signal,
+				`Timed out waiting for child extension #${handle.id} health confirmation.`,
+			);
+		}
 	}
 
 	async function sendRpc(
 		handle: SubagentHandle,
 		body: RpcRecord,
 		timeoutMs = REQUEST_TIMEOUT_MS,
+		signal?: AbortSignal,
 	): Promise<RpcResponseRecord> {
-		if (!(await requireCurrentAuthority()))
-			throw new Error(await leaseConflictMessage());
+		throwIfAborted(signal);
+		if (!(await requireCurrentAuthority(signal)))
+			throw new Error(await leaseConflictMessage(signal));
 		if (handle.processState !== "alive")
 			throw new Error(`Subagent #${handle.id} is no longer running.`);
 		if (!handle.rpc || !handle.rpcReady)
 			throw new Error(`Subagent #${handle.id} RPC process is not ready.`);
-		const response = await handle.rpc.send(body, timeoutMs);
+		const response = await bounded(
+			handle.rpc.send(body, timeoutMs),
+			timeoutMs,
+			signal,
+			`Timed out waiting for RPC response to ${String(body.type)}.`,
+		);
 		applyResponseState(handle, response);
 		update(handle);
 		return response;
@@ -1181,32 +1732,49 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	async function terminate(
 		handle: SubagentHandle,
 		checkAuthority = true,
+		signal?: AbortSignal,
 	): Promise<SubagentHandle> {
-		if (checkAuthority && !(await requireCurrentAuthority()))
-			throw new Error(await leaseConflictMessage());
+		throwIfAborted(signal);
+		if (checkAuthority && !(await requireCurrentAuthority(signal)))
+			throw new Error(await leaseConflictMessage(signal));
 		if (handle.processState === "stopped") return handle;
-		if (handle.terminationPromise) return handle.terminationPromise;
-		handle.terminationPromise = (async () => {
+		if (handle.terminationPromise)
+			return bounded(
+				handle.terminationPromise,
+				SHUTDOWN_TIMEOUT_MS,
+				signal,
+				`Timed out terminating subagent #${handle.id}.`,
+			);
+		const termination = (async () => {
 			settlementNotifications.suppressChild(handle.id);
 			requestKill(handle, now());
 			update(handle, false);
 			const transport = handle.rpc;
 			if (transport) {
-				await transport
-					.terminate({
-						abort: true,
-						abortTimeoutMs: ABORT_TIMEOUT_MS,
-						closeAfterAbortMs: 250,
-						termTimeoutMs: 1_500,
-						killTimeoutMs: 2_500,
-					})
-					.catch((error) => addDiagnostic(handle, `RPC termination failed: ${String(error)}`));
-				if (handle.processState !== "stopped" && !transport.isClosed)
+				try {
+					await bounded(
+						transport.terminate({
+							abort: true,
+							abortTimeoutMs: ABORT_TIMEOUT_MS,
+							closeAfterAbortMs: 250,
+							termTimeoutMs: 1_500,
+							killTimeoutMs: 2_500,
+						}),
+						SHUTDOWN_TIMEOUT_MS,
+						undefined,
+						`Timed out terminating subagent #${handle.id}.`,
+					);
+				} catch (error) {
+					addDiagnostic(handle, `RPC termination failed: ${String(error)}`);
+				}
+				if (handle.processState !== "stopped" && !transport.isClosed) {
+					if (handle.runtime) handle.runtime.forced = true;
 					transport.forceClose({
 						code: null,
 						signal: "SIGKILL",
 						error: new Error("RPC child termination was forced."),
 					});
+				}
 			} else {
 				handleProcessClose(handle, {
 					code: null,
@@ -1215,10 +1783,56 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				});
 			}
 			handle.completedAt ||= now();
-			await persistenceChain;
+			const persisted = await bounded(
+				persist(undefined, { important: true }),
+				PERSISTENCE_TIMEOUT_MS,
+				undefined,
+				`Timed out saving the stopped state for #${handle.id}.`,
+			);
+			if (!persisted)
+				addDiagnostic(handle, "The stopped subagent state was not persisted.");
 			return handle;
-		})();
-		return handle.terminationPromise;
+		})().catch((error) => {
+			addDiagnostic(handle, `RPC termination cleanup failed: ${String(error)}`);
+			return handle;
+		});
+		handle.terminationPromise = termination;
+		return bounded(
+			termination,
+			SHUTDOWN_TIMEOUT_MS,
+			signal,
+			`Timed out terminating subagent #${handle.id}.`,
+		);
+	}
+
+	async function forceCleanupRuntime(runtime: RuntimeChild): Promise<void> {
+		if (!runtime.transport.isClosed) {
+			await bounded(
+				runtime.transport.terminate({
+					abort: false,
+					termTimeoutMs: 500,
+					killTimeoutMs: 1_000,
+				}),
+				SHUTDOWN_TIMEOUT_MS,
+				undefined,
+				`Timed out closing RPC runtime for #${runtime.id}.`,
+			).catch((error) => addRuntimeDiagnostic(runtime, String(error)));
+		}
+		if (!runtime.transport.isClosed) {
+			runtime.forced = true;
+			runtime.transport.forceClose({
+				code: null,
+				signal: "SIGKILL",
+				error: new Error("RPC runtime cleanup was forced."),
+			});
+		}
+		if (runtimeChildren.get(runtime.id) === runtime) removeRuntime(runtime);
+	}
+
+	async function forceCleanupRuntimes(): Promise<void> {
+		await Promise.all(
+			[...runtimeChildren.values()].map((runtime) => forceCleanupRuntime(runtime)),
+		);
 	}
 
 	async function loseAuthority(reason: string): Promise<void> {
@@ -1243,30 +1857,39 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		handle: SubagentHandle,
 		requestedCommand: "steer" | "follow_up",
 		message: string,
+		signal?: AbortSignal,
 	): Promise<"prompt" | "steer" | "follow_up"> {
+		throwIfAborted(signal);
 		const command = handle.runState === "idle" ? "prompt" : requestedCommand;
 		const before = handle.runSequence;
-		await sendRpc(handle, { type: command, message });
+		await sendRpc(handle, { type: command, message }, REQUEST_TIMEOUT_MS, signal);
 		if (command === "prompt")
 			await waitUntil(
 				() => handle.runSequence > before || handle.processState === "stopped",
 				1_000,
+				signal,
 			);
 		return command;
 	}
 
-	async function interrupt(handle: SubagentHandle): Promise<boolean> {
+	async function interrupt(
+		handle: SubagentHandle,
+		signal?: AbortSignal,
+	): Promise<boolean> {
+		throwIfAborted(signal);
 		if (handle.processState !== "alive")
 			throw new Error(`Subagent #${handle.id} is no longer running.`);
-		if (!(await requireCurrentAuthority()))
-			throw new Error(await leaseConflictMessage());
+		if (!(await requireCurrentAuthority(signal)))
+			throw new Error(await leaseConflictMessage(signal));
 		if (handle.runState === "idle") return true;
 		handle.abortRequestedAt = now();
 		try {
-			await sendRpc(handle, { type: "abort" }, ABORT_TIMEOUT_MS);
+			await sendRpc(handle, { type: "abort" }, ABORT_TIMEOUT_MS, signal);
 			return true;
 		} catch (error) {
-			handle.abortRequestedAt = undefined;
+			// Keep the abort fence until native agent_settled arrives. Production Pi
+			// can send the abort response after that settlement edge.
+			if (isAbortError(error)) throw error;
 			addDiagnostic(handle, `RPC abort failed: ${String(error)}`);
 			return false;
 		}
@@ -1278,20 +1901,67 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		requestedModel: string,
 		requestedThinking: ThinkingLevel,
 		outputPath?: string,
+		signal?: AbortSignal,
 	): Promise<SubagentHandle> {
-		if (!(await requireCurrentAuthority()))
+		if (activeCount() + pendingLaunches >= MAX_ACTIVE_CHILDREN)
+			throw new Error(`The active subagent limit of ${MAX_ACTIVE_CHILDREN} has been reached.`);
+		pendingLaunches++;
+		try {
+			return await launchReserved(
+				spec,
+				cwd,
+				requestedModel,
+				requestedThinking,
+				outputPath,
+				signal,
+			);
+		} finally {
+			pendingLaunches--;
+		}
+	}
+
+	async function launchReserved(
+		spec: TaskSpec,
+		cwd: string,
+		requestedModel: string,
+		requestedThinking: ThinkingLevel,
+		outputPath?: string,
+		signal?: AbortSignal,
+	): Promise<SubagentHandle> {
+		throwIfAborted(signal);
+		if (!(await requireCurrentAuthority(signal)))
 			throw new Error(await leaseConflictMessage());
 		const resolvedOwner = owner;
 		if (!resolvedOwner)
 			throw new Error("Controller owner identity is not established.");
-		const stat = await fs.stat(cwd).catch(() => undefined);
+		const stat = await bounded(
+			fs.stat(cwd),
+			FILE_OPERATION_TIMEOUT_MS,
+			signal,
+			`Timed out checking the subagent cwd: ${cwd}`,
+		).catch((error) => {
+			if (isAbortError(error)) throw error;
+			return undefined;
+		});
 		if (!stat?.isDirectory())
 			throw new Error(`Subagent cwd does not exist or is not a directory: ${cwd}`);
 		const id = createId();
 		const incarnation = createId();
 		const sessionDir = join(getAgentDir(), "sessions", "subagents", id);
-		await fs.mkdir(sessionDir, { recursive: true, mode: 0o700 });
-		await fs.chmod(sessionDir, 0o700).catch(() => {});
+		await bounded(
+			fs.mkdir(sessionDir, { recursive: true, mode: 0o700 }),
+			FILE_OPERATION_TIMEOUT_MS,
+			signal,
+			`Timed out creating the subagent session directory for #${id}.`,
+		);
+		await bounded(
+			fs.chmod(sessionDir, 0o700),
+			FILE_OPERATION_TIMEOUT_MS,
+			signal,
+			`Timed out securing the subagent session directory for #${id}.`,
+		).catch((error) => {
+			if (isAbortError(error)) throw error;
+		});
 		const handle = createHandle({
 			childId: id,
 			name: spec.name?.trim() || undefined,
@@ -1310,8 +1980,16 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			incarnation,
 		});
 		handles.set(id, handle);
-		await persist();
+		return await withChildOperation(handle, signal, async () => {
 		try {
+			const initiallyPersisted = await bounded(
+				persist(undefined, { important: true }),
+				PERSISTENCE_TIMEOUT_MS,
+				signal,
+				`Timed out saving the initial registry entry for #${id}.`,
+			);
+			if (!initiallyPersisted)
+				throw new Error(`Could not persist the initial state for subagent #${id}.`);
 			const invocation = buildRpcChildInvocation({
 				sessionDir,
 				model: requestedModel,
@@ -1324,24 +2002,28 @@ export default function subagentExtension(pi: ExtensionAPI) {
 					childId: id,
 					incarnation,
 					depth: getDepth() + 1,
-					runIdBase: 0,
 					systemPrompt: spec.systemPrompt || "",
 					promptPath: handle.promptPath,
 					sessionDir,
+					healthPath: childExtensionHealthPath(sessionDir, incarnation),
 					leasePath: leasePath(getAgentDir(), resolvedOwner),
 					ownerSessionFile: resolvedOwner.ownerSessionFile,
 					ownerSessionId: resolvedOwner.ownerSessionId,
 					controllerInstanceId,
 				}),
+				signal,
 			);
-			await awaitReady(handle);
-			await sendRpc(handle, { type: "get_state" }, STARTUP_TIMEOUT_MS);
+			await awaitReady(handle, signal);
+			await sendRpc(handle, { type: "get_state" }, STARTUP_TIMEOUT_MS, signal);
+			await awaitExtensionHealth(handle, signal);
 			const before = handle.runSequence;
-			await sendRpc(handle, { type: "prompt", message: spec.task });
+			await sendRpc(handle, { type: "prompt", message: spec.task }, REQUEST_TIMEOUT_MS, signal);
 			await waitUntil(
 				() => handle.runSequence > before || handle.processState === "stopped",
 				1_000,
+				signal,
 			);
+			throwIfAborted(signal);
 			return handle;
 		} catch (error) {
 			addDiagnostic(
@@ -1350,28 +2032,53 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			);
 			await terminate(handle, false).catch(() => {});
 			handles.delete(id);
-			await persist();
+			await bounded(
+				persist(undefined, { important: true }),
+				PERSISTENCE_TIMEOUT_MS,
+				undefined,
+				`Timed out removing failed subagent #${id} from the registry.`,
+			).catch((persistError) =>
+				console.error(`Failed to remove failed subagent #${id}: ${String(persistError)}`),
+			);
 			throw error;
 		}
+		});
 	}
 
-	async function resumeChild(handle: SubagentHandle, task?: string): Promise<void> {
-		if (!(await requireCurrentAuthority()))
-			throw new Error(await leaseConflictMessage());
+	async function resumeChild(
+		handle: SubagentHandle,
+		task?: string,
+		signal?: AbortSignal,
+	): Promise<void> {
+		throwIfAborted(signal);
+		if (!(await requireCurrentAuthority(signal)))
+			throw new Error(await leaseConflictMessage(signal));
 		const resolvedOwner = owner;
 		if (!resolvedOwner)
 			throw new Error("Controller owner identity is not established.");
 		const sessionFile = handle.sessionPath;
 		if (!sessionFile)
 			throw new Error(`No usable child session file exists for #${handle.id}; resume is not possible.`);
-		const usable = await fs
-			.stat(sessionFile)
+		const usable = await bounded(
+			fs.stat(sessionFile),
+			FILE_OPERATION_TIMEOUT_MS,
+			signal,
+			`Timed out checking the child session file for #${handle.id}.`,
+		)
 			.then((s) => s.isFile() && s.size > 0)
-			.catch(() => false);
+			.catch((error) => {
+				if (isAbortError(error)) throw error;
+				return false;
+			});
 		if (!usable)
 			throw new Error(`No usable child session file exists for #${handle.id}; resume is not possible.`);
 		// Complete older output publication before persisting the new incarnation.
-		await handle.outputWriteChain;
+		await bounded(
+			handle.outputWriteChain,
+			OUTPUT_WRITE_TIMEOUT_MS,
+			signal,
+			`Timed out waiting for prior caller output for #${handle.id}.`,
+		);
 		const runIdBase = Math.max(
 			handle.runSequence,
 			handle.lastSettledRunId,
@@ -1392,12 +2099,20 @@ export default function subagentExtension(pi: ExtensionAPI) {
 						runOutcome: "pending" as const,
 						settlementStatus: "pending" as const,
 						error: undefined,
+						killRequestedAt: undefined,
 						incarnation,
 						resumedFrom: oldIncarnation,
 					}
 				: entry,
 		);
-		if (!(await persist(nextRegistry)))
+		if (
+			!(await bounded(
+				persist(nextRegistry, { important: true }),
+				PERSISTENCE_TIMEOUT_MS,
+				signal,
+				`Timed out saving the resumed state for #${handle.id}.`,
+			))
+		)
 			throw new Error(`Could not persist the resumed state for #${handle.id}.`);
 		handle.runSequence = runIdBase;
 		handle.incarnation = incarnation;
@@ -1406,8 +2121,10 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		handle.completedAt = undefined;
 		handle.error = undefined;
 		handle.stopReason = undefined;
+		handle.extensionError = undefined;
 		handle.terminationPromise = undefined;
 		handle.rpcReady = false;
+		handle.extensionReady = false;
 		handle.rpcReadyAt = undefined;
 		handle.rpc = undefined;
 		handle.runtime = undefined;
@@ -1434,26 +2151,30 @@ export default function subagentExtension(pi: ExtensionAPI) {
 					childId: handle.id,
 					incarnation,
 					depth: getDepth() + 1,
-					runIdBase,
 					systemPrompt: "",
 					promptPath: handle.promptPath,
 					sessionDir: handle.sessionDir,
+					healthPath: childExtensionHealthPath(handle.sessionDir, incarnation),
 					leasePath: leasePath(getAgentDir(), resolvedOwner),
 					ownerSessionFile: resolvedOwner.ownerSessionFile,
 					ownerSessionId: resolvedOwner.ownerSessionId,
 					controllerInstanceId,
 				}),
+				signal,
 			);
-			await awaitReady(handle);
-			await sendRpc(handle, { type: "get_state" }, STARTUP_TIMEOUT_MS);
+			await awaitReady(handle, signal);
+			await sendRpc(handle, { type: "get_state" }, STARTUP_TIMEOUT_MS, signal);
+			await awaitExtensionHealth(handle, signal);
 			if (task) {
 				const before = handle.runSequence;
-				await sendRpc(handle, { type: "prompt", message: task });
+				await sendRpc(handle, { type: "prompt", message: task }, REQUEST_TIMEOUT_MS, signal);
 				await waitUntil(
 					() => handle.runSequence > before || handle.processState === "stopped",
 					1_000,
+					signal,
 				);
 			}
+			throwIfAborted(signal);
 		} catch (error) {
 			addDiagnostic(
 				handle,
@@ -1464,17 +2185,35 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		}
 	}
 
-	function waitUntil(predicate: () => boolean, timeoutMs: number): Promise<void> {
-		return new Promise((resolve) => {
-			if (predicate()) return resolve();
-			const deadline = now() + timeoutMs;
-			const timer = setInterval(() => {
-				if (predicate() || now() >= deadline) {
-					clearInterval(timer);
-					resolve();
-				}
+	function waitUntil(
+		predicate: () => boolean,
+		timeoutMs: number,
+		signal?: AbortSignal,
+	): Promise<void> {
+		throwIfAborted(signal);
+		return new Promise((resolve, reject) => {
+			let settled = false;
+			let timer: NodeJS.Timeout | undefined;
+			let deadlineTimer: NodeJS.Timeout | undefined;
+			const finish = (error?: Error) => {
+				if (settled) return;
+				settled = true;
+				if (timer) clearInterval(timer);
+				if (deadlineTimer) clearTimeout(deadlineTimer);
+				signal?.removeEventListener("abort", onAbort);
+				if (error) reject(error);
+				else resolve();
+			};
+			const onAbort = () => finish(abortError());
+			if (predicate()) return finish();
+			deadlineTimer = setTimeout(() => finish(), timeoutMs);
+			deadlineTimer.unref?.();
+			timer = setInterval(() => {
+				if (predicate()) finish();
 			}, 20);
 			timer.unref?.();
+			signal?.addEventListener("abort", onAbort, { once: true });
+			if (signal?.aborted) onAbort();
 		});
 	}
 
@@ -1524,7 +2263,13 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	async function reconcile() {
 		if (!owner || !(await requireCurrentAuthority())) return;
 		const path = ownerRegistryPath(getAgentDir(), owner);
-		const saved = registryEntriesForOwner(await loadRegistry(path), owner);
+		const loaded = await bounded(
+			loadRegistry(path),
+			FILE_OPERATION_TIMEOUT_MS,
+			undefined,
+			"Timed out loading the subagent registry.",
+		);
+		const saved = registryEntriesForOwner(loaded, owner);
 		for (const entry of saved) {
 			const existing = handles.get(entry.childId);
 			const runtime = runtimeChildren.get(entry.childId);
@@ -1538,9 +2283,15 @@ export default function subagentExtension(pi: ExtensionAPI) {
 					error: "RPC child process was not available after controller reload.",
 				});
 			}
-			if (runtime?.transport.isClosed) runtimeChildren.delete(entry.childId);
 		}
-		await persist();
+		await bounded(
+			persist(undefined, { important: true }),
+			PERSISTENCE_TIMEOUT_MS,
+			undefined,
+			"Timed out saving the reconciled subagent registry.",
+		).catch((error) =>
+			console.error(`Subagent registry reconcile persistence failed: ${String(error)}`),
+		);
 		refreshUi();
 	}
 
@@ -1619,6 +2370,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	}
 
 	function stopTimers() {
+		leaseRenewGeneration++;
 		if (leaseRenewTimer) {
 			clearInterval(leaseRenewTimer);
 			leaseRenewTimer = undefined;
@@ -1626,20 +2378,46 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	}
 
 	function startLeaseRenewal() {
-		if (leaseRenewTimer) clearInterval(leaseRenewTimer);
+		stopTimers();
+		const generation = leaseRenewGeneration;
 		leaseRenewTimer = setInterval(() => {
-			if (!owner || !leaseHeld) return;
-			void renewLease(getAgentDir(), owner, controllerInstanceId, now()).then(
-				(ok) => {
-					if (ok) return;
+			const authorityOwner = owner;
+			if (
+				!authorityOwner ||
+				!leaseHeld ||
+				generation !== leaseRenewGeneration ||
+				leaseRenewPromise
+			)
+				return;
+			const renewal = (async () => {
+				const ok = await bounded(
+					renewLease(getAgentDir(), authorityOwner, controllerInstanceId, now()),
+					FILE_OPERATION_TIMEOUT_MS,
+					undefined,
+					"Timed out renewing the subagent controller lease.",
+				);
+				if (
+					generation !== leaseRenewGeneration ||
+					owner !== authorityOwner ||
+					!leaseHeld
+				)
+					return;
+				if (!ok)
 					void loseAuthority(
 						"Controller lease lost during renewal. Run /reload to re-establish it.",
 					);
-				},
-				(error) => {
+			})().catch((error) => {
+				if (
+					generation === leaseRenewGeneration &&
+					owner === authorityOwner &&
+					leaseHeld
+				)
 					void loseAuthority(`Controller lease renewal failed: ${String(error)}`);
-				},
-			);
+			});
+			leaseRenewPromise = renewal;
+			void renewal.then(() => {
+				if (leaseRenewPromise === renewal) leaseRenewPromise = undefined;
+			});
 		}, LEASE_RENEW_INTERVAL_MS);
 		leaseRenewTimer.unref();
 	}
@@ -1647,23 +2425,53 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	async function establishController(ctx: ExtensionContext): Promise<void> {
 		const sessionFile = ctx.sessionManager?.getSessionFile();
 		const sessionId = ctx.sessionManager?.getSessionId();
-		if (!sessionFile || !sessionId) {
+		const ephemeralSessionId =
+			typeof sessionId === "string" && sessionId
+				? sessionId
+				: `ephemeral-${processControllerInstanceId}`;
+		let ownerSessionFile: string;
+		try {
+			ownerSessionFile = sessionFile
+				? await bounded(
+						canonicalOwnerSessionFile(sessionFile),
+						FILE_OPERATION_TIMEOUT_MS,
+						undefined,
+						"Timed out resolving the parent session identity.",
+					)
+				: `memory:${ephemeralSessionId}`;
+		} catch (error) {
 			owner = null;
 			leaseHeld = false;
 			stopTimers();
 			setControllerStatus(ctx, undefined);
+			console.error(`Subagent controller identity failed: ${String(error)}`);
 			return;
 		}
 		const resolved: OwnerIdentity = {
-			ownerSessionFile: await canonicalOwnerSessionFile(sessionFile),
-			ownerSessionId: sessionId,
+			ownerSessionFile,
+			ownerSessionId: ephemeralSessionId,
 		};
-		const result = await acquireLease(
-			getAgentDir(),
-			resolved,
-			controllerInstanceId,
-			now(),
-		);
+		let result;
+		try {
+			result = await bounded(
+				acquireLease(
+					getAgentDir(),
+					resolved,
+					controllerInstanceId,
+					now(),
+				),
+				FILE_OPERATION_TIMEOUT_MS,
+				undefined,
+				"Timed out acquiring the subagent controller lease.",
+			);
+		} catch (error) {
+			owner = null;
+			leaseHeld = false;
+			stopTimers();
+			setControllerStatus(ctx, undefined);
+			console.error(`Subagent controller lease acquisition failed: ${String(error)}`);
+			return;
+		}
 		if (result.conflict) {
 			owner = null;
 			leaseHeld = false;
@@ -1681,12 +2489,25 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		startLeaseRenewal();
 	}
 
-	async function leaseConflictMessage(): Promise<string> {
+	async function leaseConflictMessage(signal?: AbortSignal): Promise<string> {
+		throwIfAborted(signal);
 		const base = "Subagent controller lease is not held.";
 		if (!owner)
-			return `${base} This Pi session has no persisted session file, so no controller was established.`;
-		const path = leasePath(getAgentDir(), owner);
-		const existing = await readLeaseRecord(getAgentDir(), owner).catch(() => undefined);
+			return `${base} This Pi session uses an in-memory controller identity. Run /reload to re-establish it.`;
+		const currentOwner = owner;
+		const path = leasePath(getAgentDir(), currentOwner);
+		let existing;
+		try {
+			existing = await bounded(
+				readLeaseRecord(getAgentDir(), currentOwner),
+				FILE_OPERATION_TIMEOUT_MS,
+				signal,
+				"Timed out reading the subagent controller lease.",
+			);
+		} catch (error) {
+			if (isAbortError(error)) throw error;
+			return `${base} The lease record at ${path} could not be read. Run /reload to re-establish it.`;
+		}
 		if (!existing)
 			return `${base} No lease record exists at ${path}. Run /reload to re-establish this controller.`;
 		if (existing.controllerInstanceId === controllerInstanceId)
@@ -1696,23 +2517,83 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			: `${base} The record at ${path} names pid ${existing.pid}, which is no longer running. Run /reload to take it over.`;
 	}
 
-	function releaseLeaseIfHeld() {
-		if (!owner || !leaseHeld) return Promise.resolve();
-		return releaseLease(getAgentDir(), owner, controllerInstanceId);
+	async function releaseLeaseIfHeld(): Promise<void> {
+		if (!owner || !leaseHeld) return;
+		const currentOwner = owner;
+		await bounded(
+			releaseLease(getAgentDir(), currentOwner, controllerInstanceId),
+			FILE_OPERATION_TIMEOUT_MS,
+			undefined,
+			"Timed out releasing the subagent controller lease.",
+		).catch((error) =>
+			console.error(`Subagent controller lease release failed: ${String(error)}`),
+		);
 	}
 
-	async function waitForOutputWrites(): Promise<void> {
-		await Promise.all([...handles.values()].map((handle) => handle.outputWriteChain));
+	async function waitForOutputWrites(): Promise<boolean> {
+		let complete = true;
+		await Promise.all(
+			[...handles.values()].map(async (handle) => {
+				try {
+					await bounded(
+						handle.outputWriteChain,
+						OUTPUT_WRITE_TIMEOUT_MS,
+						undefined,
+						`Timed out waiting for caller output for #${handle.id}.`,
+					);
+				} catch (error) {
+					complete = false;
+					addDiagnostic(handle, `Caller output cleanup failed: ${String(error)}`);
+					handle.outputWriteChain = Promise.resolve();
+				}
+			}),
+		);
+		return complete;
+	}
+
+	async function waitForPersistence(): Promise<boolean> {
+		try {
+			await bounded(
+				persistenceChain,
+				PERSISTENCE_TIMEOUT_MS,
+				undefined,
+				"Timed out waiting for subagent registry persistence.",
+			);
+			return true;
+		} catch (error) {
+			if (pendingPersistence) {
+				for (const waiter of pendingPersistence.waiters) waiter(false);
+				pendingPersistence = undefined;
+			}
+			persistenceChain = Promise.resolve();
+			for (const handle of handles.values())
+				addDiagnostic(handle, `Registry cleanup was forced: ${String(error)}`);
+			return false;
+		}
 	}
 
 	async function stopAllChildren(): Promise<void> {
-		await Promise.allSettled(
+		const termination = Promise.allSettled(
 			sorted()
 				.filter(active)
-				.map((handle) => terminate(handle, false)),
+				.map((handle) => withChildOperation(handle, undefined, () => terminate(handle, false))),
 		);
+		try {
+			await bounded(
+				termination,
+				SHUTDOWN_TIMEOUT_MS,
+				undefined,
+				"Timed out stopping subagent children.",
+			);
+		} catch (error) {
+			for (const handle of sorted().filter(active)) {
+				addDiagnostic(handle, `Forced child cleanup: ${String(error)}`);
+				if (handle.runtime) await forceCleanupRuntime(handle.runtime);
+			}
+		}
 		await waitForOutputWrites();
-		await persistenceChain;
+		await waitForPersistence();
+		await forceCleanupRuntimes();
 	}
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -1738,14 +2619,21 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				detachRuntime(handle.runtime);
 			}
 			await waitForOutputWrites();
-			await persistenceChain;
+			await waitForPersistence();
 			if (ctx.mode === "tui") ctx.ui.setWidget("subagent", undefined);
 			latestCtx = null;
 			return;
 		}
 		await stopAllChildren();
-		await persist();
-		await persistenceChain;
+		const persisted = await bounded(
+			persist(undefined, { important: true }),
+			PERSISTENCE_TIMEOUT_MS,
+			undefined,
+			"Timed out saving the final subagent registry.",
+		);
+		if (!persisted)
+			console.error("Final subagent registry persistence did not complete.");
+		await waitForPersistence();
 		stopTimers();
 		await releaseLeaseIfHeld();
 		owner = null;
@@ -1770,7 +2658,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		description:
 			"Start a persistent Pi RPC child with an explicit model and thinking level. The response confirms acceptance only. Use outputPath for optional caller-owned atomic output. A best-effort settlement wake reports success, failure, or abort. Diagnose runs with subagent_status instead of polling for completion. Call subagent_kill when the child is no longer useful.",
 		parameters: TaskSpecSchema,
-		async execute(_id, params, _signal, _update, ctx) {
+		async execute(_id, params, signal, _update, ctx) {
+			throwIfAborted(signal);
 			latestCtx = ctx;
 			if (getDepth() > 0)
 				return {
@@ -1794,19 +2683,24 @@ export default function subagentExtension(pi: ExtensionAPI) {
 					],
 					details: {},
 				};
+			let startedHandle: SubagentHandle | undefined;
 			try {
 				const callerCwd = ctx.cwd;
 				const childCwd = spec.cwd ? resolve(callerCwd, spec.cwd) : callerCwd;
 				const outputPath = spec.outputPath
 					? resolve(callerCwd, spec.outputPath)
 					: undefined;
-				const handle = await launch(
-					spec,
-					childCwd,
-					choice.model,
-					choice.thinking,
-					outputPath,
+				const handle = await withLaunchReservation(signal, () =>
+					launch(
+						spec,
+						childCwd,
+						choice.model,
+						choice.thinking,
+						outputPath,
+						signal,
+					),
 				);
+				startedHandle = handle;
 				return {
 					content: [
 						{
@@ -1814,9 +2708,14 @@ export default function subagentExtension(pi: ExtensionAPI) {
 							text: `Started persistent subagent #${handle.id} as a Pi RPC child process.`,
 						},
 					],
-					details: { handle: await serialize(handle) },
+					details: { handle: await serialize(handle, {}, signal) },
 				};
 			} catch (error) {
+				if (isAbortError(error)) {
+					if (startedHandle)
+						await terminate(startedHandle, false).catch(() => {});
+					throw error;
+				}
 				return {
 					content: [
 						{
@@ -1834,20 +2733,27 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		label: "Subagent List",
 		description: "List current and retained persistent subagents.",
 		parameters: ListSchema,
-		async execute(_id, params) {
+		async execute(_id, params, signal) {
+			throwIfAborted(signal);
 			const chosen = sorted().filter(
 				(handle) => (params.includeFinished ?? true) || active(handle),
+			);
+			const details = await Promise.all(
+				chosen.map(async (handle) => {
+					const serial = await serialize(handle, {}, signal);
+					return { serial, text: await summary(handle, serial) };
+				}),
 			);
 			return {
 				content: [
 					{
 						type: "text" as const,
-						text: chosen.length
-							? (await Promise.all(chosen.map(summary))).join("\n\n")
+						text: details.length
+							? details.map(({ text }) => text).join("\n\n")
 							: "No subagents tracked yet.",
 					},
 				],
-				details: { handles: await Promise.all(chosen.map((handle) => serialize(handle))) },
+				details: { handles: details.map(({ serial }) => serial) },
 			};
 		},
 	});
@@ -1857,19 +2763,24 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		description:
 			"Return bounded process/run diagnostics, settlement evidence, transcript text, and caller output status. Use this tool for diagnosis only. Do not infer completion from polling, silence, transcript text, or output files.",
 		parameters: StatusSchema,
-		async execute(_id, params) {
+		async execute(_id, params, signal) {
+			throwIfAborted(signal);
 			const handle = handles.get(params.id);
 			if (!handle)
 				return {
 					content: [{ type: "text" as const, text: `Unknown subagent id: ${params.id}` }],
 					details: {},
 				};
-			const serial = await serialize(handle, {
-				messageOffset: params.messageOffset,
-				numMessages: params.numMessages,
-			});
+			const serial = await serialize(
+				handle,
+				{
+					messageOffset: params.messageOffset,
+					numMessages: params.numMessages,
+				},
+				signal,
+			);
 			return {
-				content: [{ type: "text" as const, text: await summary(handle) }],
+				content: [{ type: "text" as const, text: await summary(handle, serial) }],
 				details: {
 					...serial,
 					timestamps: {
@@ -1893,7 +2804,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		label: "Subagent Steer",
 		description: "Accept or queue guidance during a child turn over RPC. The response does not mean completion.",
 		parameters: MessageSchema,
-		async execute(_id, params) {
+		async execute(_id, params, signal) {
+			throwIfAborted(signal);
 			const handle = handles.get(params.id);
 			if (!handle)
 				return {
@@ -1901,21 +2813,25 @@ export default function subagentExtension(pi: ExtensionAPI) {
 					details: {},
 				};
 			try {
-				const command = await deliverMessage(
-					handle,
-					"steer",
-					params.message.trim(),
+				const command = await withChildOperation(handle, signal, () =>
+					deliverMessage(
+						handle,
+						"steer",
+						params.message.trim(),
+						signal,
+					),
 				);
 				return {
 					content: [{ type: "text" as const, text: `Steering accepted by #${handle.id}.` }],
 					details: {
-						handle: await serialize(handle),
+						handle: await serialize(handle, {}, signal),
 						accepted: true,
 						queued: command !== "prompt",
 						command,
 					},
 				};
 			} catch (error) {
+				if (isAbortError(error)) throw error;
 				return { content: [{ type: "text" as const, text: String(error) }], details: { accepted: false } };
 			}
 		},
@@ -1925,7 +2841,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		label: "Subagent Follow Up",
 		description: "Accept or queue another user turn for a live persistent child. The response does not mean completion.",
 		parameters: MessageSchema,
-		async execute(_id, params) {
+		async execute(_id, params, signal) {
+			throwIfAborted(signal);
 			const handle = handles.get(params.id);
 			if (!handle)
 				return {
@@ -1933,21 +2850,25 @@ export default function subagentExtension(pi: ExtensionAPI) {
 					details: {},
 				};
 			try {
-				const command = await deliverMessage(
-					handle,
-					"follow_up",
-					params.message.trim(),
+				const command = await withChildOperation(handle, signal, () =>
+					deliverMessage(
+						handle,
+						"follow_up",
+						params.message.trim(),
+						signal,
+					),
 				);
 				return {
 					content: [{ type: "text" as const, text: `Follow-up accepted by #${handle.id}.` }],
 					details: {
-						handle: await serialize(handle),
+						handle: await serialize(handle, {}, signal),
 						accepted: true,
 						queued: command !== "prompt",
 						command,
 					},
 				};
 			} catch (error) {
+				if (isAbortError(error)) throw error;
 				return { content: [{ type: "text" as const, text: String(error) }], details: { accepted: false } };
 			}
 		},
@@ -1957,7 +2878,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		label: "Subagent Interrupt",
 		description: "Accept a cooperative abort while keeping the child process alive. Native settlement reports the eventual aborted outcome.",
 		parameters: IdSchema,
-		async execute(_id, params) {
+		async execute(_id, params, signal) {
+			throwIfAborted(signal);
 			const handle = handles.get(params.id);
 			if (!handle)
 				return {
@@ -1965,7 +2887,9 @@ export default function subagentExtension(pi: ExtensionAPI) {
 					details: {},
 				};
 			try {
-				const interrupted = await interrupt(handle);
+				const interrupted = await withChildOperation(handle, signal, () =>
+					interrupt(handle, signal),
+				);
 				return {
 					content: [
 						{
@@ -1976,13 +2900,14 @@ export default function subagentExtension(pi: ExtensionAPI) {
 						},
 					],
 					details: {
-						handle: await serialize(handle),
+						handle: await serialize(handle, {}, signal),
 						interrupted,
 						accepted: interrupted,
 						settlementPending: interrupted && handle.runState !== "idle",
 					},
 				};
 			} catch (error) {
+				if (isAbortError(error)) throw error;
 				return { content: [{ type: "text" as const, text: String(error) }], details: { interrupted: false } };
 			}
 		},
@@ -1992,20 +2917,19 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		label: "Subagent Kill",
 		description: "Terminate the child process after cooperative abort and bounded escalation. Use this cleanup action for completed or abandoned children.",
 		parameters: IdSchema,
-		async execute(_id, params) {
+		async execute(_id, params, signal) {
+			throwIfAborted(signal);
 			const handle = handles.get(params.id);
 			if (!handle)
 				return {
 					content: [{ type: "text" as const, text: `Unknown subagent id: ${params.id}` }],
 					details: {},
 				};
-			if (!active(handle))
-				return {
-					content: [{ type: "text" as const, text: `Subagent #${handle.id} is already stopped.` }],
-					details: { handle: await serialize(handle) },
-				};
-			await terminate(handle);
-			const stopped = handle.processState === "stopped";
+			const stopped = await withChildOperation(handle, signal, async () => {
+				if (!active(handle)) return true;
+				await terminate(handle, true, signal);
+				return handle.processState === "stopped";
+			});
 			return {
 				content: [
 					{
@@ -2015,7 +2939,10 @@ export default function subagentExtension(pi: ExtensionAPI) {
 							: `Could not confirm termination of subagent #${handle.id}; the tracked process still appears live.`,
 					},
 				],
-				details: { handle: await serialize(handle), terminated: stopped },
+				details: {
+					handle: await serialize(handle, {}, signal),
+					terminated: stopped,
+				},
 			};
 		},
 	});
@@ -2024,30 +2951,41 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		label: "Subagent Resume",
 		description: "Resume a stopped child from its saved Pi session file in a new RPC process incarnation.",
 		parameters: ResumeSchema,
-		async execute(_id, params) {
+		async execute(_id, params, signal) {
+			throwIfAborted(signal);
 			const handle = handles.get(params.id);
 			if (!handle)
 				return {
 					content: [{ type: "text" as const, text: `Unknown subagent id: ${params.id}` }],
 					details: {},
 				};
-			if (active(handle))
-				return {
-					content: [{ type: "text" as const, text: `Subagent #${handle.id} is still alive; resume is for stopped children.` }],
-					details: { handle: await serialize(handle) },
-				};
-			if (!requireLease())
-				return { content: [{ type: "text" as const, text: await leaseConflictMessage() }], details: {} };
 			try {
-				await resumeChild(handle, params.task);
+				const action = await withChildOperation(handle, signal, async () => {
+					if (active(handle)) return { kind: "active" as const };
+					if (!requireLease())
+						return {
+							kind: "conflict" as const,
+							text: await leaseConflictMessage(signal),
+						};
+					await resumeChild(handle, params.task, signal);
+					return { kind: "resumed" as const };
+				});
+				if (action.kind === "active")
+					return {
+						content: [{ type: "text" as const, text: `Subagent #${handle.id} is still alive; resume is for stopped children.` }],
+						details: { handle: await serialize(handle, {}, signal) },
+					};
+				if (action.kind === "conflict")
+					return { content: [{ type: "text" as const, text: action.text }], details: {} };
 				return {
 					content: [{ type: "text" as const, text: `Resumed subagent #${handle.id} from ${handle.sessionPath} in a new RPC process incarnation.` }],
-					details: { handle: await serialize(handle) },
+					details: { handle: await serialize(handle, {}, signal) },
 				};
 			} catch (error) {
+				if (isAbortError(error)) throw error;
 				return {
 					content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }],
-					details: { handle: await serialize(handle) },
+					details: { handle: await serialize(handle, {}, signal) },
 				};
 			}
 		},
