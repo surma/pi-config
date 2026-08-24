@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { dirname, join } from "node:path";
 
 const args = process.argv.slice(2);
@@ -7,7 +8,8 @@ const mode = process.env.E2E_FAKE_MODE || "success";
 const logPath = process.env.E2E_LOG_PATH;
 const markerPath = process.env.E2E_MARKER_PATH;
 const controlPath = process.env.E2E_CONTROL_PATH;
-const floodCount = Number.parseInt(process.env.E2E_FLOOD_COUNT || "600", 10) || 600;
+let floodCount = Number.parseInt(process.env.E2E_FLOOD_COUNT || "600", 10) || 600;
+const reloadQueueCount = Number.parseInt(process.env.E2E_RELOAD_QUEUE_COUNT || String(floodCount), 10) || floodCount;
 const abortResponseDelay = Number.parseInt(process.env.E2E_ABORT_RESPONSE_DELAY || "40", 10) || 40;
 
 function log(record) {
@@ -16,6 +18,19 @@ function log(record) {
 
 function mark(value) {
   if (markerPath) appendFileSync(markerPath, `${value}\n`);
+}
+
+function startsLogged() {
+  if (!logPath) return 0;
+  try {
+    return readFileSync(logPath, "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .filter((line) => JSON.parse(line).event === "start")
+      .length;
+  } catch {
+    return 0;
+  }
 }
 
 function output(record) {
@@ -44,9 +59,15 @@ if (sessionFile) {
   mkdirSync(join(sessionFile, ".."), { recursive: true });
   if (!existsSync(sessionFile)) writeFileSync(sessionFile, '{"type":"session"}\n');
 }
-if (process.env.PI_SUBAGENT_HEALTH_PATH && mode !== "extension-error") {
+if (process.env.PI_SUBAGENT_HEALTH_PATH) {
   mkdirSync(dirname(process.env.PI_SUBAGENT_HEALTH_PATH), { recursive: true });
-  writeFileSync(process.env.PI_SUBAGENT_HEALTH_PATH, "pi-subagent-child-extension-ready/v1\n");
+  if (mode === "health-stuck-read") {
+    execFileSync("mkfifo", [process.env.PI_SUBAGENT_HEALTH_PATH]);
+  } else if (mode === "stale-health") {
+    writeFileSync(process.env.PI_SUBAGENT_HEALTH_PATH, "pi-subagent-child-extension-ready/v0\n");
+  } else if (mode !== "extension-error") {
+    writeFileSync(process.env.PI_SUBAGENT_HEALTH_PATH, "pi-subagent-child-extension-ready/v1\n");
+  }
 }
 
 log({ event: "start", pid: process.pid, args, mode, sessionFile });
@@ -73,6 +94,8 @@ if (mode === "large-transcript" && sessionFile) {
 let run = Number.parseInt(process.env.PI_SUBAGENT_RUN_ID_BASE || "0", 10) || 0;
 let activeRun;
 let promptCount = 0;
+let messageCount = 0;
+let abortCount = 0;
 let messageBusy = false;
 let reloadReleased = false;
 let input = "";
@@ -120,8 +143,8 @@ function settleRun(runId, text, outcome = "succeeded") {
   });
   output({ type: "message_end", message: assistant });
   appendSession({ role: "assistant", content: [{ type: "text", text }] });
-  output({ type: "agent_end", runId, messages: [assistant], willRetry: false });
-  output({ type: "agent_settled", runId, runOutcome: outcome });
+  output({ type: "agent_end", messages: [assistant], willRetry: false });
+  output({ type: "agent_settled" });
   activeRun = undefined;
 }
 
@@ -163,7 +186,7 @@ function floodRun(runId, prefix = "flood") {
   };
   output({ type: "message_end", message: assistant });
   appendSession({ role: "assistant", content: [{ type: "text", text: finalText }] });
-  output({ type: "agent_end", runId, messages: [assistant], willRetry: false });
+  output({ type: "agent_end", messages: [assistant], willRetry: false });
   output({ type: "agent_settled" });
   activeRun = undefined;
   mark("flood-done");
@@ -176,7 +199,7 @@ function startPrompt(message) {
   activeRun = runId;
   const text = `result-${runId} ${String(message || "")}`;
   appendSession({ role: "user", content: [{ type: "text", text: String(message || "") }] });
-  output({ type: "agent_start", runId });
+  output({ type: "agent_start" });
 
   if (mode === "hang-prompt") return;
   if (mode === "close") {
@@ -185,7 +208,14 @@ function startPrompt(message) {
     setTimeout(() => process.exit(17), 100);
     return;
   }
-  if (mode === "hang-message" || mode === "hang-abort" || mode === "message-race") {
+  if (
+    mode === "hang-message" ||
+    mode === "hang-abort" ||
+    mode === "message-race" ||
+    mode === "queue-message" ||
+    mode === "queue-interrupt" ||
+    mode === "queue-kill"
+  ) {
     mark(promptCount === 1 ? "active" : `active-${promptCount}`);
     return;
   }
@@ -197,12 +227,15 @@ function startPrompt(message) {
     mark("second-run-active");
     return;
   }
-  if (mode === "reload-queue") {
+  if (mode === "reload-queue" || mode === "reload-queue-under-limit" || mode === "reload-queue-overflow") {
     mark("reload-ready");
     const poll = setInterval(() => {
       if (reloadReleased) {
         clearInterval(poll);
+        const originalFloodCount = floodCount;
+        floodCount = reloadQueueCount;
         floodRun(runId, "reload");
+        floodCount = originalFloodCount;
       } else if (controlPath && existsSync(controlPath)) {
         try {
           reloadReleased = readFileSync(controlPath, "utf8").includes("emit");
@@ -228,7 +261,12 @@ function startPrompt(message) {
 
 function command(command) {
   if (command.type === "get_state") {
-    if (mode === "hang-get-state" || (mode === "hang-resume-state" && run > 0)) return;
+    if (
+      mode === "hang-get-state" ||
+      (mode === "hang-resume-state" && startsLogged() > 1) ||
+      (mode === "queue-launch" && startsLogged() === 1) ||
+      (mode === "queue-resume" && run > 0 && startsLogged() <= 2)
+    ) return;
     if (mode === "extension-error") {
       output({
         type: "extension_error",
@@ -253,7 +291,13 @@ function command(command) {
     return;
   }
   if (command.type === "abort") {
-    if (mode === "hang-abort" || mode === "hang-message") return;
+    abortCount += 1;
+    if (
+      mode === "hang-abort" ||
+      mode === "hang-message" ||
+      (mode === "queue-interrupt" && abortCount === 1) ||
+      (mode === "queue-kill" && abortCount === 1)
+    ) return;
     const settledRun = activeRun;
     if (settledRun === undefined) {
       respond(command);
@@ -267,13 +311,18 @@ function command(command) {
     }
     respond(command);
     setTimeout(() => {
-      output({ type: "agent_settled", runId: settledRun, runOutcome: "aborted" });
+      output({ type: "agent_settled" });
       activeRun = undefined;
     }, 20);
     return;
   }
   if (command.type === "steer" || command.type === "follow_up") {
     if (mode === "hang-message" || mode === "hang-abort") return;
+    messageCount += 1;
+    if (mode === "queue-message" && messageCount === 1) {
+      mark("predecessor-message");
+      return;
+    }
     if (mode === "message-race") {
       if (messageBusy) {
         log({ event: "message-overlap", command: command.type });

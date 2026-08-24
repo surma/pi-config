@@ -195,11 +195,13 @@ e2eTest("E2E: slow production abort remains accepted after settlement", { timeou
 
 e2eTest("E2E: stream updates keep registry persistence bounded", { timeout: 12_000 }, async () => {
 	const result = await runScenario("stream-flood", 9_000);
-	assert.ok(Number(result.registryEvents) < 100);
+	assert.ok(Number(result.registrySaves) > 0);
+	assert.ok(Number(result.registrySaves) < 100);
 });
 
-e2eTest("E2E: persistence floods cannot hold shutdown", { timeout: 15_000 }, async () => {
+e2eTest("E2E: persistence floods save current state and cannot hold shutdown", { timeout: 15_000 }, async () => {
 	const result = await runScenario("persistence-flood", 12_000);
+	assert.ok(Number(result.registrySaves) > 0);
 	assert.ok(Number(result.shutdownMs) < 1_000);
 });
 
@@ -213,24 +215,43 @@ e2eTest("E2E: oversized unterminated RPC records are discarded with a diagnostic
 	assert.equal(result.discarded, true);
 });
 
-e2eTest("E2E: RPC stdin honors stream backpressure", { timeout: 8_000 }, async () => {
+e2eTest("E2E: RPC stdin bounds pending requests and queued bytes", { timeout: 8_000 }, async () => {
 	const result = await runScenario("backpressure");
-	assert.ok(Number(result.writableLength) <= 8 * 1024 * 1024);
+	assert.ok(Number(result.pendingBefore) > 0);
+	assert.equal(Number(result.pendingAfter), 0);
+	assert.ok(Number(result.queuedBytesBefore) <= 16 * 1024 * 1024);
 });
 
-e2eTest("E2E: reload drains queued records without losing settlement", { timeout: 12_000 }, async () => {
-	const result = await runScenario("reload-queue", 9_000);
+e2eTest("E2E: reload drains under-limit records without losing settlement", { timeout: 12_000 }, async () => {
+	const result = await runScenario("reload-queue-under-limit", 9_000);
 	assert.equal(result.queueDelivered, true);
+	assert.equal(result.overflow, false);
+	assert.ok(Number(result.queueCount) < 512);
 });
 
-e2eTest("E2E: startup rejects a child with an extension health error", { timeout: 8_000 }, async () => {
+e2eTest("E2E: reload reports explicit overflow while preserving settlement", { timeout: 12_000 }, async () => {
+	const result = await runScenario("reload-queue-overflow", 9_000);
+	assert.equal(result.queueDelivered, true);
+	assert.equal(result.overflow, true);
+	assert.ok(Number(result.queueCount) > 512);
+	assert.ok(
+		(Array.isArray(result.diagnostics) ? result.diagnostics : []).some((value) =>
+			String(value).includes("Older records were discarded"),
+		),
+	);
+});
+
+e2eTest("E2E: startup requires the exact health marker and rejects extension errors", { timeout: 8_000 }, async () => {
 	const result = await runScenario("startup-extension-health");
+	assert.equal(result.markerExact, true);
 	assert.equal(result.rejected, true);
 });
 
-e2eTest("E2E: close callback errors cannot crash the parent", { timeout: 8_000 }, async () => {
+e2eTest("E2E: asynchronous close callbacks preserve lifecycle evidence", { timeout: 8_000 }, async () => {
 	const result = await runScenario("close-callback");
 	assert.equal(result.closeHandled, true);
+	assert.equal(result.lifecycle, "error");
+	assert.equal(result.forced, false);
 });
 
 e2eTest("E2E: aborted idle state does not contradict its lifecycle", { timeout: 8_000 }, async () => {
@@ -266,6 +287,14 @@ e2eTest("E2E: settlement guidance names the status message parameter", { timeout
 e2eTest("E2E: concurrent resume creates one child incarnation", { timeout: 12_000 }, async () => {
 	const result = await runScenario("concurrent-resume", 9_000);
 	assert.equal(result.processStarts, 2);
+});
+
+e2eTest("E2E: a canceled queued operation releases its predecessor", { timeout: 12_000 }, async () => {
+	const result = await runScenario("hanging-predecessor", 9_000);
+	assert.equal(result.predecessorCanceled, true);
+	assert.equal(result.successorCanceled, true);
+	assert.equal(result.queueReleased, true);
+	assert.equal(result.processStarts, 1);
 });
 
 e2eTest("E2E: concurrent same-child messages serialize", { timeout: 10_000 }, async () => {
