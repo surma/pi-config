@@ -15,6 +15,7 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 import type { TSchema } from "@sinclair/typebox";
 import { Check } from "@sinclair/typebox/value";
 import subagentExtension from "./index.ts";
+import { RpcChildTransport } from "./rpc.js";
 import { leasePath, ownerRegistryPath } from "./owner.ts";
 
 // The test process can inherit the delegated-child marker from the parent harness.
@@ -326,6 +327,163 @@ test("nested children cannot start another delegated child", async () => {
 	} finally {
 		if (previous === undefined) delete process.env.PI_SUBAGENT_DEPTH;
 		else process.env.PI_SUBAGENT_DEPTH = previous;
+	}
+});
+
+test("aborted tool calls reject without a normal result", async () => {
+	const { tools } = setup();
+	const signal = AbortSignal.abort(new Error("caller canceled"));
+	await assert.rejects(
+		requireTool(tools, "subagent_status").execute(
+			"aborted",
+			{ id: "missing" },
+			signal,
+		),
+		(error: unknown) => error instanceof Error && error.name === "AbortError",
+	);
+});
+
+test("parent signals reach RPC transport requests", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "pi-rpc-signal-forwarding-"));
+	const agentDirectory = join(directory, "agent");
+	const parentSession = join(directory, "parent.jsonl");
+	const logPath = join(directory, "invocations.jsonl");
+	await writeFile(parentSession, "parent\\n");
+	const binary = await fakePi(directory, logPath);
+	const old = {
+		agentDirectory: process.env.PI_CODING_AGENT_DIR,
+		pi: process.env.PI_SUBAGENT_PI_BIN,
+		depth: process.env.PI_SUBAGENT_DEPTH,
+	};
+	process.env.PI_CODING_AGENT_DIR = agentDirectory;
+	process.env.PI_SUBAGENT_PI_BIN = binary;
+	delete process.env.PI_SUBAGENT_DEPTH;
+	const handlers = new Map<string, TestHandler>();
+	const { tools } = setup(handlers);
+	const ctx = context(parentSession, "signal-forwarding-parent", directory);
+	const prototype = RpcChildTransport.prototype as unknown as {
+		send: (...args: any[]) => Promise<unknown>;
+	};
+	const originalSend = prototype.send;
+	let observedSignal: AbortSignal | undefined;
+	prototype.send = function (...args: any[]): Promise<unknown> {
+		observedSignal = args[2] as AbortSignal | undefined;
+		return originalSend.apply(this, args);
+	};
+	try {
+		await handlers.get("session_start")?.({ reason: "startup" }, ctx);
+		const started = await requireTool(tools, "subagent_start").execute(
+			"start",
+			{ task: "initial", model: "provider/model", thinking: "off" },
+			undefined,
+			undefined,
+			ctx,
+		);
+		const signal = new AbortController().signal;
+		await requireTool(tools, "subagent_follow_up").execute(
+			"follow-up",
+			{ id: started.details.handle.id, message: "next" },
+			signal,
+			undefined,
+			ctx,
+		);
+		assert.equal(observedSignal, signal);
+	} finally {
+		prototype.send = originalSend;
+		await handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
+		if (old.agentDirectory === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = old.agentDirectory;
+		if (old.pi === undefined) delete process.env.PI_SUBAGENT_PI_BIN;
+		else process.env.PI_SUBAGENT_PI_BIN = old.pi;
+		if (old.depth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
+		else process.env.PI_SUBAGENT_DEPTH = old.depth;
+	}
+});
+
+test("a canceled queue waiter cannot overlap a live predecessor", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "pi-rpc-queue-fence-"));
+	const agentDirectory = join(directory, "agent");
+	const parentSession = join(directory, "parent.jsonl");
+	const logPath = join(directory, "invocations.jsonl");
+	await writeFile(parentSession, "parent\\n");
+	const binary = await fakePi(directory, logPath);
+	const old = {
+		agentDirectory: process.env.PI_CODING_AGENT_DIR,
+		pi: process.env.PI_SUBAGENT_PI_BIN,
+		depth: process.env.PI_SUBAGENT_DEPTH,
+	};
+	process.env.PI_CODING_AGENT_DIR = agentDirectory;
+	process.env.PI_SUBAGENT_PI_BIN = binary;
+	delete process.env.PI_SUBAGENT_DEPTH;
+	const handlers = new Map<string, TestHandler>();
+	const { tools } = setup(handlers);
+	const ctx = context(parentSession, "queue-fence-parent", directory);
+	const prototype = RpcChildTransport.prototype as unknown as {
+		send: (...args: any[]) => Promise<unknown>;
+	};
+	const originalSend = prototype.send;
+	let delayFirstPrompt = false;
+	const promptCalls: unknown[] = [];
+	prototype.send = function (...args: any[]): Promise<unknown> {
+		const body = args[0] as Record<string, unknown>;
+		if (body.type === "prompt") {
+			promptCalls.push(body);
+			if (delayFirstPrompt) {
+				delayFirstPrompt = false;
+				return new Promise((resolve, reject) => {
+					setTimeout(() => {
+						void originalSend.apply(this, args).then(resolve, reject);
+					}, 150);
+				});
+			}
+		}
+		return originalSend.apply(this, args);
+	};
+	try {
+		await handlers.get("session_start")?.({ reason: "startup" }, ctx);
+		const started = await requireTool(tools, "subagent_start").execute(
+			"start",
+			{ task: "initial", model: "provider/model", thinking: "off" },
+			undefined,
+			undefined,
+			ctx,
+		);
+		const childId = started.details.handle.id;
+		promptCalls.length = 0;
+		delayFirstPrompt = true;
+		const first = requireTool(tools, "subagent_follow_up").execute(
+			"first",
+			{ id: childId, message: "first" },
+		);
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		const controller = new AbortController();
+		const canceled = requireTool(tools, "subagent_follow_up").execute(
+			"canceled",
+			{ id: childId, message: "canceled" },
+			controller.signal,
+		);
+		const successor = requireTool(tools, "subagent_follow_up").execute(
+			"successor",
+			{ id: childId, message: "successor" },
+		);
+		setTimeout(() => controller.abort(new Error("caller canceled")), 25);
+		await assert.rejects(
+			canceled,
+			(error: unknown) => error instanceof Error && error.name === "AbortError",
+		);
+		assert.equal(promptCalls.length, 1);
+		await Promise.all([first, successor]);
+		assert.equal(promptCalls.length, 2);
+		await requireTool(tools, "subagent_kill").execute("kill", { id: childId });
+	} finally {
+		prototype.send = originalSend;
+		await handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
+		if (old.agentDirectory === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = old.agentDirectory;
+		if (old.pi === undefined) delete process.env.PI_SUBAGENT_PI_BIN;
+		else process.env.PI_SUBAGENT_PI_BIN = old.pi;
+		if (old.depth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
+		else process.env.PI_SUBAGENT_DEPTH = old.depth;
 	}
 });
 

@@ -31,7 +31,6 @@ import {
 	acquireLease,
 	canonicalOwnerSessionFile,
 	createControllerInstanceId,
-	hasLeaseAuthority,
 	LEASE_RENEW_INTERVAL_MS,
 	leasePath,
 	type OwnerIdentity,
@@ -174,6 +173,7 @@ interface PendingPersistence {
 	entries: RegistryEntry[];
 	owner: OwnerIdentity;
 	path: string;
+	generation: number;
 	waiters: Array<(result: boolean) => void>;
 }
 
@@ -181,8 +181,13 @@ type PersistedRegistryEntry = RegistryEntry & {
 	killRequestedAt?: number;
 };
 
-function abortError(): Error {
-	const error = new Error("The operation was aborted.");
+function abortError(reason?: unknown): Error {
+	const error =
+		reason instanceof Error
+			? reason
+			: new Error(
+					reason === undefined ? "The operation was aborted." : String(reason),
+			);
 	error.name = "AbortError";
 	return error;
 }
@@ -192,7 +197,7 @@ function isAbortError(error: unknown): boolean {
 }
 
 function throwIfAborted(signal?: AbortSignal): void {
-	if (signal?.aborted) throw abortError();
+	if (signal?.aborted) throw abortError(signal.reason);
 }
 
 /** Observe an operation while bounding both cancellation and slow dependencies. */
@@ -217,7 +222,7 @@ function bounded<T>(
 			if (settled) return;
 			settled = true;
 			cleanup();
-			reject(abortError());
+			reject(abortError(signal?.reason));
 		};
 		const cleanup = () => {
 			clearTimeout(timer);
@@ -240,6 +245,11 @@ function bounded<T>(
 			},
 		);
 	});
+}
+
+function deadlineTimeout(deadline: number | undefined, fallback: number): number {
+	if (deadline === undefined) return fallback;
+	return Math.max(1, Math.min(fallback, deadline - now()));
 }
 
 function emptyTranscriptResult(): TranscriptResult {
@@ -580,6 +590,7 @@ interface SubagentHandle extends SubagentDispatchHandle {
 	diagnostics: string[];
 	waiters: Set<() => void>;
 	terminationPromise?: Promise<SubagentHandle>;
+	rpcOperationPromise?: Promise<void>;
 	processCloseHandled: boolean;
 	osCloseObserved?: boolean;
 	forced?: boolean;
@@ -755,6 +766,9 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	let activeInspector: SubagentInspector | undefined;
 	let widgetVisible = true;
 	let persistenceChain = Promise.resolve();
+	let persistenceGeneration = 0;
+	let persistenceClosed = false;
+	let activePersistence: PendingPersistence | undefined;
 	let owner: OwnerIdentity | null = null;
 	const controllerInstanceId = processControllerInstanceId;
 	let leaseHeld = false;
@@ -797,10 +811,17 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	): Promise<T> {
 		const previous = launchReservationTail;
 		let release!: () => void;
+		let released = false;
 		const current = new Promise<void>((resolve) => {
 			release = resolve;
 		});
+		const releaseCurrent = () => {
+			if (released) return;
+			released = true;
+			release();
+		};
 		launchReservationTail = current;
+		let operationPromise: Promise<T> | undefined;
 		try {
 			await bounded(
 				previous,
@@ -809,11 +830,13 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				"Timed out waiting for another subagent launch reservation.",
 			);
 			throwIfAborted(signal);
-			return await operation();
-		} finally {
-			release();
-			if (launchReservationTail === current)
-				launchReservationTail = Promise.resolve();
+			operationPromise = Promise.resolve().then(operation);
+			void operationPromise.then(releaseCurrent, releaseCurrent);
+			return await operationPromise;
+		} catch (error) {
+			// Keep a canceled waiter chained to the live predecessor.
+			if (!operationPromise) void previous.then(releaseCurrent, releaseCurrent);
+			throw error;
 		}
 	}
 	async function withChildOperation<T>(
@@ -824,10 +847,19 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		throwIfAborted(signal);
 		const previous = childOperationTails.get(handle.id) || Promise.resolve();
 		let release!: () => void;
+		let released = false;
 		const current = new Promise<void>((resolve) => {
 			release = resolve;
 		});
+		const releaseCurrent = () => {
+			if (released) return;
+			released = true;
+			release();
+			if (childOperationTails.get(handle.id) === current)
+				childOperationTails.delete(handle.id);
+		};
 		childOperationTails.set(handle.id, current);
+		let operationPromise: Promise<T> | undefined;
 		try {
 			await bounded(
 				previous,
@@ -836,11 +868,18 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				`Timed out waiting for another operation on subagent #${handle.id}.`,
 			);
 			throwIfAborted(signal);
-			return await operation();
-		} finally {
-			release();
-			if (childOperationTails.get(handle.id) === current)
-				childOperationTails.delete(handle.id);
+			operationPromise = Promise.resolve().then(operation);
+			// Cancellation can return before transport or termination cleanup settles.
+			const completion = operationPromise.then(
+				() => handle.terminationPromise || handle.rpcOperationPromise,
+				() => handle.terminationPromise || handle.rpcOperationPromise,
+			);
+			void completion.then(releaseCurrent, releaseCurrent);
+			return await operationPromise;
+		} catch (error) {
+			// Keep a canceled waiter chained to the live predecessor.
+			if (!operationPromise) void previous.then(releaseCurrent, releaseCurrent);
+			throw error;
 		}
 	}
 	const setControllerStatus = (
@@ -856,18 +895,18 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	): Promise<boolean> {
 		const agentDir = getAgentDir();
 		try {
+			const record = await bounded(
+				readLeaseRecord(agentDir, authorityOwner),
+				FILE_OPERATION_TIMEOUT_MS,
+				signal,
+				"Timed out checking subagent controller authority.",
+			);
+			// Compare the clock after the lease read completes.
 			if (
-				await bounded(
-					hasLeaseAuthority(
-						agentDir,
-						authorityOwner,
-						controllerInstanceId,
-						now(),
-					),
-					FILE_OPERATION_TIMEOUT_MS,
-					signal,
-					"Timed out checking subagent controller authority.",
-				)
+				record?.ownerSessionFile === authorityOwner.ownerSessionFile &&
+				record.ownerSessionId === authorityOwner.ownerSessionId &&
+				record.controllerInstanceId === controllerInstanceId &&
+				now() <= record.expiresAt
 			)
 				return true;
 			return await bounded(
@@ -950,6 +989,22 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	const registryEntries = (): RegistryEntry[] => sorted().map(registryEntry);
 	let pendingPersistence: PendingPersistence | undefined;
 	let persistenceWorkerActive = false;
+	const settlePersistence = (
+		request: PendingPersistence,
+		result: boolean,
+	): void => {
+		const waiters = request.waiters.splice(0);
+		for (const waiter of waiters) waiter(result);
+	};
+	const fencePersistence = (close = false): void => {
+		persistenceGeneration++;
+		if (close) persistenceClosed = true;
+		if (pendingPersistence) {
+			settlePersistence(pendingPersistence, false);
+			pendingPersistence = undefined;
+		}
+		if (activePersistence) settlePersistence(activePersistence, false);
+	};
 	const persistFailure = (error: unknown): void => {
 		for (const handle of handles.values())
 			addDiagnostic(
@@ -958,34 +1013,54 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			);
 	};
 	const startPersistenceWorker = (): void => {
-		if (persistenceWorkerActive) return;
+		if (persistenceWorkerActive || persistenceClosed) return;
 		persistenceWorkerActive = true;
 		const previous = persistenceChain;
 		const run = previous.then(async () => {
 			while (pendingPersistence) {
 				const request = pendingPersistence;
 				pendingPersistence = undefined;
+				activePersistence = request;
 				let result = false;
 				try {
-					if (
+					const authoritative =
+						request.generation === persistenceGeneration &&
+						!persistenceClosed &&
 						owner &&
 						owner.ownerSessionFile === request.owner.ownerSessionFile &&
 						owner.ownerSessionId === request.owner.ownerSessionId &&
 						leaseHeld &&
-						(await requireCurrentAuthority())
+						(await requireCurrentAuthority());
+					if (
+						authoritative &&
+						request.generation === persistenceGeneration &&
+						!persistenceClosed
 					) {
-						await bounded(
-							saveRegistry(request.entries, request.path),
-							PERSISTENCE_TIMEOUT_MS,
-							undefined,
-							"Timed out saving the subagent registry.",
-						);
-						result = true;
+						const saveOperation = saveRegistry(request.entries, request.path);
+						try {
+							await bounded(
+								saveOperation,
+								PERSISTENCE_TIMEOUT_MS,
+								undefined,
+								"Timed out saving the subagent registry.",
+							);
+							result =
+								request.generation === persistenceGeneration &&
+								!persistenceClosed;
+						} finally {
+							// Keep the worker fenced until the actual filesystem operation ends.
+							await saveOperation.catch(() => {});
+						}
 					}
 				} catch (error) {
-					persistFailure(error);
+					if (
+						request.generation === persistenceGeneration &&
+						!persistenceClosed
+					)
+						persistFailure(error);
 				}
-				for (const waiter of request.waiters) waiter(result);
+				if (activePersistence === request) activePersistence = undefined;
+				settlePersistence(request, result);
 			}
 		});
 		persistenceChain = run.catch((error) => {
@@ -1001,7 +1076,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		_options: { important?: boolean } = {},
 	): Promise<boolean> => {
 		const persistenceOwner = owner;
-		if (!persistenceOwner || !leaseHeld) return Promise.resolve(false);
+		if (!persistenceOwner || !leaseHeld || persistenceClosed)
+			return Promise.resolve(false);
 		const path = ownerRegistryPath(getAgentDir(), persistenceOwner);
 		const entries = snapshot || registryEntries();
 		return new Promise<boolean>((resolve) => {
@@ -1010,7 +1086,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				(pendingPersistence.owner.ownerSessionFile !== persistenceOwner.ownerSessionFile ||
 					pendingPersistence.owner.ownerSessionId !== persistenceOwner.ownerSessionId)
 			) {
-				for (const waiter of pendingPersistence.waiters) waiter(false);
+				settlePersistence(pendingPersistence, false);
 				pendingPersistence = undefined;
 			}
 			if (!pendingPersistence) {
@@ -1018,11 +1094,13 @@ export default function subagentExtension(pi: ExtensionAPI) {
 					entries,
 					owner: persistenceOwner,
 					path,
+					generation: persistenceGeneration,
 					waiters: [resolve],
 				};
 			} else {
 				pendingPersistence.entries = entries;
 				pendingPersistence.path = path;
+				pendingPersistence.generation = persistenceGeneration;
 				pendingPersistence.waiters.push(resolve);
 			}
 			startPersistenceWorker();
@@ -1376,6 +1454,11 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		handle.completedAt = undefined;
 		handle.stopReason = undefined;
 		handle.error = undefined;
+		handle.killRequestedAt = undefined;
+		handle.extensionError = undefined;
+		handle.osCloseObserved = undefined;
+		handle.forced = undefined;
+		handle.abortRequestedAt = undefined;
 		handle.tentativeError = undefined;
 		handle.finalError = undefined;
 		handle.currentTool = undefined;
@@ -1387,6 +1470,15 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		handle.latestAssistantText = "";
 		handle.activeTools.clear();
 		handle.recentTools = [];
+		handle.knownToolCallIds = [];
+		handle.assistantMessageGeneration = 0;
+		handle.finalizedAssistantIdentities = [];
+		handle.finalizedAssistantMessageGeneration = undefined;
+		handle.finalizedAssistantMessageKey = undefined;
+		handle.finalizedAssistantFallbackKey = undefined;
+		handle.finalizedAssistantResponseId = undefined;
+		handle.finalizedAssistantTimestamp = undefined;
+		handle.assistantTextTruncated = false;
 		handle.usage = createUsage();
 		handle.outputStatus = handle.outputPath ? "pending" : "not_requested";
 		handle.outputError = undefined;
@@ -1506,7 +1598,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			handle.extensionError = `${extensionPath}: ${error}`;
 		}
 		if (record.type === "agent_start") {
-			if (handle.runState !== "running") resetHandleForRun(handle);
+			if (handle.runState !== "running" && handle.killRequestedAt === undefined)
+				resetHandleForRun(handle);
 			handle.assistantAssembly = undefined;
 		}
 		const accepted = dispatchSubagentEvent(handle, record, dispatchOptions(handle));
@@ -1600,7 +1693,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				if (settled) return;
 				settled = true;
 				cleanup();
-				reject(abortError());
+				reject(abortError(signal?.reason));
 			};
 			const cleanup = () => {
 				clearTimeout(timer);
@@ -1654,7 +1747,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				finish(new Error(`Timed out waiting for RPC child #${handle.id} to become ready.`));
 			}, STARTUP_TIMEOUT_MS);
 			timer.unref?.();
-			const onAbort = () => finish(abortError());
+			const onAbort = () => finish(abortError(signal?.reason));
 			const check = () => {
 				if (handle.rpcReady && handle.rpc) finish();
 				else if (handle.processState === "stopped")
@@ -1705,6 +1798,12 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		}
 	}
 
+	type RpcSendWithSignal = (
+		body: RpcRecord,
+		timeoutMs?: number,
+		signal?: AbortSignal,
+	) => Promise<RpcResponseRecord>;
+
 	async function sendRpc(
 		handle: SubagentHandle,
 		body: RpcRecord,
@@ -1718,12 +1817,21 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			throw new Error(`Subagent #${handle.id} is no longer running.`);
 		if (!handle.rpc || !handle.rpcReady)
 			throw new Error(`Subagent #${handle.id} RPC process is not ready.`);
+		// The runtime branch accepts the third signal argument. Keep this cast for
+		// compatibility with the older local transport until both branches merge.
+		const send = handle.rpc.send as unknown as RpcSendWithSignal;
+		const transportOperation = send.call(handle.rpc, body, timeoutMs, signal);
+		handle.rpcOperationPromise = transportOperation.then(
+			() => undefined,
+			() => undefined,
+		);
 		const response = await bounded(
-			handle.rpc.send(body, timeoutMs),
+			transportOperation,
 			timeoutMs,
 			signal,
 			`Timed out waiting for RPC response to ${String(body.type)}.`,
 		);
+		throwIfAborted(signal);
 		applyResponseState(handle, response);
 		update(handle);
 		return response;
@@ -1733,6 +1841,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		handle: SubagentHandle,
 		checkAuthority = true,
 		signal?: AbortSignal,
+		deadline?: number,
 	): Promise<SubagentHandle> {
 		throwIfAborted(signal);
 		if (checkAuthority && !(await requireCurrentAuthority(signal)))
@@ -1741,7 +1850,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		if (handle.terminationPromise)
 			return bounded(
 				handle.terminationPromise,
-				SHUTDOWN_TIMEOUT_MS,
+				deadlineTimeout(deadline, SHUTDOWN_TIMEOUT_MS),
 				signal,
 				`Timed out terminating subagent #${handle.id}.`,
 			);
@@ -1760,7 +1869,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 							termTimeoutMs: 1_500,
 							killTimeoutMs: 2_500,
 						}),
-						SHUTDOWN_TIMEOUT_MS,
+						deadlineTimeout(deadline, SHUTDOWN_TIMEOUT_MS),
 						undefined,
 						`Timed out terminating subagent #${handle.id}.`,
 					);
@@ -1785,7 +1894,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			handle.completedAt ||= now();
 			const persisted = await bounded(
 				persist(undefined, { important: true }),
-				PERSISTENCE_TIMEOUT_MS,
+				deadlineTimeout(deadline, PERSISTENCE_TIMEOUT_MS),
 				undefined,
 				`Timed out saving the stopped state for #${handle.id}.`,
 			);
@@ -1799,13 +1908,16 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		handle.terminationPromise = termination;
 		return bounded(
 			termination,
-			SHUTDOWN_TIMEOUT_MS,
+			deadlineTimeout(deadline, SHUTDOWN_TIMEOUT_MS),
 			signal,
 			`Timed out terminating subagent #${handle.id}.`,
 		);
 	}
 
-	async function forceCleanupRuntime(runtime: RuntimeChild): Promise<void> {
+	async function forceCleanupRuntime(
+		runtime: RuntimeChild,
+		deadline?: number,
+	): Promise<void> {
 		if (!runtime.transport.isClosed) {
 			await bounded(
 				runtime.transport.terminate({
@@ -1813,7 +1925,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 					termTimeoutMs: 500,
 					killTimeoutMs: 1_000,
 				}),
-				SHUTDOWN_TIMEOUT_MS,
+				deadlineTimeout(deadline, SHUTDOWN_TIMEOUT_MS),
 				undefined,
 				`Timed out closing RPC runtime for #${runtime.id}.`,
 			).catch((error) => addRuntimeDiagnostic(runtime, String(error)));
@@ -1829,9 +1941,11 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		if (runtimeChildren.get(runtime.id) === runtime) removeRuntime(runtime);
 	}
 
-	async function forceCleanupRuntimes(): Promise<void> {
+	async function forceCleanupRuntimes(deadline?: number): Promise<void> {
 		await Promise.all(
-			[...runtimeChildren.values()].map((runtime) => forceCleanupRuntime(runtime)),
+			[...runtimeChildren.values()].map((runtime) =>
+				forceCleanupRuntime(runtime, deadline),
+			),
 		);
 	}
 
@@ -1845,7 +1959,9 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		refreshUi();
 		const children = sorted().filter(active);
 		const termination = Promise.allSettled(
-			children.map((handle) => terminate(handle, false)),
+			children.map((handle) =>
+				withChildOperation(handle, undefined, () => terminate(handle, false)),
+			),
 		).then(() => undefined);
 		authorityLossPromise = termination.finally(() => {
 			authorityLossPromise = undefined;
@@ -2100,6 +2216,10 @@ export default function subagentExtension(pi: ExtensionAPI) {
 						settlementStatus: "pending" as const,
 						error: undefined,
 						killRequestedAt: undefined,
+						outputStatus: entry.outputPath
+							? ("pending" as const)
+							: ("not_requested" as const),
+						outputError: undefined,
 						incarnation,
 						resumedFrom: oldIncarnation,
 					}
@@ -2118,25 +2238,17 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		handle.incarnation = incarnation;
 		handle.resumedFrom = oldIncarnation;
 		reviveForResume(handle);
-		handle.completedAt = undefined;
-		handle.error = undefined;
-		handle.stopReason = undefined;
-		handle.extensionError = undefined;
+		resetHandleForRun(handle);
 		handle.terminationPromise = undefined;
 		handle.rpcReady = false;
 		handle.extensionReady = false;
 		handle.rpcReadyAt = undefined;
 		handle.rpc = undefined;
 		handle.runtime = undefined;
+		handle.rpcOperationPromise = undefined;
 		handle.processCloseHandled = false;
 		handle.exitCode = undefined;
 		handle.exitSignal = undefined;
-		handle.isStreaming = false;
-		handle.activeTools.clear();
-		handle.currentTool = undefined;
-		handle.currentToolStartedAt = undefined;
-		deactivateAssistantMessage(handle);
-		handle.assistantAssembly = undefined;
 		try {
 			const invocation = buildRpcChildInvocation({
 				sessionFile,
@@ -2204,7 +2316,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				if (error) reject(error);
 				else resolve();
 			};
-			const onAbort = () => finish(abortError());
+			const onAbort = () => finish(abortError(signal?.reason));
 			if (predicate()) return finish();
 			deadlineTimer = setTimeout(() => finish(), timeoutMs);
 			deadlineTimer.unref?.();
@@ -2530,73 +2642,82 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		);
 	}
 
-	async function waitForOutputWrites(): Promise<boolean> {
+	async function waitForOutputWrites(deadline?: number): Promise<boolean> {
 		let complete = true;
 		await Promise.all(
 			[...handles.values()].map(async (handle) => {
 				try {
 					await bounded(
 						handle.outputWriteChain,
-						OUTPUT_WRITE_TIMEOUT_MS,
+						deadlineTimeout(deadline, OUTPUT_WRITE_TIMEOUT_MS),
 						undefined,
 						`Timed out waiting for caller output for #${handle.id}.`,
 					);
 				} catch (error) {
 					complete = false;
 					addDiagnostic(handle, `Caller output cleanup failed: ${String(error)}`);
-					handle.outputWriteChain = Promise.resolve();
 				}
 			}),
 		);
 		return complete;
 	}
 
-	async function waitForPersistence(): Promise<boolean> {
+	async function waitForPersistence(deadline?: number): Promise<boolean> {
 		try {
 			await bounded(
 				persistenceChain,
-				PERSISTENCE_TIMEOUT_MS,
+				deadlineTimeout(deadline, PERSISTENCE_TIMEOUT_MS),
 				undefined,
 				"Timed out waiting for subagent registry persistence.",
 			);
 			return true;
 		} catch (error) {
-			if (pendingPersistence) {
-				for (const waiter of pendingPersistence.waiters) waiter(false);
-				pendingPersistence = undefined;
-			}
-			persistenceChain = Promise.resolve();
+			// Fence late completions instead of resetting the active chain underneath them.
+			fencePersistence(true);
 			for (const handle of handles.values())
 				addDiagnostic(handle, `Registry cleanup was forced: ${String(error)}`);
 			return false;
 		}
 	}
 
-	async function stopAllChildren(): Promise<void> {
+	async function stopAllChildren(
+		deadline = now() + SHUTDOWN_TIMEOUT_MS,
+	): Promise<void> {
 		const termination = Promise.allSettled(
 			sorted()
 				.filter(active)
-				.map((handle) => withChildOperation(handle, undefined, () => terminate(handle, false))),
+				.map((handle) =>
+					withChildOperation(handle, undefined, () =>
+						terminate(handle, false, undefined, deadline),
+					),
+				),
 		);
 		try {
 			await bounded(
 				termination,
-				SHUTDOWN_TIMEOUT_MS,
+				deadlineTimeout(deadline, SHUTDOWN_TIMEOUT_MS),
 				undefined,
 				"Timed out stopping subagent children.",
 			);
 		} catch (error) {
-			for (const handle of sorted().filter(active)) {
-				addDiagnostic(handle, `Forced child cleanup: ${String(error)}`);
-				if (handle.runtime) await forceCleanupRuntime(handle.runtime);
-			}
+			const live = sorted().filter(active);
+			await Promise.all(
+				live.map(async (handle) => {
+					addDiagnostic(handle, `Forced child cleanup: ${String(error)}`);
+					if (handle.runtime)
+						await forceCleanupRuntime(handle.runtime, deadline);
+				}),
+			);
 		}
-		await waitForOutputWrites();
-		await waitForPersistence();
-		await forceCleanupRuntimes();
+		await waitForOutputWrites(deadline);
+		await waitForPersistence(deadline);
+		await forceCleanupRuntimes(deadline);
 	}
 
 	pi.on("session_start", async (_event, ctx) => {
+		// A reload starts a new persistence generation after any fenced old work.
+		persistenceGeneration++;
+		persistenceClosed = false;
 		sessionShuttingDown = false;
 		latestCtx = ctx;
 		await establishController(ctx);
@@ -2610,6 +2731,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		sessionShuttingDown = true;
 		suppressAllSettlementNotifications();
 		latestCtx = ctx;
+		const deadline = now() + SHUTDOWN_TIMEOUT_MS;
 		const reason = event?.reason || "quit";
 		if (reason === "reload") {
 			stopTimers();
@@ -2618,22 +2740,24 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				handle.runtime.handle = handle;
 				detachRuntime(handle.runtime);
 			}
-			await waitForOutputWrites();
-			await waitForPersistence();
+			await waitForOutputWrites(deadline);
+			await waitForPersistence(deadline);
+			fencePersistence(true);
 			if (ctx.mode === "tui") ctx.ui.setWidget("subagent", undefined);
 			latestCtx = null;
 			return;
 		}
-		await stopAllChildren();
+		await stopAllChildren(deadline);
 		const persisted = await bounded(
 			persist(undefined, { important: true }),
-			PERSISTENCE_TIMEOUT_MS,
+			deadlineTimeout(deadline, PERSISTENCE_TIMEOUT_MS),
 			undefined,
 			"Timed out saving the final subagent registry.",
 		);
 		if (!persisted)
 			console.error("Final subagent registry persistence did not complete.");
-		await waitForPersistence();
+		await waitForPersistence(deadline);
+		fencePersistence(true);
 		stopTimers();
 		await releaseLeaseIfHeld();
 		owner = null;
@@ -3008,13 +3132,15 @@ export default function subagentExtension(pi: ExtensionAPI) {
 							if (!message) return "Canceled.";
 							const handle = handles.get(id);
 							if (!handle) return "Subagent no longer exists.";
-							const command = await deliverMessage(handle, "steer", message);
+							const command = await withChildOperation(handle, undefined, () =>
+								deliverMessage(handle, "steer", message),
+							);
 							return `Accepted via ${command}.`;
 						},
 						kill: async (id) => {
 							const handle = handles.get(id);
 							if (!handle) return "Subagent no longer exists.";
-							await terminate(handle);
+							await withChildOperation(handle, undefined, () => terminate(handle));
 							return "Killed.";
 						},
 						clearFinished: () => {
@@ -3060,7 +3186,13 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	pi.registerCommand("subagents-kill-all", {
 		description: "Terminate all live subagents",
 		handler: async () => {
-			await Promise.allSettled(sorted().filter(active).map((handle) => terminate(handle)));
+			await Promise.allSettled(
+				sorted()
+					.filter(active)
+					.map((handle) =>
+						withChildOperation(handle, undefined, () => terminate(handle)),
+					),
+			);
 		},
 	});
 }

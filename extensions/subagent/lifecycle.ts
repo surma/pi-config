@@ -120,7 +120,11 @@ export function startRun(
 	at: number,
 	suppliedRunId?: number,
 ): SubagentRun | undefined {
-	if (isLifecycleTerminal(state) || currentRun(state)?.phase === "active")
+	if (
+		isLifecycleTerminal(state) ||
+		currentRun(state)?.phase === "active" ||
+		state.killRequestedAt !== undefined
+	)
 		return undefined;
 	if (
 		suppliedRunId !== undefined &&
