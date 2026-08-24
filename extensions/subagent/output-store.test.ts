@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+	MAX_OUTPUT_CONTENT_BYTES,
 	MAX_OUTPUT_ERROR_BYTES,
 	writeCallerOutput,
 } from "./output-store.ts";
@@ -94,4 +95,42 @@ test("an empty caller path is a failed request, not an implicit output", async (
 		path: "",
 		error: "The caller output path must be a non-empty string.",
 	});
+});
+
+test("oversized caller content is rejected before filesystem work", async () => {
+	const directory = await temporaryDirectory();
+	const path = join(directory, "too-large.txt");
+	const result = await writeCallerOutput({
+		path,
+		content: "x".repeat(MAX_OUTPUT_CONTENT_BYTES + 1),
+	});
+	assert.equal(result.status, "failed");
+	assert.equal((await readdir(directory)).length, 0);
+});
+
+test("filesystem waits return a failed status before they can hold the caller", async () => {
+	const directory = await temporaryDirectory();
+	const never = new Promise<never>(() => {});
+	const started = Date.now();
+	const result = await writeCallerOutput(
+		{ path: join(directory, "stuck.txt"), content: "result" },
+		{ timeoutMs: 25, io: { mkdir: async () => never } },
+	);
+	assert.equal(result.status, "failed");
+	if (result.status === "failed") assert.match(result.error, /timed out/);
+	assert.ok(Date.now() - started < 500);
+});
+
+test("cancellation returns a failed status without publishing output", async () => {
+	const directory = await temporaryDirectory();
+	const controller = new AbortController();
+	controller.abort(new Error("caller canceled"));
+	const path = join(directory, "canceled.txt");
+	const result = await writeCallerOutput(
+		{ path, content: "result" },
+		{ signal: controller.signal },
+	);
+	assert.equal(result.status, "failed");
+	assert.match(result.error, /caller canceled/);
+	assert.deepEqual(await readdir(directory), []);
 });

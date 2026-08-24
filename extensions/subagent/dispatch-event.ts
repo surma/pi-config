@@ -32,6 +32,8 @@ export interface SubagentUsageStats {
 
 // Independent from active display state so delayed prior-run records remain inert.
 const MAX_KNOWN_TOOL_CALL_IDS = 256;
+/** Maximum number of tool calls that can remain active without an end record. */
+export const MAX_ACTIVE_TOOLS = 64;
 
 export interface SubagentDispatchHandle
 	extends LifecycleState,
@@ -60,6 +62,167 @@ export interface SubagentDispatchOptions {
 	diagnostic: (message: string) => void;
 	onAssistantFinalized: () => void;
 	onSettled: (run: SubagentRun) => void;
+}
+
+function invokeDispatchCallback(
+	options: SubagentDispatchOptions,
+	name: string,
+	callback: () => void,
+): void {
+	try {
+		callback();
+	} catch (error) {
+		try {
+			options.diagnostic(
+				`${name} callback failed: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		} catch {
+			// A diagnostic callback cannot make event dispatch unsafe.
+		}
+	}
+}
+
+/**
+ * Drain a bounded reload batch without losing a record when its consumer fails.
+ *
+ * A failed record moves to the queue tail so later records can continue. The
+ * caller should schedule another drain turn instead of draining synchronously.
+ */
+export const MAX_SUBAGENT_EVENT_DRAIN_RECORDS = 128;
+export const MAX_SUBAGENT_EVENT_QUEUE_RECORDS = 512;
+/** Reserved queue slots for lifecycle boundaries after an update flood. */
+export const MAX_SUBAGENT_EVENT_CRITICAL_RECORDS = 8;
+
+export interface SubagentEventQueueState {
+	overflowed: boolean;
+}
+
+const overflowedEventQueues = new WeakSet<object>();
+const criticalEventTypes = new Set([
+	"agent_start",
+	"message_start",
+	"message_end",
+	"agent_end",
+	"agent_settled",
+	"tool_execution_start",
+	"tool_execution_end",
+	"extension_error",
+]);
+
+/** Identify records that preserve lifecycle and tool boundaries after overflow. */
+export function isCriticalSubagentEvent(
+	record: Record<string, unknown>,
+): boolean {
+	return typeof record.type === "string" && criticalEventTypes.has(record.type);
+}
+
+function markEventQueueOverflow(
+	queue: Record<string, unknown>[],
+	maxRecords: number,
+	state: SubagentEventQueueState | undefined,
+	options: {
+		diagnostic?: (message: string) => void;
+		onOverflow?: () => void;
+	},
+): void {
+	if (state) state.overflowed = true;
+	overflowedEventQueues.add(queue);
+	const message =
+		`Subagent reload event queue reached its ${maxRecords}-record bound; overflow is terminal, accepted records were retained, and only bounded critical lifecycle records remain accepted.`;
+	try {
+		options.diagnostic?.(message);
+	} catch {
+		// A diagnostic callback cannot change the terminal queue state.
+	}
+	try {
+		options.onOverflow?.();
+	} catch {
+		// The caller still receives the explicit overflow state.
+	}
+}
+
+/**
+ * Enqueue one reload record without discarding accepted lifecycle evidence.
+ *
+ * The queue reserves critical boundary slots before overflow. An update flood
+ * enters a terminal fence, rejects later updates, and still accepts critical
+ * lifecycle records until the finite queue bound is full.
+ */
+export function enqueueSubagentEventQueue(
+	queue: Record<string, unknown>[],
+	record: Record<string, unknown>,
+	options: {
+		maxRecords?: number;
+		state?: SubagentEventQueueState;
+		diagnostic?: (message: string) => void;
+		onOverflow?: () => void;
+	} = {},
+): boolean {
+	const requested = options.maxRecords ?? MAX_SUBAGENT_EVENT_QUEUE_RECORDS;
+	const maxRecords = Number.isSafeInteger(requested)
+		? Math.max(1, Math.min(MAX_SUBAGENT_EVENT_QUEUE_RECORDS, requested))
+		: MAX_SUBAGENT_EVENT_QUEUE_RECORDS;
+	const criticalReserve = Math.min(
+		MAX_SUBAGENT_EVENT_CRITICAL_RECORDS,
+		Math.max(0, maxRecords - 1),
+	);
+	const state = options.state;
+	const overflowed = state?.overflowed || overflowedEventQueues.has(queue);
+	const critical = isCriticalSubagentEvent(record);
+	if (overflowed) {
+		if (state) state.overflowed = true;
+		if (!critical || queue.length >= maxRecords) return false;
+		queue.push(record);
+		return true;
+	}
+	const criticalCount = queue.reduce(
+		(count, queued) => count + (isCriticalSubagentEvent(queued) ? 1 : 0),
+		0,
+	);
+	const remainingCriticalReserve = Math.max(0, criticalReserve - criticalCount);
+	const regularLimit = maxRecords - remainingCriticalReserve;
+	if (queue.length >= maxRecords || (!critical && queue.length >= regularLimit)) {
+		markEventQueueOverflow(queue, maxRecords, state, options);
+		if (critical && queue.length < maxRecords) {
+			queue.push(record);
+			return true;
+		}
+		return false;
+	}
+	queue.push(record);
+	return true;
+}
+
+export function drainSubagentEventQueue(
+	queue: Record<string, unknown>[],
+	consumer: (record: Record<string, unknown>) => void,
+	options: { maxRecords?: number; diagnostic?: (message: string) => void } = {},
+): number {
+	const requested = options.maxRecords ?? MAX_SUBAGENT_EVENT_DRAIN_RECORDS;
+	const maxRecords = Number.isSafeInteger(requested)
+		? Math.max(1, Math.min(MAX_SUBAGENT_EVENT_DRAIN_RECORDS, requested))
+		: MAX_SUBAGENT_EVENT_DRAIN_RECORDS;
+	const batch = queue.splice(0, maxRecords);
+	let delivered = 0;
+	for (const record of batch) {
+		try {
+			consumer(record);
+			delivered++;
+		} catch (error) {
+			queue.push(record);
+			try {
+				options.diagnostic?.(
+					`Subagent event consumer failed; record retained for retry: ${error instanceof Error ? error.message : String(error)}`.slice(
+						0,
+						2_048,
+					),
+				);
+			} catch {
+				// A diagnostic callback cannot discard the retained record.
+			}
+		}
+	}
+	return delivered;
 }
 
 function cloneToolActivity(tool: ToolActivity): ToolActivity {
@@ -154,12 +317,48 @@ function requireActiveRun(
 	return false;
 }
 
+/** Preserve abort evidence until native agent_settled consumes the fence. */
+export function requestSubagentAbort(
+	handle: SubagentDispatchHandle,
+	at: number,
+): boolean {
+	if (isLifecycleTerminal(handle) || handle.runState === "idle") return false;
+	const run = currentRun(handle);
+	if (!run || run.id <= handle.lastSettledRunId) return false;
+	handle.abortRequestedAt ??= at;
+	return true;
+}
+
 /** Dispatch one typed companion event into the production subagent state machine. */
 export function dispatchSubagentEvent(
 	handle: SubagentDispatchHandle,
 	record: Record<string, unknown>,
-	options: SubagentDispatchOptions,
+	rawOptions: SubagentDispatchOptions,
 ): boolean {
+	const options: SubagentDispatchOptions = {
+		...rawOptions,
+		diagnostic: (message) => {
+			try {
+				rawOptions.diagnostic(message);
+			} catch {
+				// Diagnostics must not break event dispatch.
+			}
+		},
+		update: (streaming) =>
+			invokeDispatchCallback(rawOptions, "update", () =>
+				rawOptions.update(streaming),
+			),
+		onAssistantFinalized: () =>
+			invokeDispatchCallback(
+				rawOptions,
+				"onAssistantFinalized",
+				rawOptions.onAssistantFinalized,
+			),
+		onSettled: (run) =>
+			invokeDispatchCallback(rawOptions, "onSettled", () =>
+				rawOptions.onSettled(run),
+			),
+	};
 	const at = options.now();
 	switch (record.type) {
 		case "agent_start": {
@@ -206,12 +405,19 @@ export function dispatchSubagentEvent(
 			}
 			if (!requireActiveRun(handle, options, "tool_execution_start"))
 				return false;
-			if (!rememberNewToolCallId(handle, record.toolCallId)) {
+			if (handle.knownToolCallIds.includes(record.toolCallId)) {
 				options.diagnostic(
 					"Ignored duplicate or delayed tool_execution_start for a previously seen toolCallId.",
 				);
 				return false;
 			}
+			if (handle.activeTools.size >= MAX_ACTIVE_TOOLS) {
+				options.diagnostic(
+					`Rejected tool_execution_start because the active tool limit of ${MAX_ACTIVE_TOOLS} was reached.`,
+				);
+				return false;
+			}
+			if (!rememberNewToolCallId(handle, record.toolCallId)) return false;
 			corroborateRun(handle);
 			handle.activeTools.set(record.toolCallId, {
 				toolCallId: record.toolCallId,

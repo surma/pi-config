@@ -68,6 +68,41 @@ export function createLifecycleState(): LifecycleState {
 	};
 }
 
+/** Derive compatibility fields from the process and current-run model. */
+export function syncLifecycleCompatibility(state: LifecycleState): void {
+	if (state.processState === "stopped") {
+		if (state.killRequestedAt !== undefined) {
+			state.state = "killed";
+			state.lifecycle = "killed";
+		} else if (
+			state.settlementStatus === "settled" &&
+			state.runOutcome !== "failed"
+		) {
+			state.state = "done";
+			state.lifecycle = "done";
+		} else {
+			state.state = "error";
+			state.lifecycle = "error";
+		}
+		return;
+	}
+	if (state.runState !== "idle") {
+		state.state = "running";
+		state.lifecycle =
+			state.killRequestedAt !== undefined ? "killing" : state.runState;
+		return;
+	}
+	if (state.settlementStatus === "settled") {
+		state.state = state.runOutcome === "failed" ? "error" : "done";
+		state.lifecycle =
+			state.killRequestedAt !== undefined ? "killing" : "idle";
+		return;
+	}
+	state.state = "starting";
+	state.lifecycle =
+		state.killRequestedAt !== undefined ? "killing" : "idle";
+}
+
 export function currentRun(state: LifecycleState): SubagentRun | undefined {
 	return state.runs[state.runs.length - 1];
 }
@@ -85,7 +120,11 @@ export function startRun(
 	at: number,
 	suppliedRunId?: number,
 ): SubagentRun | undefined {
-	if (isLifecycleTerminal(state) || currentRun(state)?.phase === "active")
+	if (
+		isLifecycleTerminal(state) ||
+		currentRun(state)?.phase === "active" ||
+		state.killRequestedAt !== undefined
+	)
 		return undefined;
 	if (
 		suppliedRunId !== undefined &&
@@ -106,13 +145,13 @@ export function startRun(
 	state.runs.push(run);
 	if (state.runs.length > MAX_RUN_HISTORY)
 		state.runs.splice(0, state.runs.length - MAX_RUN_HISTORY);
-	state.state = "running";
 	state.runState = "running";
-	state.lifecycle = state.killRequestedAt ? "killing" : "running";
 	state.runOutcome = "pending";
 	state.settlementStatus = "pending";
+	state.settledAt = undefined;
 	state.tentativeError = undefined;
 	state.finalError = undefined;
+	syncLifecycleCompatibility(state);
 	return run;
 }
 
@@ -165,9 +204,8 @@ export function endRun(
 	run.corroborated = true;
 	run.endedAt = at;
 	if (run.outcome === "pending") run.outcome = "succeeded";
-	state.state = "running";
 	state.runState = willRetry ? "retrying" : "finishing";
-	state.lifecycle = state.killRequestedAt ? "killing" : state.runState;
+	syncLifecycleCompatibility(state);
 	return true;
 }
 
@@ -180,6 +218,7 @@ export function abortRun(state: LifecycleState, at: number): boolean {
 		run.stopReason = "aborted";
 		run.error = undefined;
 		state.tentativeError = undefined;
+		syncLifecycleCompatibility(state);
 		return true;
 	}
 	if (run?.phase !== "active") return false;
@@ -193,7 +232,7 @@ export function abortRun(state: LifecycleState, at: number): boolean {
 export function requestKill(state: LifecycleState, at: number): void {
 	if (isLifecycleTerminal(state)) return;
 	state.killRequestedAt ||= at;
-	state.lifecycle = "killing";
+	syncLifecycleCompatibility(state);
 }
 
 /** Revive a stopped logical child for a new process incarnation. */
@@ -208,13 +247,14 @@ export function reviveForResume(state: LifecycleState): void {
 /** Clear session-specific live state without resetting the process-wide settlement cursor. */
 export function resetRunViewForSession(state: LifecycleState): void {
 	if (isLifecycleTerminal(state)) return;
-	state.state = "starting";
-	state.lifecycle = "idle";
 	state.runState = "idle";
 	state.runOutcome = "pending";
 	state.runs = [];
+	state.settlementStatus = "pending";
+	state.settledAt = undefined;
 	state.tentativeError = undefined;
 	state.finalError = undefined;
+	syncLifecycleCompatibility(state);
 }
 
 /** Settle one run while leaving the child process alive and re-enterable. */
@@ -246,20 +286,15 @@ export function settleRunToIdle(
 	state.settledAt = at;
 	state.settlementStatus = "settled";
 	state.runState = "idle";
-	state.lifecycle = "idle";
 	state.tentativeError = undefined;
 	state.runOutcome = settled.outcome;
 	if (settled.outcome === "failed") {
-		state.state = "error";
 		state.finalError =
 			settled.error || errorMessage || "Assistant response failed";
-	} else if (settled.outcome === "aborted") {
-		state.state = "running";
-		state.finalError = undefined;
 	} else {
-		state.state = "done";
 		state.finalError = undefined;
 	}
+	syncLifecycleCompatibility(state);
 	return state.state;
 }
 
@@ -291,10 +326,9 @@ export function markStopped(
 	state.settledAt = at;
 	state.runState = "idle";
 	state.tentativeError = undefined;
-	if (state.killRequestedAt) {
-		state.state = "killed";
-		state.lifecycle = "killed";
+	if (state.killRequestedAt !== undefined) {
 		state.finalError = state.finalError || "Killed";
+		syncLifecycleCompatibility(state);
 		return state.state;
 	}
 	const settledOutcome = last?.outcome || state.runOutcome;
@@ -302,23 +336,21 @@ export function markStopped(
 		(last && last.id <= state.lastSettledRunId) ||
 		(!last && state.settlementStatus === "settled")
 	) {
-		state.state = settledOutcome === "failed" ? "error" : "done";
-		state.lifecycle = state.state;
 		state.finalError =
 			settledOutcome === "failed"
 				? last?.error || state.finalError || "Assistant response failed"
 				: undefined;
+		syncLifecycleCompatibility(state);
 		return state.state;
 	}
 	const failed = [...state.runs]
 		.reverse()
 		.find((candidate) => candidate.outcome === "failed");
-	state.state = "error";
-	state.lifecycle = "error";
 	state.finalError =
 		exit?.error ||
 		failed?.error ||
 		`Process exited before agent_settled${exit?.signal ? ` via signal ${exit.signal}` : ` with code ${exit?.code ?? "unknown"}`}`;
+	syncLifecycleCompatibility(state);
 	return state.state;
 }
 

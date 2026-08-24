@@ -2,9 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { visibleWidth } from "@mariozechner/pi-tui";
 import {
+	MAX_TASK_DISPLAY_CHARS,
 	type InspectorHandle,
 	SubagentInspector,
 	sanitizeTerminalText,
+	type SubagentInspectorOptions,
 } from "./ui.ts";
 
 function handle(
@@ -63,20 +65,56 @@ interface TestFileStat {
 	mtimeMs: number;
 }
 
+interface TestFileHandle {
+	stat(): Promise<{ size: number }>;
+	read(
+		buffer: Buffer,
+		offset: number,
+		length: number,
+		position: number,
+	): Promise<{ bytesRead: number; buffer: Buffer }>;
+	close(): Promise<void>;
+}
+
 interface TestFiles {
-	readFile(path: string, encoding: string): Promise<string>;
+	open(path: string, flags: string): Promise<TestFileHandle>;
 	stat(path: string): Promise<TestFileStat>;
 }
 
-type InspectorArguments = ConstructorParameters<typeof SubagentInspector>;
+function openText(content: string): TestFileHandle {
+	const bytes = Buffer.from(content, "utf8");
+	return {
+		stat: async () => ({ size: bytes.length }),
+		read: async (buffer, offset, length, position) => {
+			const available = Math.max(0, bytes.length - position);
+			const count = Math.min(length, available);
+			bytes.copy(buffer, offset, position, position + count);
+			return { bytesRead: count, buffer };
+		},
+		close: async () => {},
+	};
+}
 
-function fixture(initial: InspectorHandle[], files?: TestFiles, rows = 60) {
+type InspectorArguments = ConstructorParameters<typeof SubagentInspector>;
+interface TestInspectorOptions extends SubagentInspectorOptions {
+	throwOnRequestRender?: boolean;
+}
+
+function fixture(
+	initial: InspectorHandle[],
+	files?: TestFiles,
+	rows = 60,
+	options?: TestInspectorOptions,
+) {
 	const handles = initial;
 	let renders = 0;
 	let closed = false;
 	const tui = {
 		terminal: { rows, columns: 120 },
-		requestRender: () => renders++,
+		requestRender: () => {
+			if (options?.throwOnRequestRender) throw new Error("render failed");
+			renders++;
+		},
 	} as unknown as InspectorArguments[0];
 	const theme = {
 		fg: (_color: string, text: string) => text,
@@ -110,6 +148,7 @@ function fixture(initial: InspectorHandle[], files?: TestFiles, rows = 60) {
 			},
 		},
 		files as unknown as InspectorArguments[4],
+		options,
 	);
 	return {
 		handles,
@@ -127,8 +166,8 @@ function plain(lines: string[]): string {
 	return lines.join("\n");
 }
 
-const noFiles = {
-	readFile: async () => "",
+const noFiles: TestFiles = {
+	open: async () => openText(""),
 	stat: async () => ({ size: 0, mtimeMs: 0 }),
 };
 
@@ -172,6 +211,22 @@ test("status, original task, and live output have distinct hierarchy", async () 
 	assert.match(live, /RECENT ACTIVITY \/ TRANSCRIPT/);
 	assert.match(live, /\[tool\] bash · running/);
 	assert.match(live, /partial output/);
+	fx.inspector.dispose();
+});
+
+test("the original task display stays bounded for an untrusted persisted handle", async () => {
+	const child = handle("long", {
+		task: `TASK-START ${"x".repeat(MAX_TASK_DISPLAY_CHARS * 2)} TASK-END`,
+	});
+	const fx = fixture([child], noFiles, 100);
+	fx.inspector.render(2_000);
+	fx.inspector.handleInput("enter");
+	fx.inspector.handleInput("p");
+	await Promise.resolve();
+	const rendered = plain(fx.inspector.render(2_000));
+	assert.match(rendered, /TASK-START/);
+	assert.match(rendered, /original task truncated after/);
+	assert.doesNotMatch(rendered, /TASK-END/);
 	fx.inspector.dispose();
 });
 
@@ -245,9 +300,9 @@ test("stale prompt reads cannot overwrite a newer selection", async () => {
 	const first = new Promise<string>((resolve) => {
 		resolveFirst = resolve;
 	});
-	const files = {
-		readFile: async (path: string) =>
-			path.includes("a.prompt") ? first : "prompt-b",
+	const files: TestFiles = {
+		open: async (path: string) =>
+			openText(path.includes("a.prompt") ? await first : "prompt-b"),
 		stat: async () => ({ size: 0, mtimeMs: 0 }),
 	};
 	const fx = fixture([handle("a"), handle("b")], files);
@@ -256,10 +311,10 @@ test("stale prompt reads cannot overwrite a newer selection", async () => {
 	fx.inspector.handleInput("escape");
 	fx.inspector.handleInput("down");
 	fx.inspector.handleInput("p");
-	await Promise.resolve();
+	await new Promise((resolve) => setTimeout(resolve, 10));
 	resolveFirst("prompt-a");
 	await first;
-	await Promise.resolve();
+	await new Promise((resolve) => setTimeout(resolve, 10));
 	const rendered = plain(fx.inspector.render(100));
 	assert.match(rendered, /prompt-b/);
 	assert.doesNotMatch(rendered, /prompt-a/);
@@ -267,9 +322,9 @@ test("stale prompt reads cannot overwrite a newer selection", async () => {
 });
 
 test("malformed and partial JSONL history remains renderable", async () => {
-	const files = {
+	const files: TestFiles = {
+		open: async () => openText(`not-json\n{"type":"message"`),
 		stat: async () => ({ size: 30, mtimeMs: 1 }),
-		readFile: async () => `not-json\n{"type":"message"`,
 	};
 	const fx = fixture([handle("a")], files);
 	fx.inspector.render(100);
@@ -278,6 +333,138 @@ test("malformed and partial JSONL history remains renderable", async () => {
 	const rendered = plain(fx.inspector.render(100));
 	assert.match(rendered, /malformed JSONL record/);
 	assert.match(rendered, /partial JSONL record while Pi writes/);
+	fx.inspector.dispose();
+});
+
+test("inspector reads only a bounded transcript tail and keeps recent records", async () => {
+	const transcript = `${Array.from(
+		{ length: 20_000 },
+		(_, index) => JSON.stringify({ type: "session_info", name: `history-${index}` }),
+	).join("\n")}\n`;
+	const size = Buffer.byteLength(transcript, "utf8");
+	let largestRead = 0;
+	const files: TestFiles = {
+		stat: async () => ({ size, mtimeMs: 1 }),
+		open: async () => {
+			const source = openText(transcript);
+			return {
+				stat: source.stat,
+				read: async (buffer, offset, length, position) => {
+					largestRead = Math.max(largestRead, length);
+					return source.read(buffer, offset, length, position);
+				},
+				close: source.close,
+			};
+		},
+	};
+	const fx = fixture([handle("a")], files, 40);
+	fx.inspector.render(100);
+	fx.inspector.handleInput("r");
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	assert.ok(largestRead <= 512 * 1024);
+	fx.inspector.handleInput("\x1bOH");
+	assert.match(plain(fx.inspector.render(100)), /earlier transcript records omitted/);
+	fx.inspector.handleInput("\x1bOF");
+	assert.match(plain(fx.inspector.render(100)), /history-19999/);
+	fx.inspector.dispose();
+});
+
+test("inspector bounds captured prompt reads and reports truncation", async () => {
+	const prompt = `prompt-start\n${"p".repeat(70 * 1024)}`;
+	let largestRead = 0;
+	const files: TestFiles = {
+		stat: async () => ({ size: 0, mtimeMs: 0 }),
+		open: async () => {
+			const source = openText(prompt);
+			return {
+				stat: source.stat,
+				read: async (buffer, offset, length, position) => {
+					largestRead = Math.max(largestRead, length);
+					return source.read(buffer, offset, length, position);
+				},
+				close: source.close,
+			};
+		},
+	};
+	const fx = fixture([handle("a")], files);
+	fx.inspector.render(100);
+	fx.inspector.handleInput("p");
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	assert.ok(largestRead <= 64 * 1024 + 1);
+	assert.match(plain(fx.inspector.render(100)), /prompt-start/);
+	fx.inspector.handleInput("\x1bOF");
+	assert.match(plain(fx.inspector.render(100)), /prompt truncated after/);
+	fx.inspector.dispose();
+});
+
+test("a stalled transcript read cancels before the next selection refreshes", async () => {
+	const reads: string[] = [];
+	let closedStalledFile = 0;
+	const files: TestFiles = {
+		stat: async (path: string) => ({
+			size: 20,
+			mtimeMs: path.includes("a.jsonl") ? 1 : 2,
+		}),
+		open: async (path: string) => {
+			reads.push(path);
+			if (path.includes("a.jsonl")) {
+				return {
+					stat: async () => ({ size: 20 }),
+					read: async () => new Promise<never>(() => {}),
+					close: async () => {
+						closedStalledFile++;
+					},
+				};
+			}
+			return openText(
+				`${JSON.stringify({ type: "session_info", name: "history-b" })}\n`,
+			);
+		},
+	};
+	const fx = fixture(
+		[handle("a"), handle("b")],
+		files,
+		40,
+		{ fileOperationTimeoutMs: 20 },
+	);
+	fx.inspector.render(100);
+	fx.inspector.handleInput("r");
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	fx.inspector.handleInput("escape");
+	fx.inspector.handleInput("down");
+	fx.inspector.handleInput("r");
+	await new Promise((resolve) => setTimeout(resolve, 80));
+	assert.ok(reads[0]?.includes("a.jsonl"));
+	assert.ok(reads.some((path) => path.includes("b.jsonl")));
+	assert.equal(closedStalledFile, 1);
+	assert.match(plain(fx.inspector.render(100)), /history-b/);
+	fx.inspector.dispose();
+});
+
+test("a failed UI refresh stays inside the inspector boundary", () => {
+	const fx = fixture([handle("a")], noFiles, 60, {
+		throwOnRequestRender: true,
+	});
+	assert.doesNotThrow(() => fx.inspector.refresh());
+	fx.inspector.dispose();
+});
+
+test("an aborted settled idle child does not keep the inspector refresh timer", async () => {
+	const fx = fixture([
+		handle("a", {
+			state: "running",
+			lifecycle: "idle",
+			processState: "alive",
+			runState: "idle",
+			runOutcome: "aborted",
+			settlementStatus: "settled",
+			isStreaming: false,
+		}),
+	]);
+	fx.inspector.render(80);
+	const before = fx.renders;
+	await new Promise((resolve) => setTimeout(resolve, 1_050));
+	assert.equal(fx.renders, before);
 	fx.inspector.dispose();
 });
 
@@ -297,13 +484,15 @@ test("stale transcript reads are ignored and queued refresh uses the newer child
 	const firstStat = new Promise<TestFileStat>((resolve) => {
 		resolveFirstStat = resolve;
 	});
-	const files = {
+	const files: TestFiles = {
 		stat: async (path: string) =>
 			path.includes("a.jsonl") ? firstStat : { size: 20, mtimeMs: 2 },
-		readFile: async (path: string) =>
-			path.includes("a.jsonl")
-				? `${JSON.stringify({ type: "session_info", name: "history-a" })}\n`
-				: `${JSON.stringify({ type: "session_info", name: "history-b" })}\n`,
+		open: async (path: string) =>
+			openText(
+				path.includes("a.jsonl")
+					? `${JSON.stringify({ type: "session_info", name: "history-a" })}\n`
+					: `${JSON.stringify({ type: "session_info", name: "history-b" })}\n`,
+			),
 	};
 	const fx = fixture([handle("a"), handle("b")], files);
 	fx.inspector.render(100);

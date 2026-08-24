@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Set PI_SUBAGENT_SKIP_E2E=1 to run only the deterministic suite.
 set -euo pipefail
 
 version="$(pi --version)"
@@ -15,7 +16,15 @@ trap cleanup EXIT
 
 sources=(child.ts dispatch-event.ts index.ts lifecycle.ts live-state.ts lock.ts owner.ts registry.ts output-store.ts settlement-notifications.ts transcript.ts ui.ts rpc.ts)
 tests=(guard.test.ts child.test.ts lifecycle.test.ts live-state.test.ts lock.test.ts dispatch-event.test.ts launch.test.ts owner.test.ts registry.test.ts output-store.test.ts settlement-notifications.test.ts transcript.test.ts tools.test.ts ui.test.ts rpc.test.ts)
-cp "${sources[@]/#/$script_dir/}" "${tests[@]/#/$script_dir/}" "$tmp"/
+support=()
+if [[ "${PI_SUBAGENT_E2E_ONLY:-0}" == "1" ]]; then
+	tests=(e2e.test.ts)
+	support=(e2e-driver.ts e2e-fake-pi.mjs)
+elif [[ "${PI_SUBAGENT_SKIP_E2E:-0}" != "1" ]]; then
+	tests+=(e2e.test.ts)
+	support=(e2e-driver.ts e2e-fake-pi.mjs)
+fi
+cp "${sources[@]/#/$script_dir/}" "${tests[@]/#/$script_dir/}" "${support[@]/#/$script_dir/}" "$tmp"/
 for source in "${sources[@]}"; do ln -s "$source" "$tmp/${source%.ts}.js"; done
 mkdir -p "$tmp/node_modules/@mariozechner" "$tmp/node_modules/@sinclair"
 ln -s "$package_dir" "$tmp/node_modules/@mariozechner/pi-coding-agent"
