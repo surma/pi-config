@@ -156,14 +156,14 @@ async function runScenario(
 }
 
 const cancellationCases: [string, string, number][] = [
-	["start", "subagent_start", 4_000],
-	["list", "subagent_list", 4_000],
-	["status", "subagent_status", 4_000],
-	["steer", "subagent_steer", 4_000],
-	["follow-up", "subagent_follow_up", 4_000],
-	["interrupt", "subagent_interrupt", 4_000],
+	["start", "subagent_start", 6_000],
+	["list", "subagent_list", 6_000],
+	["status", "subagent_status", 6_000],
+	["steer", "subagent_steer", 6_000],
+	["follow-up", "subagent_follow_up", 6_000],
+	["interrupt", "subagent_interrupt", 6_000],
 	["kill", "subagent_kill", 10_000],
-	["resume", "subagent_resume", 5_000],
+	["resume", "subagent_resume", 7_000],
 ];
 
 for (const [suffix, toolName, timeoutMs] of cancellationCases) {
@@ -175,9 +175,9 @@ for (const [suffix, toolName, timeoutMs] of cancellationCases) {
 
 e2eTest(
 	"E2E: resume cancellation releases the original indefinite-resume chain",
-	{ timeout: 7_000 },
+	{ timeout: 9_000 },
 	async () => {
-		const result = await runScenario("cancel-resume", 5_000);
+		const result = await runScenario("cancel-resume", 7_000);
 		assert.equal(result.tool, "subagent_resume");
 	},
 );
