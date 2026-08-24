@@ -24,6 +24,10 @@ export interface RpcProcessClose {
 
 /** Maximum retained bytes for one native RPC JSONL record. */
 export const MAX_RPC_RECORD_BYTES = 2 * 1024 * 1024;
+/** Maximum serialized size of one outbound RPC request. */
+export const MAX_RPC_REQUEST_BYTES = 1 * 1024 * 1024;
+/** Maximum serialized bytes retained by pending outbound RPC requests. */
+export const MAX_RPC_PENDING_BYTES = 8 * 1024 * 1024;
 const MAX_DIAGNOSTIC_BYTES = 8 * 1024;
 const MAX_STDERR_BYTES = 64 * 1024;
 const DEFAULT_WRITE_TIMEOUT_MS = 5_000;
@@ -102,8 +106,9 @@ function remainingUntil(deadline: number): number {
 }
 
 function abortError(reason: unknown): Error {
-	if (reason instanceof Error) return reason;
-	const error = new Error(reason === undefined ? "The operation was aborted." : String(reason));
+	const error = reason instanceof Error
+		? reason
+		: new Error(reason === undefined ? "The operation was aborted." : String(reason));
 	error.name = "AbortError";
 	return error;
 }
@@ -312,6 +317,7 @@ interface PendingRequest {
 	resolve: (response: RpcResponseRecord) => void;
 	reject: (error: Error) => void;
 	timer: NodeJS.Timeout;
+	bytes: number;
 	signal?: AbortSignal;
 	onAbort?: () => void;
 }
@@ -323,7 +329,9 @@ export interface RpcChildTransportOptions {
 	requestTimeoutMs?: number;
 	writeTimeoutMs?: number;
 	maxRecordBytes?: number;
+	maxRequestBytes?: number;
 	maxPendingRequests?: number;
+	maxPendingBytes?: number;
 }
 
 export interface RpcSendOptions {
@@ -382,8 +390,12 @@ export class RpcChildTransport {
 	private stderrText = "";
 	private writeChain: Promise<void> = Promise.resolve();
 	private queuedWrites = 0;
+	private pendingBytes = 0;
+	private sigkillDelivered = false;
 	private readonly writeAbortController = new AbortController();
 	private readonly maxPendingRequests: number;
+	private readonly maxRequestBytes: number;
+	private readonly maxPendingBytes: number;
 
 	constructor(
 		readonly process: ChildProcess,
@@ -392,6 +404,14 @@ export class RpcChildTransport {
 		this.maxPendingRequests = Math.min(
 			MAX_PENDING_REQUESTS,
 			positiveTimeout(options.maxPendingRequests, MAX_PENDING_REQUESTS),
+		);
+		this.maxRequestBytes = Math.min(
+			MAX_RPC_REQUEST_BYTES,
+			positiveTimeout(options.maxRequestBytes, MAX_RPC_REQUEST_BYTES),
+		);
+		this.maxPendingBytes = Math.min(
+			MAX_RPC_PENDING_BYTES,
+			positiveTimeout(options.maxPendingBytes, MAX_RPC_PENDING_BYTES),
 		);
 		this.closePromise = new Promise((resolve) => {
 			this.resolveClose = resolve;
@@ -487,12 +507,18 @@ export class RpcChildTransport {
 		} catch (error) {
 			throw asError(error);
 		}
+		const encodedBytes = Buffer.byteLength(encoded, "utf8");
 		const maxRecordBytes = Math.min(
 			MAX_RPC_RECORD_BYTES,
 			positiveTimeout(this.options.maxRecordBytes, MAX_RPC_RECORD_BYTES),
 		);
-		if (Buffer.byteLength(encoded, "utf8") > maxRecordBytes)
-			throw new Error(`RPC request exceeds ${maxRecordBytes} bytes.`);
+		const maxRequestBytes = Math.min(maxRecordBytes, this.maxRequestBytes);
+		if (encodedBytes > maxRequestBytes)
+			throw new Error(`RPC request exceeds ${maxRequestBytes} bytes.`);
+		if (this.pendingBytes + encodedBytes > this.maxPendingBytes)
+			throw new Error(
+				`RPC request queue is full at ${this.maxPendingBytes} pending bytes.`,
+			);
 		return new Promise((resolve, reject) => {
 			const timer = setTimeout(() => {
 				this.rejectRequest(id, new Error(`Timed out waiting for RPC response to ${String(body.type)}.`));
@@ -502,6 +528,7 @@ export class RpcChildTransport {
 				resolve,
 				reject,
 				timer,
+				bytes: encodedBytes,
 				signal: requestSignal,
 			};
 			if (requestSignal) {
@@ -510,6 +537,7 @@ export class RpcChildTransport {
 				requestSignal.addEventListener("abort", pending.onAbort, { once: true });
 			}
 			this.pending.set(id, pending);
+			this.pendingBytes += encodedBytes;
 			this.queuedWrites++;
 			const deadline = Date.now() + timeoutMs;
 			this.writeChain = this.writeChain
@@ -589,15 +617,37 @@ export class RpcChildTransport {
 			osCloseObserved: false,
 			forced: true,
 		});
+		this.trySigkill();
 	}
 
 	private signal(signal: NodeJS.Signals): void {
 		if (this.closed) return;
+		if (signal === "SIGKILL") {
+			this.trySigkill();
+			return;
+		}
 		try {
 			if (!this.process.kill(signal))
 				this.safeDiagnostic(`RPC child process rejected ${signal}.`);
 		} catch (error) {
 			this.safeDiagnostic(`RPC child ${signal} failed: ${String(error)}`);
+		}
+	}
+
+	private trySigkill(): void {
+		if (this.sigkillDelivered) return;
+		const exited =
+			(this.process.exitCode !== null && this.process.exitCode !== undefined) ||
+			(this.process.signalCode !== null && this.process.signalCode !== undefined);
+		if (exited) return;
+		try {
+			if (this.process.kill("SIGKILL")) {
+				this.sigkillDelivered = true;
+				return;
+			}
+			this.safeDiagnostic("RPC child process rejected SIGKILL.");
+		} catch (error) {
+			this.safeDiagnostic(`RPC child SIGKILL failed: ${String(error)}`);
 		}
 	}
 
@@ -631,10 +681,7 @@ export class RpcChildTransport {
 				return;
 			}
 			const response = record as RpcResponseRecord;
-			this.pending.delete(id);
-			clearTimeout(pending.timer);
-			if (pending.signal && pending.onAbort)
-				pending.signal.removeEventListener("abort", pending.onAbort);
+			this.removePending(id);
 			if (response.success === false)
 				pending.reject(new Error(response.error || `RPC ${String(response.command)} failed.`));
 			else pending.resolve(response);
@@ -647,13 +694,20 @@ export class RpcChildTransport {
 		}
 	}
 
-	private rejectRequest(id: string, error: Error): void {
+	private removePending(id: string): PendingRequest | undefined {
 		const pending = this.pending.get(id);
-		if (!pending) return;
+		if (!pending) return undefined;
 		this.pending.delete(id);
+		this.pendingBytes = Math.max(0, this.pendingBytes - pending.bytes);
 		clearTimeout(pending.timer);
 		if (pending.signal && pending.onAbort)
 			pending.signal.removeEventListener("abort", pending.onAbort);
+		return pending;
+	}
+
+	private rejectRequest(id: string, error: Error): void {
+		const pending = this.removePending(id);
+		if (!pending) return;
 		try {
 			pending.reject(error);
 		} catch {

@@ -3,6 +3,7 @@ import {
 	mkdir,
 	mkdtemp,
 	readFile as readFileFs,
+	rm as rmFs,
 	stat,
 	utimes,
 	writeFile,
@@ -126,4 +127,74 @@ test("the lock bounds an action that never settles", async () => {
 		withDirectoryLock(path, async () => never, "Stuck action", { timeoutMs: 25 }),
 		/timed out/,
 	);
+});
+
+test("a timed-out cleanup cannot remove a later lock acquisition", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "pi-lock-late-cleanup-"));
+	const path = join(directory, "record.json");
+	const lockPath = `${path}.lock`;
+	let releaseLateCleanup!: () => void;
+	const lateCleanup = new Promise<void>((resolve) => {
+		releaseLateCleanup = resolve;
+	});
+	let releaseAction!: () => void;
+	const action = new Promise<void>((resolve) => {
+		releaseAction = resolve;
+	});
+	let cleanupStarted = false;
+	let firstCleanup = true;
+	const io = {
+		rm: async (target: string, options: { recursive: boolean; force: boolean }) => {
+			if (target === lockPath && firstCleanup) {
+				firstCleanup = false;
+				cleanupStarted = true;
+				await rmFs(target, options);
+				await lateCleanup;
+				await rmFs(target, options);
+				return;
+			}
+			await rmFs(target, options);
+		},
+	};
+	const started = Date.now();
+	const first = withDirectoryLock(
+		path,
+		async () => action,
+		"First lock",
+		{ timeoutMs: 25, io },
+	);
+	await assert.rejects(first, /timed out/);
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.equal(cleanupStarted, true);
+	assert.ok(Date.now() - started < 150);
+	try {
+		let entered = false;
+		await assert.rejects(
+			withDirectoryLock(
+				path,
+				async () => {
+					entered = true;
+				},
+				"Second lock",
+				{ timeoutMs: 25, retryMs: 1, retries: 100, io },
+			),
+			/timed out/,
+		);
+		assert.equal(entered, false);
+	} finally {
+		releaseLateCleanup();
+		releaseAction();
+	}
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	let entered = false;
+	await withDirectoryLock(
+		path,
+		async () => {
+			entered = true;
+		},
+		"Third lock",
+		{ io },
+	);
+	assert.equal(entered, true);
+	await assert.rejects(stat(lockPath), { code: "ENOENT" });
 });

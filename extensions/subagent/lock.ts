@@ -58,6 +58,39 @@ function mergedIo(options: DirectoryLockOptions): LockFileSystem {
 	return { ...defaultIo, ...options.io };
 }
 
+const lockCleanupTails = new Map<string, Promise<void>>();
+
+async function waitForLockCleanup(
+	path: string,
+	deadline: number,
+	signal: AbortSignal | undefined,
+): Promise<void> {
+	const cleanup = lockCleanupTails.get(path);
+	if (!cleanup) return;
+	await bounded(cleanup, deadline, signal, "Lock cleanup");
+}
+
+function queueLockCleanup(
+	path: string,
+	action: Promise<unknown>,
+	operation: () => Promise<void>,
+): Promise<void> {
+	const previous = lockCleanupTails.get(path) || Promise.resolve();
+	const actionDone = action.then(
+		() => undefined,
+		() => undefined,
+	);
+	const current = previous.then(operation);
+	const marker = Promise.allSettled([current, actionDone]).then(
+		() => undefined,
+	);
+	lockCleanupTails.set(path, marker);
+	void marker.then(() => {
+		if (lockCleanupTails.get(path) === marker) lockCleanupTails.delete(path);
+	});
+	return current;
+}
+
 function positiveLimit(value: number | undefined, fallback: number): number {
 	return typeof value === "number" && Number.isFinite(value) && value > 0
 		? Math.floor(value)
@@ -282,6 +315,7 @@ export async function withDirectoryLock<T>(
 	const retries = positiveLimit(options.retries, LOCK_RETRIES);
 	const deadline = Date.now() + timeoutMs;
 	const lockPath = `${path}.lock`;
+	await waitForLockCleanup(lockPath, deadline, options.signal);
 	await bounded(
 		() => io.mkdir(dirname(path), { recursive: true, mode: 0o700 }),
 		deadline,
@@ -289,6 +323,7 @@ export async function withDirectoryLock<T>(
 		`${description} parent directory creation`,
 	);
 	for (let attempt = 0; attempt < retries && Date.now() < deadline; attempt++) {
+		await waitForLockCleanup(lockPath, deadline, options.signal);
 		try {
 			await bounded(
 				() => io.mkdir(lockPath, { mode: 0o700 }),
@@ -325,11 +360,29 @@ export async function withDirectoryLock<T>(
 			});
 			continue;
 		}
+		let actionPromise: Promise<T> = Promise.resolve() as Promise<T>;
 		try {
 			await writeLockOwner(lockPath, io, deadline, options.signal, now);
-			return await bounded(() => action(), deadline, options.signal, description);
+			try {
+				actionPromise = Promise.resolve(action());
+			} catch (error) {
+				actionPromise = Promise.reject(error);
+			}
+			return await bounded(actionPromise, deadline, options.signal, description);
 		} finally {
-			await cleanupBounded(() => io.rm(lockPath, { recursive: true, force: true }));
+			const cleanup = queueLockCleanup(
+				lockPath,
+				actionPromise,
+				() => io.rm(lockPath, { recursive: true, force: true }),
+			);
+			// Keep the underlying action and cleanup observed after a bounded return.
+			void cleanup.catch(() => {});
+			await bounded(
+				cleanup,
+				Math.min(deadline, Date.now() + CLEANUP_TIMEOUT_MS),
+				undefined,
+				"Lock cleanup",
+			).catch(() => {});
 		}
 	}
 	throw new Error(`${description} operation timed out for ${path}.`);

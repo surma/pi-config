@@ -203,13 +203,81 @@ test("RPC response waits still reject after their finite timeout", async () => {
 test("RPC sends can be canceled through an optional AbortSignal", async () => {
 	const fixture = transport();
 	const controller = new AbortController();
-	const request = fixture.rpc.send({ type: "cancelable" }, {
-		timeoutMs: 200,
+	const request = fixture.rpc.send({ type: "cancelable" }, 200, controller.signal);
+	controller.abort(new Error("request canceled"));
+	await assert.rejects(request, (error) => {
+		assert.equal((error as Error).name, "AbortError");
+		assert.match((error as Error).message, /request canceled/);
+		return true;
+	});
+	await tick();
+	assert.deepEqual(fixture.child.stdin.lines, []);
+	fixture.rpc.forceClose({ code: null, signal: "SIGKILL" });
+});
+
+test("aborting a blocked write releases its pending request and queue slot", async () => {
+	const child = new BackpressuredProcess();
+	const rpc = new RpcChildTransport(child as unknown as ChildProcess, {
+		onRecord: () => {},
+		onDiagnostic: () => {},
+		onClose: () => {},
+		requestTimeoutMs: 500,
+		maxPendingRequests: 1,
+	});
+	const controller = new AbortController();
+	const first = rpc.send({ type: "first" }, {
+		timeoutMs: 500,
+		writeTimeoutMs: 500,
 		signal: controller.signal,
 	});
-	controller.abort(new Error("request canceled"));
-	await assert.rejects(request, /request canceled/);
-	fixture.rpc.forceClose({ code: null, signal: "SIGKILL" });
+	await tick();
+	assert.equal(child.stdin.writes.length, 1);
+	controller.abort(new Error("parent aborted"));
+	await assert.rejects(first, (error) => {
+		assert.equal((error as Error).name, "AbortError");
+		return true;
+	});
+	await tick();
+	child.stdin.release();
+	const second = rpc.send({ type: "second" }, {
+		timeoutMs: 500,
+		writeTimeoutMs: 500,
+	});
+	await tick();
+	assert.equal(child.stdin.writes.length, 2);
+	child.stdin.release();
+	const command = child.stdin.writes[1];
+	assert.ok(command);
+	child.stdout.write(`${JSON.stringify(response(command))}\n`);
+	await second;
+	rpc.forceClose({ code: null, signal: "SIGKILL" });
+});
+
+test("RPC request and aggregate pending-byte bounds reject before queue growth", async () => {
+	const fixture = transport();
+	const boundedRpc = new RpcChildTransport(fixture.child as unknown as ChildProcess, {
+		onRecord: () => {},
+		onDiagnostic: () => {},
+		onClose: () => {},
+		requestTimeoutMs: 500,
+		maxRequestBytes: 256,
+		maxPendingBytes: 128,
+	});
+	await assert.rejects(
+		boundedRpc.send({ type: "oversized", message: "x".repeat(300) }),
+		/request exceeds/,
+	);
+	const first = boundedRpc.send({ type: "first", message: "x".repeat(40) });
+	await assert.rejects(
+		boundedRpc.send({ type: "second", message: "y".repeat(40) }),
+		/request queue is full/,
+	);
+	boundedRpc.forceClose({
+		code: null,
+		signal: "SIGKILL",
+		error: new Error("forced close"),
+	});
+	await assert.rejects(first, /forced close/);
 });
 
 test("RPC writes wait for drain and serialize queued requests", async () => {
@@ -295,6 +363,7 @@ test("forceClose records missing OS close and releases stream resources", async 
 	assert.equal(fixture.child.stdin.destroyed, true);
 	assert.equal(fixture.child.stdout.destroyed, true);
 	assert.equal(fixture.child.stderr.destroyed, true);
+	assert.deepEqual(fixture.child.signals, ["SIGKILL"]);
 	assert.deepEqual(closes, [{
 		code: null,
 		signal: "SIGKILL",

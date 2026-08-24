@@ -482,6 +482,10 @@ function abortError(reason: unknown): Error {
 	return error;
 }
 
+function isAbortError(error: unknown): error is Error {
+	return error instanceof Error && error.name === "AbortError";
+}
+
 function bounded<T>(
 	operation: Promise<T> | (() => Promise<T>),
 	deadline: number,
@@ -584,6 +588,7 @@ export async function readTranscript(
 		scanner.push(decoder.end());
 		return resultFor(collector, scanner.finish());
 	} catch (error) {
+		if (isAbortError(error)) throw error;
 		if ((error as NodeJS.ErrnoException).code === "ENOENT")
 			return resultFor(createPageCollector(page), "missing");
 		return resultFor(createPageCollector(page), "unreadable");

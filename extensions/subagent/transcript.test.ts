@@ -408,6 +408,33 @@ test("stuck transcript reads return unreadable within the operation deadline", a
 	assert.equal(closeCount, 1);
 });
 
+test("transcript reads preserve AbortError cancellation", async () => {
+	const controller = new AbortController();
+	let closeCount = 0;
+	const never = new Promise<never>(() => {});
+	const result = readTranscript("canceled.jsonl", {
+		timeoutMs: 500,
+		signal: controller.signal,
+		io: {
+			open: async () => ({
+				stat: async () => never,
+				read: async () => never,
+				close: async () => {
+					closeCount++;
+				},
+			}),
+		},
+	});
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	controller.abort(new Error("transcript canceled"));
+	await assert.rejects(result, (error) => {
+		assert.equal((error as Error).name, "AbortError");
+		assert.match((error as Error).message, /transcript canceled/);
+		return true;
+	});
+	assert.equal(closeCount, 1);
+});
+
 test("a snapshot above the total byte bound is rejected", async () => {
 	const fixture = await temporaryFile(line(message("user", "bounded")));
 	try {

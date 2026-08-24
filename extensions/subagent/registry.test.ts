@@ -45,7 +45,14 @@ function entry(overrides: Partial<RegistryEntry> = {}): RegistryEntry {
 test("registry round trips RPC process identity atomically", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-registry-"));
 	const path = join(dir, "registry.json");
-	const entries = [entry({ exitSignal: "SIGINT" })];
+	const entries = [
+		entry({
+			exitSignal: "SIGINT",
+			killRequestedAt: 3,
+			osCloseObserved: false,
+			forced: true,
+		}),
+	];
 	await saveRegistry(entries, path);
 	assert.deepEqual(await loadRegistry(path), entries);
 	assert.match(await readFile(path, "utf8"), /"pid": 123/);
@@ -98,6 +105,40 @@ test("registry loader rejects malformed owner-matching entries before reconcilia
 		]),
 	);
 	assert.deepEqual(await loadRegistry(path), [entry()]);
+});
+
+test("registry loading preserves durable kill and close evidence", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-registry-evidence-"));
+	const path = join(dir, "registry.json");
+	const durable = entry({
+		killRequestedAt: 123,
+		osCloseObserved: false,
+		forced: true,
+	});
+	await writeFile(path, JSON.stringify([durable]), "utf8");
+	assert.deepEqual(await loadRegistry(path), [durable]);
+	await saveRegistry([durable], path);
+	assert.deepEqual(await loadRegistry(path), [durable]);
+});
+
+test("registry loading rejects invalid durable evidence fields", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-registry-evidence-invalid-"));
+	const path = join(dir, "registry.json");
+	await writeFile(
+		path,
+		JSON.stringify([
+			entry({ killRequestedAt: -1 as never }),
+			entry({ osCloseObserved: "false" as never }),
+			entry({ forced: 1 as never }),
+			entry({ killRequestedAt: 123, osCloseObserved: false, forced: true }),
+		]),
+		"utf8",
+	);
+	assert.deepEqual((await loadRegistry(path)).map(({ killRequestedAt, osCloseObserved, forced }) => ({
+		killRequestedAt,
+		osCloseObserved,
+		forced,
+	})), [{ killRequestedAt: 123, osCloseObserved: false, forced: true }]);
 });
 
 test("registry loading rejects an oversized snapshot before JSON parsing", async () => {

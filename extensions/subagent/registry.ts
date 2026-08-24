@@ -33,6 +33,9 @@ export interface RegistryEntry {
 	createdAt: number;
 	lastActivityAt: number;
 	error?: string;
+	killRequestedAt?: number;
+	osCloseObserved?: boolean;
+	forced?: boolean;
 	stderrTail?: string;
 	diagnostics?: string[];
 	outputPath?: string;
@@ -328,6 +331,9 @@ function validRegistryEntry(value: unknown): value is RegistryEntry {
 				SETTLEMENT_STATUSES.has(value as SettlementStatus),
 		) ||
 		!optional(entry, "error", (value) => boundedString(value, MAX_ERROR_BYTES)) ||
+		!optional(entry, "killRequestedAt", safeTimestamp) ||
+		!optional(entry, "osCloseObserved", (value) => typeof value === "boolean") ||
+		!optional(entry, "forced", (value) => typeof value === "boolean") ||
 		!optional(entry, "stderrTail", (value) =>
 			boundedString(value, MAX_STDERR_TAIL_BYTES),
 		) ||
@@ -376,6 +382,9 @@ const REGISTRY_KEYS: readonly (keyof RegistryEntry)[] = [
 	"createdAt",
 	"lastActivityAt",
 	"error",
+	"killRequestedAt",
+	"osCloseObserved",
+	"forced",
 	"stderrTail",
 	"diagnostics",
 	"outputPath",
