@@ -6,6 +6,7 @@ export type SettledRunOutcome = Exclude<RunOutcome, "pending">;
 export const SETTLEMENT_NOTIFICATION_DELAY_MS = 0;
 const MAX_SEND_RETRIES = 1;
 const MAX_ACCEPTED_KEYS = 4096;
+const MAX_SENDS_PER_FLUSH = 32;
 
 export interface SettlementNotificationRecord {
 	ownerSessionFile: string;
@@ -61,7 +62,7 @@ function key(record: SettlementNotificationRecord): string {
 function messageFor(record: SettlementNotificationRecord): SettlementCustomMessage {
 	return {
 		customType: "subagent-settlement",
-		content: `Subagent ${record.childId} reached idle after run ${record.runId}. Check subagent_status with messages=3.`,
+		content: `Subagent ${record.childId} reached idle after run ${record.runId}. Check subagent_status with numMessages=3.`,
 		display: true,
 		details: {
 			...record,
@@ -144,8 +145,8 @@ export class SettlementNotificationQueue {
 		if (this.flushing) return;
 		this.flushing = true;
 		try {
-			const entries = [...this.pending.entries()];
-			this.pending.clear();
+			const entries = [...this.pending.entries()].slice(0, MAX_SENDS_PER_FLUSH);
+			for (const [recordKey] of entries) this.pending.delete(recordKey);
 			const suppressionEpoch = this.suppressionEpoch;
 			const childSuppressionEpochs = new Map(
 				entries.map(([_, record]) => [

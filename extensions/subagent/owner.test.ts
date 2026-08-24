@@ -225,3 +225,44 @@ test("empty or corrupt lease files behave as absent", async () => {
 	await writeFile(path, "", { mode: 0o600 });
 	assert.equal((await acquireLease(dir, owner, "controller-a", 1_000_000)).held, true);
 });
+
+test("overlapping renewals never let an older timestamp regress the lease", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-owner-lease-renew-order-"));
+	const t0 = 1_000_000;
+	await acquireLease(dir, owner, "controller-a", t0);
+	const newer = renewLease(dir, owner, "controller-a", t0 + 20_000);
+	const older = renewLease(dir, owner, "controller-a", t0 + 1_000);
+	assert.equal(await newer, true);
+	assert.equal(await older, true);
+	const record = await readLeaseRecord(dir, owner);
+	assert.ok(record);
+	assert.equal(record.renewedAt, t0 + 20_000);
+	assert.equal(record.expiresAt, t0 + 20_000 + LEASE_TTL_MS);
+});
+
+test("lease filesystem waits fail with a bounded error", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-owner-lease-timeout-"));
+	const never = new Promise<never>(() => {});
+	const started = Date.now();
+	await assert.rejects(
+		readLeaseRecord(dir, owner, {
+			timeoutMs: 25,
+			io: { readFile: async () => never },
+		}),
+		/timed out/,
+	);
+	assert.ok(Date.now() - started < 500);
+});
+
+test("owner realpath waits honor cancellation", async () => {
+	const controller = new AbortController();
+	const never = new Promise<never>(() => {});
+	controller.abort(new Error("owner lookup canceled"));
+	await assert.rejects(
+		canonicalOwnerSessionFile("/tmp/parent.jsonl", {
+			io: { realpath: async () => never },
+			signal: controller.signal,
+		}),
+		/owner lookup canceled/,
+	);
+});

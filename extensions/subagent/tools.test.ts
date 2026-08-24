@@ -15,6 +15,7 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 import type { TSchema } from "@sinclair/typebox";
 import { Check } from "@sinclair/typebox/value";
 import subagentExtension from "./index.ts";
+import { RpcChildTransport } from "./rpc.js";
 import { leasePath, ownerRegistryPath } from "./owner.ts";
 
 // The test process can inherit the delegated-child marker from the parent harness.
@@ -106,7 +107,7 @@ async function fakePi(
 	await writeFile(
 		binary,
 		`#!/usr/bin/env node
-import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 const args = process.argv.slice(2);
 const logPath = ${JSON.stringify(logPath)};
@@ -120,7 +121,23 @@ if (sessionFile) {
   mkdirSync(join(sessionFile, ".."), { recursive: true });
   if (!existsSync(sessionFile)) writeFileSync(sessionFile, "{\\"type\\":\\"session\\"}\\n");
 }
-let run = Number.parseInt(process.env.PI_SUBAGENT_RUN_ID_BASE || "0", 10) || 0;
+const healthPath = process.env.PI_SUBAGENT_HEALTH_PATH;
+if (healthPath && mode !== "extension-error") {
+  mkdirSync(join(healthPath, ".."), { recursive: true });
+  writeFileSync(healthPath, "pi-subagent-child-extension-ready/v1\\n", { encoding: "utf8", mode: 0o600 });
+}
+const runCursorPath = sessionDir ? join(sessionDir, "run-cursor.json") : undefined;
+let run = 0;
+if (runCursorPath && existsSync(runCursorPath)) {
+  try {
+    const cursor = JSON.parse(readFileSync(runCursorPath, "utf8"));
+    if (Number.isSafeInteger(cursor.runCursor) && cursor.runCursor >= 0) run = cursor.runCursor;
+  } catch {}
+}
+function persistRunCursor(runCursor) {
+  if (!runCursorPath) return;
+  writeFileSync(runCursorPath, JSON.stringify({ runCursor }) + "\\n", { mode: 0o600 });
+}
 let activeAbortRun;
 let buffer = "";
 function output(record) { process.stdout.write(JSON.stringify(record) + "\\n"); }
@@ -130,6 +147,7 @@ function respond(command, data) {
 function turn(message) {
   run += 1;
   const runId = run;
+  persistRunCursor(runId);
   const responseId = "response-" + run;
   output({ type: "agent_start", runId });
   if (mode === "close") {
@@ -167,6 +185,9 @@ function turn(message) {
 }
 function command(command) {
   if (command.type === "get_state") {
+    if (mode === "extension-error") {
+      output({ type: "extension_error", extensionPath: "child.ts", error: "child extension failed to load" });
+    }
     respond(command, { sessionFile, sessionId: "child-session", model: { provider: "provider", id: "model" }, thinkingLevel: "off" });
   } else if (command.type === "prompt") {
     respond(command);
@@ -309,6 +330,163 @@ test("nested children cannot start another delegated child", async () => {
 	}
 });
 
+test("aborted tool calls reject without a normal result", async () => {
+	const { tools } = setup();
+	const signal = AbortSignal.abort(new Error("caller canceled"));
+	await assert.rejects(
+		requireTool(tools, "subagent_status").execute(
+			"aborted",
+			{ id: "missing" },
+			signal,
+		),
+		(error: unknown) => error instanceof Error && error.name === "AbortError",
+	);
+});
+
+test("parent signals reach RPC transport requests", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "pi-rpc-signal-forwarding-"));
+	const agentDirectory = join(directory, "agent");
+	const parentSession = join(directory, "parent.jsonl");
+	const logPath = join(directory, "invocations.jsonl");
+	await writeFile(parentSession, "parent\\n");
+	const binary = await fakePi(directory, logPath);
+	const old = {
+		agentDirectory: process.env.PI_CODING_AGENT_DIR,
+		pi: process.env.PI_SUBAGENT_PI_BIN,
+		depth: process.env.PI_SUBAGENT_DEPTH,
+	};
+	process.env.PI_CODING_AGENT_DIR = agentDirectory;
+	process.env.PI_SUBAGENT_PI_BIN = binary;
+	delete process.env.PI_SUBAGENT_DEPTH;
+	const handlers = new Map<string, TestHandler>();
+	const { tools } = setup(handlers);
+	const ctx = context(parentSession, "signal-forwarding-parent", directory);
+	const prototype = RpcChildTransport.prototype as unknown as {
+		send: (...args: any[]) => Promise<unknown>;
+	};
+	const originalSend = prototype.send;
+	let observedSignal: AbortSignal | undefined;
+	prototype.send = function (...args: any[]): Promise<unknown> {
+		observedSignal = args[2] as AbortSignal | undefined;
+		return originalSend.apply(this, args);
+	};
+	try {
+		await handlers.get("session_start")?.({ reason: "startup" }, ctx);
+		const started = await requireTool(tools, "subagent_start").execute(
+			"start",
+			{ task: "initial", model: "provider/model", thinking: "off" },
+			undefined,
+			undefined,
+			ctx,
+		);
+		const signal = new AbortController().signal;
+		await requireTool(tools, "subagent_follow_up").execute(
+			"follow-up",
+			{ id: started.details.handle.id, message: "next" },
+			signal,
+			undefined,
+			ctx,
+		);
+		assert.equal(observedSignal, signal);
+	} finally {
+		prototype.send = originalSend;
+		await handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
+		if (old.agentDirectory === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = old.agentDirectory;
+		if (old.pi === undefined) delete process.env.PI_SUBAGENT_PI_BIN;
+		else process.env.PI_SUBAGENT_PI_BIN = old.pi;
+		if (old.depth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
+		else process.env.PI_SUBAGENT_DEPTH = old.depth;
+	}
+});
+
+test("a canceled queue waiter cannot overlap a live predecessor", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "pi-rpc-queue-fence-"));
+	const agentDirectory = join(directory, "agent");
+	const parentSession = join(directory, "parent.jsonl");
+	const logPath = join(directory, "invocations.jsonl");
+	await writeFile(parentSession, "parent\\n");
+	const binary = await fakePi(directory, logPath);
+	const old = {
+		agentDirectory: process.env.PI_CODING_AGENT_DIR,
+		pi: process.env.PI_SUBAGENT_PI_BIN,
+		depth: process.env.PI_SUBAGENT_DEPTH,
+	};
+	process.env.PI_CODING_AGENT_DIR = agentDirectory;
+	process.env.PI_SUBAGENT_PI_BIN = binary;
+	delete process.env.PI_SUBAGENT_DEPTH;
+	const handlers = new Map<string, TestHandler>();
+	const { tools } = setup(handlers);
+	const ctx = context(parentSession, "queue-fence-parent", directory);
+	const prototype = RpcChildTransport.prototype as unknown as {
+		send: (...args: any[]) => Promise<unknown>;
+	};
+	const originalSend = prototype.send;
+	let delayFirstPrompt = false;
+	const promptCalls: unknown[] = [];
+	prototype.send = function (...args: any[]): Promise<unknown> {
+		const body = args[0] as Record<string, unknown>;
+		if (body.type === "prompt") {
+			promptCalls.push(body);
+			if (delayFirstPrompt) {
+				delayFirstPrompt = false;
+				return new Promise((resolve, reject) => {
+					setTimeout(() => {
+						void originalSend.apply(this, args).then(resolve, reject);
+					}, 150);
+				});
+			}
+		}
+		return originalSend.apply(this, args);
+	};
+	try {
+		await handlers.get("session_start")?.({ reason: "startup" }, ctx);
+		const started = await requireTool(tools, "subagent_start").execute(
+			"start",
+			{ task: "initial", model: "provider/model", thinking: "off" },
+			undefined,
+			undefined,
+			ctx,
+		);
+		const childId = started.details.handle.id;
+		promptCalls.length = 0;
+		delayFirstPrompt = true;
+		const first = requireTool(tools, "subagent_follow_up").execute(
+			"first",
+			{ id: childId, message: "first" },
+		);
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		const controller = new AbortController();
+		const canceled = requireTool(tools, "subagent_follow_up").execute(
+			"canceled",
+			{ id: childId, message: "canceled" },
+			controller.signal,
+		);
+		const successor = requireTool(tools, "subagent_follow_up").execute(
+			"successor",
+			{ id: childId, message: "successor" },
+		);
+		setTimeout(() => controller.abort(new Error("caller canceled")), 25);
+		await assert.rejects(
+			canceled,
+			(error: unknown) => error instanceof Error && error.name === "AbortError",
+		);
+		assert.equal(promptCalls.length, 1);
+		await Promise.all([first, successor]);
+		assert.equal(promptCalls.length, 2);
+		await requireTool(tools, "subagent_kill").execute("kill", { id: childId });
+	} finally {
+		prototype.send = originalSend;
+		await handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
+		if (old.agentDirectory === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = old.agentDirectory;
+		if (old.pi === undefined) delete process.env.PI_SUBAGENT_PI_BIN;
+		else process.env.PI_SUBAGENT_PI_BIN = old.pi;
+		if (old.depth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
+		else process.env.PI_SUBAGENT_DEPTH = old.depth;
+	}
+});
+
 test("RPC child lifecycle supports settlement wakes, output collisions, transcript paging, reload, and resume", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "pi-rpc-tools-"));
 	const agentDirectory = join(directory, "agent");
@@ -390,7 +568,7 @@ test("RPC child lifecycle supports settlement wakes, output collisions, transcri
 		await waitFor(() => sent.length >= 1);
 		const firstNotification = sent[0];
 		assert.equal(firstNotification.message.customType, "subagent-settlement");
-		assert.equal(firstNotification.message.content, `Subagent ${childId} reached idle after run 1. Check subagent_status with messages=3.`);
+		assert.equal(firstNotification.message.content, `Subagent ${childId} reached idle after run 1. Check subagent_status with numMessages=3.`);
 		assert.equal(firstNotification.options.triggerTurn, true);
 		assert.equal(firstNotification.options.deliverAs, "steer");
 		const firstDetails = firstNotification.message.details;
@@ -430,7 +608,28 @@ test("RPC child lifecycle supports settlement wakes, output collisions, transcri
 		assert.equal(reloadedList.details.handles[0]?.lifecycle, "idle");
 
 		await requireTool(reloaded.tools, "subagent_kill").execute("kill", { id: childId });
-		const resumed = await requireTool(reloaded.tools, "subagent_resume").execute("resume", {
+		const killedRegistry = JSON.parse(
+			await readFile(
+				ownerRegistryPath(agentDirectory, {
+					ownerSessionFile: parentSession,
+					ownerSessionId: "parent-session",
+				}),
+				"utf8",
+			),
+		) as Record<string, unknown>[];
+		assert.equal(typeof killedRegistry[0]?.killRequestedAt, "number");
+		await reloaded.handlers.get("session_shutdown")?.({ reason: "reload" }, ctx);
+		const afterKillReload = setup(new Map(), sent);
+		shutdownHandlers = afterKillReload.handlers;
+		await afterKillReload.handlers.get("session_start")?.({ reason: "reload" }, ctx);
+		const killed = await requireTool(afterKillReload.tools, "subagent_status").execute("killed-status", {
+			id: childId,
+		});
+		assert.equal(killed.details.processState, "stopped");
+		assert.equal(typeof killed.details.killRequestedAt, "number");
+		assert.equal(killed.details.state, "killed");
+		assert.equal(killed.details.lifecycle, "killed");
+		const resumed = await requireTool(afterKillReload.tools, "subagent_resume").execute("resume", {
 			id: childId,
 			task: "resumed",
 		});
@@ -438,7 +637,7 @@ test("RPC child lifecycle supports settlement wakes, output collisions, transcri
 		assert.equal(resumed.details.handle.processState, "alive");
 		assert.equal(resumed.details.handle.runId, 3);
 		assert.equal(resumed.details.handle.settlement.status, "settled");
-		await requireTool(reloaded.tools, "subagent_kill").execute("kill-again", { id: childId });
+		await requireTool(afterKillReload.tools, "subagent_kill").execute("kill-again", { id: childId });
 
 		const invocations = (await readFile(logPath, "utf8"))
 			.trim()
@@ -642,7 +841,7 @@ test("native assistant abort errors settle as one aborted wake with empty output
 		assert.equal(sent[0]?.message.customType, "subagent-settlement");
 		assert.equal(
 			sent[0]?.message.content,
-			`Subagent ${childId} reached idle after run 1. Check subagent_status with messages=3.`,
+			`Subagent ${childId} reached idle after run 1. Check subagent_status with numMessages=3.`,
 		);
 		assert.equal(sent[0]?.message.details?.settlements?.length, 1);
 		assert.deepEqual(sent[0]?.options, { triggerTurn: true, deliverAs: "steer" });
@@ -655,6 +854,55 @@ test("native assistant abort errors settle as one aborted wake with empty output
 		else process.env.PI_SUBAGENT_PI_BIN = old.pi;
 		if (old.mode === undefined) delete process.env.FAKE_PI_MODE;
 		else process.env.FAKE_PI_MODE = old.mode;
+	}
+});
+
+test("extension health failure rejects promptly on extension_error without a marker", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "pi-rpc-extension-health-error-"));
+	const agentDirectory = join(directory, "agent");
+	const parentSession = join(directory, "parent.jsonl");
+	const logPath = join(directory, "invocations.jsonl");
+	await writeFile(parentSession, "parent\n");
+	const binary = await fakePi(directory, logPath, "extension-error");
+	const old = {
+		agentDirectory: process.env.PI_CODING_AGENT_DIR,
+		pi: process.env.PI_SUBAGENT_PI_BIN,
+		depth: process.env.PI_SUBAGENT_DEPTH,
+	};
+	process.env.PI_CODING_AGENT_DIR = agentDirectory;
+	process.env.PI_SUBAGENT_PI_BIN = binary;
+	delete process.env.PI_SUBAGENT_DEPTH;
+	const handlers = new Map<string, TestHandler>();
+	const { tools } = setup(handlers);
+	const ctx = context(parentSession, "extension-health-error-parent", directory);
+	try {
+		await handlers.get("session_start")?.({ reason: "startup" }, ctx);
+		const startedAt = Date.now();
+		const result = await requireTool(tools, "subagent_start").execute(
+			"start",
+			{ task: "health", model: "provider/model", thinking: "off" },
+			undefined,
+			undefined,
+			ctx,
+		);
+		const elapsed = Date.now() - startedAt;
+		assert.ok(elapsed < 1_000, `health failure took ${elapsed}ms`);
+		assert.match(result.content[0]?.text || "", /health confirmation failed/);
+		assert.match(result.content[0]?.text || "", /child\.ts: child extension failed to load/);
+		const invocations = (await readFile(logPath, "utf8"))
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line) as string[]);
+		assert.equal(invocations.length, 1);
+		assert.equal(invocations[0]?.includes("--mode"), true);
+	} finally {
+		await handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
+		if (old.agentDirectory === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = old.agentDirectory;
+		if (old.pi === undefined) delete process.env.PI_SUBAGENT_PI_BIN;
+		else process.env.PI_SUBAGENT_PI_BIN = old.pi;
+		if (old.depth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
+		else process.env.PI_SUBAGENT_DEPTH = old.depth;
 	}
 });
 

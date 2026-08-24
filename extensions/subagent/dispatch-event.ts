@@ -62,6 +62,119 @@ export interface SubagentDispatchOptions {
 	onSettled: (run: SubagentRun) => void;
 }
 
+function invokeDispatchCallback(
+	options: SubagentDispatchOptions,
+	name: string,
+	callback: () => void,
+): void {
+	try {
+		callback();
+	} catch (error) {
+		try {
+			options.diagnostic(
+				`${name} callback failed: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		} catch {
+			// A diagnostic callback cannot make event dispatch unsafe.
+		}
+	}
+}
+
+/**
+ * Drain a bounded reload batch without losing a record when its consumer fails.
+ *
+ * A failed record moves to the queue tail so later records can continue. The
+ * caller should schedule another drain turn instead of draining synchronously.
+ */
+export const MAX_SUBAGENT_EVENT_DRAIN_RECORDS = 128;
+export const MAX_SUBAGENT_EVENT_QUEUE_RECORDS = 512;
+
+export interface SubagentEventQueueState {
+	overflowed: boolean;
+}
+
+const overflowedEventQueues = new WeakSet<object>();
+
+/**
+ * Enqueue one reload record without discarding lifecycle evidence.
+ *
+ * Overflow is terminal for the queue. The helper retains every queued record,
+ * rejects the new record, and calls `onOverflow` once. The caller must fence
+ * the runtime and report the terminal diagnostic instead of accepting events.
+ */
+export function enqueueSubagentEventQueue(
+	queue: Record<string, unknown>[],
+	record: Record<string, unknown>,
+	options: {
+		maxRecords?: number;
+		state?: SubagentEventQueueState;
+		diagnostic?: (message: string) => void;
+		onOverflow?: () => void;
+	} = {},
+): boolean {
+	const requested = options.maxRecords ?? MAX_SUBAGENT_EVENT_QUEUE_RECORDS;
+	const maxRecords = Number.isSafeInteger(requested)
+		? Math.max(1, Math.min(MAX_SUBAGENT_EVENT_QUEUE_RECORDS, requested))
+		: MAX_SUBAGENT_EVENT_QUEUE_RECORDS;
+	const state = options.state;
+	const overflowed = state?.overflowed || overflowedEventQueues.has(queue);
+	if (overflowed) {
+		if (state) state.overflowed = true;
+		return false;
+	}
+	if (queue.length >= maxRecords) {
+		if (state) state.overflowed = true;
+		overflowedEventQueues.add(queue);
+		const message =
+			`Subagent reload event queue reached ${maxRecords} records; overflow is terminal and queued lifecycle records were retained.`;
+		try {
+			options.diagnostic?.(message);
+		} catch {
+			// A diagnostic callback cannot change the terminal queue state.
+		}
+		try {
+			options.onOverflow?.();
+		} catch {
+			// The caller still receives the explicit false overflow result.
+		}
+		return false;
+	}
+	queue.push(record);
+	return true;
+}
+
+export function drainSubagentEventQueue(
+	queue: Record<string, unknown>[],
+	consumer: (record: Record<string, unknown>) => void,
+	options: { maxRecords?: number; diagnostic?: (message: string) => void } = {},
+): number {
+	const requested = options.maxRecords ?? MAX_SUBAGENT_EVENT_DRAIN_RECORDS;
+	const maxRecords = Number.isSafeInteger(requested)
+		? Math.max(1, Math.min(MAX_SUBAGENT_EVENT_DRAIN_RECORDS, requested))
+		: MAX_SUBAGENT_EVENT_DRAIN_RECORDS;
+	const batch = queue.splice(0, maxRecords);
+	let delivered = 0;
+	for (const record of batch) {
+		try {
+			consumer(record);
+			delivered++;
+		} catch (error) {
+			queue.push(record);
+			try {
+				options.diagnostic?.(
+					`Subagent event consumer failed; record retained for retry: ${error instanceof Error ? error.message : String(error)}`.slice(
+						0,
+						2_048,
+					),
+				);
+			} catch {
+				// A diagnostic callback cannot discard the retained record.
+			}
+		}
+	}
+	return delivered;
+}
+
 function cloneToolActivity(tool: ToolActivity): ToolActivity {
 	return { ...tool };
 }
@@ -154,12 +267,48 @@ function requireActiveRun(
 	return false;
 }
 
+/** Preserve abort evidence until native agent_settled consumes the fence. */
+export function requestSubagentAbort(
+	handle: SubagentDispatchHandle,
+	at: number,
+): boolean {
+	if (isLifecycleTerminal(handle) || handle.runState === "idle") return false;
+	const run = currentRun(handle);
+	if (!run || run.id <= handle.lastSettledRunId) return false;
+	handle.abortRequestedAt ??= at;
+	return true;
+}
+
 /** Dispatch one typed companion event into the production subagent state machine. */
 export function dispatchSubagentEvent(
 	handle: SubagentDispatchHandle,
 	record: Record<string, unknown>,
-	options: SubagentDispatchOptions,
+	rawOptions: SubagentDispatchOptions,
 ): boolean {
+	const options: SubagentDispatchOptions = {
+		...rawOptions,
+		diagnostic: (message) => {
+			try {
+				rawOptions.diagnostic(message);
+			} catch {
+				// Diagnostics must not break event dispatch.
+			}
+		},
+		update: (streaming) =>
+			invokeDispatchCallback(rawOptions, "update", () =>
+				rawOptions.update(streaming),
+			),
+		onAssistantFinalized: () =>
+			invokeDispatchCallback(
+				rawOptions,
+				"onAssistantFinalized",
+				rawOptions.onAssistantFinalized,
+			),
+		onSettled: (run) =>
+			invokeDispatchCallback(rawOptions, "onSettled", () =>
+				rawOptions.onSettled(run),
+			),
+	};
 	const at = options.now();
 	switch (record.type) {
 		case "agent_start": {

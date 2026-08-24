@@ -17,11 +17,35 @@ export interface TranscriptMessage {
 	timestamp?: number;
 }
 
+export interface TranscriptFileHandle {
+	read(
+		buffer: Buffer,
+		offset: number,
+		length: number,
+		position: number,
+	): Promise<{ bytesRead: number }>;
+	stat(): Promise<{ size: number }>;
+	close(): Promise<void>;
+}
+
+export interface TranscriptFileSystem {
+	open(path: string, flags: string): Promise<TranscriptFileHandle>;
+}
+
 export interface TranscriptOptions {
 	/** Zero-based index in the filtered transcript message sequence. */
 	messageOffset?: number;
 	/** Number of messages to return. The default is three and the maximum is twenty. */
 	numMessages?: number;
+	/** Total deadline for an inspector-facing transcript snapshot. */
+	timeoutMs?: number;
+	signal?: AbortSignal;
+	/** Optional dependency injection for deterministic bounded-read tests. */
+	io?: TranscriptFileSystem;
+	/** Maximum file snapshot size. Values above the safe default are capped. */
+	maxSnapshotBytes?: number;
+	/** Maximum one JSONL record size. Values above the safe default are capped. */
+	maxRecordBytes?: number;
 }
 
 export interface TranscriptResult {
@@ -34,14 +58,23 @@ const DEFAULT_MESSAGE_COUNT = 3;
 const MAX_MESSAGE_COUNT = 20;
 const MAX_MESSAGE_BYTES = 8 * 1024;
 const MAX_TOTAL_TEXT_BYTES = 32 * 1024;
-const MAX_RECORD_BYTES = 256 * 1024;
+/** Valid records can exceed the previous 256 KiB limit, but not this bound. */
+export const MAX_TRANSCRIPT_RECORD_BYTES = 2 * 1024 * 1024;
+/** A read snapshots at most this many bytes, even while the file grows. */
+export const MAX_TRANSCRIPT_SNAPSHOT_BYTES = 8 * 1024 * 1024;
+export const DEFAULT_TRANSCRIPT_TIMEOUT_MS = 5_000;
 const READ_CHUNK_BYTES = 64 * 1024;
 const STRING_SCAN_CHUNK_CHARS = 16 * 1024;
 const TRUNCATION_MARKER = "\n… [transcript text truncated] …\n";
 const ERROR_FALLBACK = "Assistant response failed";
+const CLEANUP_TIMEOUT_MS = 250;
 
 type TranscriptOptionsInput = TranscriptOptions | number | undefined;
 type SessionRecord = Record<string, unknown>;
+
+const defaultIo: TranscriptFileSystem = {
+	open: (path, flags) => fs.open(path, flags),
+};
 
 function isRecord(value: unknown): value is SessionRecord {
 	return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -65,6 +98,12 @@ function normalizeCount(value: unknown): number {
 	if (value === Number.POSITIVE_INFINITY) return MAX_MESSAGE_COUNT;
 	if (value === Number.NEGATIVE_INFINITY) return 0;
 	return Math.min(MAX_MESSAGE_COUNT, Math.max(0, Math.floor(value)));
+}
+
+function positiveLimit(value: number | undefined, fallback: number): number {
+	return typeof value === "number" && Number.isFinite(value) && value > 0
+		? Math.floor(value)
+		: fallback;
 }
 
 function normalizeOptions(
@@ -341,6 +380,7 @@ class TranscriptScanner {
 
 	constructor(
 		private readonly onLine: (line: string, onMalformed: () => void) => void,
+		private readonly maxRecordBytes: number,
 	) {}
 
 	push(decoded: string): void {
@@ -360,7 +400,7 @@ class TranscriptScanner {
 	finish(): TranscriptStatus {
 		const incomplete =
 			this.lineHasContent || this.lineParts.length > 0 || this.oversizedLine;
-		if (this.malformed) return "unreadable";
+		if (this.malformed || this.oversizedLine) return "unreadable";
 		return incomplete ? "incomplete" : "available";
 	}
 
@@ -369,7 +409,7 @@ class TranscriptScanner {
 		this.lineHasContent = true;
 		if (this.oversizedLine) return;
 		const bytes = Buffer.byteLength(segment, "utf8");
-		if (this.lineBytes + bytes > MAX_RECORD_BYTES) {
+		if (this.lineBytes + bytes > this.maxRecordBytes) {
 			this.oversizedLine = true;
 			this.lineParts = [];
 			this.lineBytes = 0;
@@ -392,6 +432,13 @@ class TranscriptScanner {
 	}
 }
 
+function recordLimit(options: TranscriptOptions): number {
+	return Math.min(
+		MAX_TRANSCRIPT_RECORD_BYTES,
+		positiveLimit(options.maxRecordBytes, MAX_TRANSCRIPT_RECORD_BYTES),
+	);
+}
+
 /**
  * Parse one LF-framed child session snapshot without accepting its final fragment.
  * The offset indexes only emitted user, assistant, and error messages.
@@ -403,8 +450,9 @@ export function parseTranscript(
 ): TranscriptResult {
 	const options = normalizeOptions(optionsOrOffset, numMessages);
 	const collector = createPageCollector(options);
-	const scanner = new TranscriptScanner((line, onMalformed) =>
-		projectLine(line, collector, onMalformed),
+	const scanner = new TranscriptScanner(
+		(line, onMalformed) => projectLine(line, collector, onMalformed),
+		recordLimit(typeof optionsOrOffset === "object" && optionsOrOffset ? optionsOrOffset : {}),
 	);
 	for (let offset = 0; offset < content.length; ) {
 		let end = Math.min(content.length, offset + STRING_SCAN_CHUNK_CHARS);
@@ -422,38 +470,130 @@ export function parseTranscript(
 	return resultFor(collector, scanner.finish());
 }
 
-/** Read and parse one child session snapshot with bounded chunk and record memory. */
+function timeoutError(description: string): Error {
+	const error = new Error(`${description} timed out.`);
+	error.name = "TimeoutError";
+	return error;
+}
+
+function abortError(reason: unknown): Error {
+	const error = reason instanceof Error ? reason : new Error(reason === undefined ? "The operation was aborted." : String(reason));
+	error.name = "AbortError";
+	return error;
+}
+
+function isAbortError(error: unknown): error is Error {
+	return error instanceof Error && error.name === "AbortError";
+}
+
+function bounded<T>(
+	operation: Promise<T> | (() => Promise<T>),
+	deadline: number,
+	signal: AbortSignal | undefined,
+	description: string,
+): Promise<T> {
+	return new Promise((resolve, reject) => {
+		let settled = false;
+		let timer: NodeJS.Timeout | undefined;
+		const cleanup = () => {
+			if (timer) clearTimeout(timer);
+			signal?.removeEventListener("abort", onAbort);
+		};
+		const finish = (callback: () => void) => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			callback();
+		};
+		const onAbort = () => finish(() => reject(abortError(signal?.reason)));
+		if (signal) {
+			if (signal.aborted) return onAbort();
+			signal.addEventListener("abort", onAbort, { once: true });
+		}
+		if (deadline <= Date.now()) return finish(() => reject(timeoutError(description)));
+		timer = setTimeout(
+			() => finish(() => reject(timeoutError(description))),
+			Math.max(1, Math.ceil(deadline - Date.now())),
+		);
+		timer.unref?.();
+		let promise: Promise<T>;
+		try {
+			promise = typeof operation === "function" ? operation() : operation;
+		} catch (error) {
+			return finish(() => reject(error instanceof Error ? error : new Error(String(error))));
+		}
+		void promise.then(
+			(value) => finish(() => resolve(value)),
+			(error) => finish(() => reject(error instanceof Error ? error : new Error(String(error)))),
+		);
+	});
+}
+
+function cleanupBounded(operation: () => Promise<void>): Promise<void> {
+	try {
+		return bounded(operation, Date.now() + CLEANUP_TIMEOUT_MS, undefined, "Transcript cleanup").catch(() => {});
+	} catch {
+		return Promise.resolve();
+	}
+}
+
+/** Read and parse one finite child session snapshot with bounded chunk and record memory. */
 export async function readTranscript(
 	sessionPath: string | undefined,
 	optionsOrOffset?: TranscriptOptionsInput,
 	numMessages?: number,
 ): Promise<TranscriptResult> {
-	const options = normalizeOptions(optionsOrOffset, numMessages);
+	const page = normalizeOptions(optionsOrOffset, numMessages);
 	if (typeof sessionPath !== "string" || sessionPath.length === 0)
-		return resultFor(createPageCollector(options), "missing");
-
-	let file: Awaited<ReturnType<typeof fs.open>> | undefined;
+		return resultFor(createPageCollector(page), "missing");
+	const readOptions =
+		typeof optionsOrOffset === "object" && optionsOrOffset
+			? optionsOrOffset
+			: {};
+	const maxSnapshotBytes = Math.min(
+		MAX_TRANSCRIPT_SNAPSHOT_BYTES,
+		positiveLimit(readOptions.maxSnapshotBytes, MAX_TRANSCRIPT_SNAPSHOT_BYTES),
+	);
+	const deadline = Date.now() + positiveLimit(readOptions.timeoutMs, DEFAULT_TRANSCRIPT_TIMEOUT_MS);
+	const io = readOptions.io || defaultIo;
+	let file: TranscriptFileHandle | undefined;
 	try {
-		file = await fs.open(sessionPath, "r");
-		const collector = createPageCollector(options);
-		const scanner = new TranscriptScanner((line, onMalformed) =>
-			projectLine(line, collector, onMalformed),
+		file = await bounded(() => io.open(sessionPath, "r"), deadline, readOptions.signal, "Transcript open");
+		const fileStat = await bounded(() => file!.stat(), deadline, readOptions.signal, "Transcript stat");
+		if (!Number.isSafeInteger(fileStat.size) || fileStat.size < 0)
+			return resultFor(createPageCollector(page), "unreadable");
+		if (fileStat.size > maxSnapshotBytes)
+			return resultFor(createPageCollector(page), "unreadable");
+		const collector = createPageCollector(page);
+		const scanner = new TranscriptScanner(
+			(line, onMalformed) => projectLine(line, collector, onMalformed),
+			recordLimit(readOptions),
 		);
 		const decoder = new StringDecoder("utf8");
-		const buffer = Buffer.allocUnsafe(READ_CHUNK_BYTES);
-		for (;;) {
-			const { bytesRead } = await file.read(buffer, 0, buffer.length, null);
-			if (bytesRead === 0) break;
-			scanner.push(decoder.write(buffer.subarray(0, bytesRead)));
+		const buffer = Buffer.allocUnsafe(Math.min(READ_CHUNK_BYTES, Math.max(1, fileStat.size)));
+		let position = 0;
+		while (position < fileStat.size) {
+			const length = Math.min(buffer.length, fileStat.size - position);
+			const result = await bounded(
+				() => file!.read(buffer, 0, length, position),
+				deadline,
+				readOptions.signal,
+				"Transcript read",
+			);
+			if (!Number.isSafeInteger(result.bytesRead) || result.bytesRead <= 0 || result.bytesRead > length)
+				return resultFor(collector, "unreadable");
+			position += result.bytesRead;
+			scanner.push(decoder.write(buffer.subarray(0, result.bytesRead)));
 		}
 		scanner.push(decoder.end());
 		return resultFor(collector, scanner.finish());
 	} catch (error) {
+		if (isAbortError(error)) throw error;
 		if ((error as NodeJS.ErrnoException).code === "ENOENT")
-			return resultFor(createPageCollector(options), "missing");
-		return resultFor(createPageCollector(options), "unreadable");
+			return resultFor(createPageCollector(page), "missing");
+		return resultFor(createPageCollector(page), "unreadable");
 	} finally {
-		await file?.close().catch(() => {});
+		if (file) await cleanupBounded(() => file!.close());
 	}
 }
 

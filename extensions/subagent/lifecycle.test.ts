@@ -101,9 +101,20 @@ test("failed and aborted outcomes classify the run without stopping process", ()
 	startRun(aborted, 1);
 	corroborateRun(aborted);
 	endRun(aborted, 2, false);
-	assert.equal(settleRunToIdle(aborted, 3, "aborted", "aborted"), "running");
+	assert.equal(settleRunToIdle(aborted, 3, "aborted", "aborted"), "done");
+	assert.equal(aborted.lifecycle, "idle");
 	assert.equal(aborted.runOutcome, "aborted");
 	assert.equal(aborted.processState, "alive");
+});
+
+test("a kill fence blocks a new run until resume revival clears it", () => {
+	const state = createLifecycleState();
+	requestKill(state, 1);
+	assert.equal(startRun(state, 2), undefined);
+	markStopped(state, 3);
+	assert.equal(startRun(state, 4), undefined);
+	reviveForResume(state);
+	assert.equal(startRun(state, 5)?.id, 1);
 });
 
 test("resume revival clears the kill fence and preserves monotonic cursors", () => {
