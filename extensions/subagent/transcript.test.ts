@@ -4,8 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+	MAX_TRANSCRIPT_RECORD_BYTES,
 	parseTranscript,
 	readTranscript,
+	type TranscriptFileHandle,
 	type TranscriptMessage,
 } from "./transcript.ts";
 
@@ -278,7 +280,10 @@ test("multibyte text uses hard UTF-8 budgets without splitting a surrogate pair"
 
 test("an oversized complete record stays bounded and does not change filtered offsets", async () => {
 	const fixture = await temporaryFile(
-		JSON.stringify({ type: "custom", payload: "x".repeat(300_000) }) +
+		JSON.stringify({
+			type: "custom",
+			payload: "x".repeat(MAX_TRANSCRIPT_RECORD_BYTES + 1_024),
+		}) +
 		"\n" +
 		line(message("user", "after oversized input")),
 	);
@@ -292,6 +297,18 @@ test("an oversized complete record stays bounded and does not change filtered of
 	} finally {
 		await removeTemporary(fixture.directory);
 	}
+});
+
+test("an oversized unterminated record is unreadable", () => {
+	const result = parseTranscript(
+		JSON.stringify({
+			type: "custom",
+			payload: "x".repeat(MAX_TRANSCRIPT_RECORD_BYTES + 1_024),
+		}),
+		{ numMessages: 3 },
+	);
+	assert.equal(result.status, "unreadable");
+	assert.deepEqual(result.messages, []);
 });
 
 test("numeric arguments and defaults normalize the pagination contract", () => {
@@ -323,6 +340,81 @@ test("the file reader parses one snapshot and does not expose a partial append",
 			line(message("user", "saved")) +
 			JSON.stringify(message("assistant", [{ type: "text", text: "partial" }])),
 		);
+	} finally {
+		await removeTemporary(fixture.directory);
+	}
+});
+
+test("valid records above the old 256 KiB limit remain readable", () => {
+	const result = parseTranscript(
+		line(message("assistant", [{ type: "text", text: "x".repeat(300_000) }])),
+		{ numMessages: 1 },
+	);
+	assert.equal(result.status, "available");
+	assert.equal(result.messages.length, 1);
+	assert.ok(result.messages[0]);
+	assert.match(result.messages[0].text, /transcript text truncated/);
+});
+
+test("transcript reads use the initial file size while the source grows", async () => {
+	const initial = Buffer.from(line(message("user", "initial")), "utf8");
+	const grown = Buffer.from(
+		`${initial.toString("utf8")}${line(message("user", "appended later"))}`,
+		"utf8",
+	);
+	let maximumReadEnd = 0;
+	let closeCount = 0;
+	const handle: TranscriptFileHandle = {
+		stat: async () => ({ size: initial.length }),
+		read: async (buffer, offset, length, position) => {
+			maximumReadEnd = Math.max(maximumReadEnd, position + length);
+			const chunk = grown.subarray(position, Math.min(position + length, initial.length));
+			chunk.copy(buffer, offset);
+			return { bytesRead: chunk.length };
+		},
+		close: async () => {
+			closeCount++;
+		},
+	};
+	const result = await readTranscript("growing.jsonl", {
+		numMessages: 20,
+		io: { open: async () => handle },
+	});
+	assert.equal(result.status, "available");
+	assert.deepEqual(result.messages.map(({ text }) => text), ["initial"]);
+	assert.ok(maximumReadEnd <= initial.length);
+	assert.equal(closeCount, 1);
+});
+
+test("stuck transcript reads return unreadable within the operation deadline", async () => {
+	const never = new Promise<never>(() => {});
+	let closeCount = 0;
+	const started = Date.now();
+	const result = await readTranscript("stuck.jsonl", {
+		timeoutMs: 25,
+		io: {
+			open: async () => ({
+				stat: async () => ({ size: 1 }),
+				read: async () => never,
+				close: async () => {
+					closeCount++;
+				},
+			}),
+		},
+	});
+	assert.equal(result.status, "unreadable");
+	assert.deepEqual(result.messages, []);
+	assert.ok(Date.now() - started < 500);
+	assert.equal(closeCount, 1);
+});
+
+test("a snapshot above the total byte bound is rejected", async () => {
+	const fixture = await temporaryFile(line(message("user", "bounded")));
+	try {
+		const result = await readTranscript(fixture.path, {
+			maxSnapshotBytes: 1,
+		});
+		assert.equal(result.status, "unreadable");
 	} finally {
 		await removeTemporary(fixture.directory);
 	}
