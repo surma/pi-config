@@ -215,6 +215,22 @@ test("RPC sends can be canceled through an optional AbortSignal", async () => {
 	fixture.rpc.forceClose({ code: null, signal: "SIGKILL" });
 });
 
+test("RPC sends preserve DOMException abort reasons without mutating them", async () => {
+	const fixture = transport();
+	const controller = new AbortController();
+	const reason = new DOMException("request canceled", "AbortError");
+	const request = fixture.rpc.send({ type: "cancelable" }, 200, controller.signal);
+	controller.abort(reason);
+	await assert.rejects(request, (error) => {
+		assert.equal((error as Error).name, "AbortError");
+		assert.equal((error as Error).message, reason.message);
+		assert.notEqual(error, reason);
+		return true;
+	});
+	assert.equal(reason.name, "AbortError");
+	fixture.rpc.forceClose({ code: null, signal: "SIGKILL" });
+});
+
 test("aborting a blocked write releases its pending request and queue slot", async () => {
 	const child = new BackpressuredProcess();
 	const rpc = new RpcChildTransport(child as unknown as ChildProcess, {

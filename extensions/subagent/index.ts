@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
-import { promises as fs } from "node:fs";
+import { accessSync, constants, promises as fs } from "node:fs";
 import { spawn, type ChildProcess } from "node:child_process";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
@@ -167,6 +167,7 @@ interface RuntimeChild {
 	forced?: boolean;
 	drainTimer?: NodeJS.Timeout;
 	drainBlocked?: boolean;
+	overflowed?: boolean;
 }
 
 interface PendingPersistence {
@@ -182,12 +183,13 @@ type PersistedRegistryEntry = RegistryEntry & {
 };
 
 function abortError(reason?: unknown): Error {
-	const error =
+	const error = new Error(
 		reason instanceof Error
-			? reason
-			: new Error(
-					reason === undefined ? "The operation was aborted." : String(reason),
-			);
+			? reason.message
+			: reason === undefined
+				? "The operation was aborted."
+				: String(reason),
+	);
 	error.name = "AbortError";
 	return error;
 }
@@ -388,11 +390,24 @@ function copyMessage(message: Record<string, unknown>): Record<string, unknown> 
 	};
 }
 
+function executableOnPath(name: string): string | undefined {
+	for (const directory of (process.env.PATH || "").split(delimiter)) {
+		const candidate = join(directory || ".", name);
+		try {
+			accessSync(candidate, constants.X_OK);
+			return candidate;
+		} catch {
+			// Keep searching PATH.
+		}
+	}
+	return undefined;
+}
+
 export function getPiInvocation(args: string[]): string[] {
 	const offlineArgs = ["--offline", "--approve", ...args];
 	if (process.env.PI_SUBAGENT_PI_BIN)
 		return [process.env.PI_SUBAGENT_PI_BIN, ...offlineArgs];
-	const devx = process.env.PI_SUBAGENT_DEVX_BIN;
+	const devx = process.env.PI_SUBAGENT_DEVX_BIN || executableOnPath("devx");
 	if (devx) return [devx, "pi", ...offlineArgs];
 	const script = process.argv[1];
 	if (
@@ -482,16 +497,31 @@ function removeRuntime(runtime: RuntimeChild, clearQueue = true): void {
 	if (runtimeChildren.get(runtime.id) === runtime) runtimeChildren.delete(runtime.id);
 }
 
+function isDiscardableReloadRecord(record: RpcRecord): boolean {
+	return record.type === "message_update" || record.type === "tool_execution_update";
+}
+
 function queueRuntimeRecord(runtime: RuntimeChild, record: RpcRecord): void {
+	if (runtime.overflowed && isDiscardableReloadRecord(record)) return;
 	if (runtime.queuedRecords.length >= MAX_RELOAD_QUEUE_RECORDS) {
-		runtime.queuedRecords.shift();
-		if (!runtime.drainBlocked) {
+		if (!runtime.overflowed) {
+			runtime.overflowed = true;
 			runtime.drainBlocked = true;
 			addRuntimeDiagnostic(
 				runtime,
 				`Reload event queue reached ${MAX_RELOAD_QUEUE_RECORDS} records. Older records were discarded.`,
 			);
+			const retained = runtime.queuedRecords.filter(
+				(record) => !isDiscardableReloadRecord(record),
+			);
+			runtime.queuedRecords.splice(
+				0,
+				runtime.queuedRecords.length,
+				...retained,
+			);
 		}
+		if (isDiscardableReloadRecord(record)) return;
+		if (runtime.queuedRecords.length >= MAX_RELOAD_QUEUE_RECORDS) return;
 	}
 	runtime.queuedRecords.push(record);
 }
@@ -500,10 +530,31 @@ function attachRuntime(
 	runtime: RuntimeChild,
 	consumer: (record: RpcRecord) => void,
 	closeConsumer: (close: RpcProcessClose) => void,
+	onCloseError?: (close: RpcProcessClose) => void,
 ): void {
 	runtime.consumer = consumer;
 	runtime.closeConsumer = closeConsumer;
 	runtime.drainBlocked = false;
+	const deliverClose = () => {
+		const close = runtime.closed;
+		if (!close || runtime.closeConsumer !== closeConsumer) return;
+		try {
+			closeConsumer(close);
+		} catch (error) {
+			addRuntimeDiagnostic(
+				runtime,
+				`RPC close handling failed: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			try {
+				onCloseError?.(close);
+			} catch (fallbackError) {
+				addRuntimeDiagnostic(
+					runtime,
+					`RPC close fallback failed: ${fallbackError instanceof Error ? fallbackError.message : String(fallbackError)}`,
+				);
+			}
+		}
+	};
 	const drain = () => {
 		runtime.drainTimer = undefined;
 		if (runtime.consumer !== consumer) return;
@@ -528,14 +579,15 @@ function attachRuntime(
 			runtime.drainTimer.unref?.();
 			return;
 		}
-		if (runtime.closed && runtime.closeConsumer === closeConsumer)
-			closeConsumer(runtime.closed);
+		runtime.overflowed = false;
+		deliverClose();
 	};
 	if (runtime.queuedRecords.length > 0) {
 		runtime.drainTimer = setTimeout(drain, 0);
 		runtime.drainTimer.unref?.();
-	} else if (runtime.closed) {
-		closeConsumer(runtime.closed);
+	} else {
+		runtime.overflowed = false;
+		deliverClose();
 	}
 }
 
@@ -975,6 +1027,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		error: handle.error || handle.finalError,
 		killRequestedAt: handle.killRequestedAt,
 		stderrTail: tail(handle.stderr),
+		osCloseObserved: handle.osCloseObserved,
+		forced: handle.forced,
 		diagnostics: handle.diagnostics.length ? [...handle.diagnostics] : undefined,
 		outputPath: handle.outputPath,
 		outputStatus: handle.outputStatus,
@@ -1423,8 +1477,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			transcriptStatus: "missing",
 			outputWriteChain: Promise.resolve(),
 			stderr: typeof entry.stderrTail === "string" ? tail(entry.stderrTail) || "" : "",
-			osCloseObserved: undefined,
-			forced: undefined,
+			osCloseObserved: entry.osCloseObserved,
+			forced: entry.forced,
 			error: entry.error,
 			finalError:
 				entry.error && (stopped || runOutcome === "failed")
@@ -1619,6 +1673,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		attachRuntime(
 			runtime,
 			(record) => handleRpcRecord(handle, runtime, record),
+			(close) => handleProcessClose(handle, close, runtime),
 			(close) => handleProcessClose(handle, close, runtime),
 		);
 	}
@@ -2462,23 +2517,30 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	}
 
 	function refreshUi() {
-		activeInspector?.refresh();
-		const ctx = latestCtx;
-		if (ctx?.mode !== "tui") return;
-		const running = sorted().filter(active);
-		if (!widgetVisible || !running.length) {
-			ctx.ui.setWidget("subagent", undefined);
-			return;
+		try {
+			activeInspector?.refresh();
+			const ctx = latestCtx;
+			if (ctx?.mode !== "tui") return;
+			const running = sorted().filter(active);
+			if (!widgetVisible || !running.length) {
+				ctx.ui.setWidget("subagent", undefined);
+				return;
+			}
+			ctx.ui.setWidget(
+				"subagent",
+				running
+					.slice(0, 12)
+					.map(
+						(handle) =>
+							`${handle.processState === "alive" ? "●" : "○"} ${handle.id.slice(0, 8)}${handle.name ? ` ${handle.name}` : ""} · ${handle.processState}/${handle.runState} · ${lifecycleActivity(handle, handle)}`,
+					),
+			);
+		} catch (error) {
+			const message =
+				error instanceof Error ? error.message : String(error);
+			for (const handle of handles.values())
+				addDiagnostic(handle, `Subagent UI refresh failed: ${message}`);
 		}
-		ctx.ui.setWidget(
-			"subagent",
-			running
-				.slice(0, 12)
-				.map(
-					(handle) =>
-						`${handle.processState === "alive" ? "●" : "○"} ${handle.id.slice(0, 8)}${handle.name ? ` ${handle.name}` : ""} · ${handle.processState}/${handle.runState} · ${lifecycleActivity(handle, handle)}`,
-				),
-		);
 	}
 
 	function stopTimers() {

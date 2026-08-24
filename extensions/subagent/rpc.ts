@@ -106,9 +106,13 @@ function remainingUntil(deadline: number): number {
 }
 
 function abortError(reason: unknown): Error {
-	const error = reason instanceof Error
-		? reason
-		: new Error(reason === undefined ? "The operation was aborted." : String(reason));
+	const error = new Error(
+		reason instanceof Error
+			? reason.message
+			: reason === undefined
+				? "The operation was aborted."
+				: String(reason),
+	);
 	error.name = "AbortError";
 	return error;
 }
