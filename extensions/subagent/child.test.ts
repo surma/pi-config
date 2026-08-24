@@ -138,6 +138,80 @@ test("child lease checks do not overlap and stale generations cannot fence a hea
 	monitor.stop();
 });
 
+test("lease expiry is compared with the time after the read completes", async () => {
+	let currentTime = 0;
+	let terminations = 0;
+	const monitor = createChildLeaseMonitor({
+		leasePath: "/tmp/lease.json",
+		identity,
+		intervalMs: 60_000,
+		now: () => currentTime,
+		readLease: async () => {
+			currentTime = 101;
+			return record(100);
+		},
+		terminate: () => terminations++,
+	});
+	monitor.start();
+	await monitor.checkNow();
+	assert.equal(terminations, 1);
+	monitor.stop();
+});
+
+test("stopping a child lease check during a read does not self-terminate", async () => {
+	let releaseRead!: () => void;
+	let readStarted!: () => void;
+	const started = new Promise<void>((resolve) => {
+		readStarted = resolve;
+	});
+	const read = new Promise<unknown>((resolve) => {
+		releaseRead = () => resolve(record(Date.now() + 60_000));
+	});
+	let terminations = 0;
+	const monitor = createChildLeaseMonitor({
+		leasePath: "/tmp/lease.json",
+		identity,
+		intervalMs: 60_000,
+		operationTimeoutMs: 10,
+		readLease: async () => {
+			readStarted();
+			return read;
+		},
+		terminate: () => terminations++,
+	});
+	monitor.start();
+	await started;
+	monitor.stop();
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.equal(terminations, 0);
+	releaseRead();
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.equal(terminations, 0);
+});
+
+test("aborted child health checks preserve cancellation", async () => {
+	const controller = new AbortController();
+	controller.abort();
+	await assert.rejects(
+		verifyChildExtensionHealth("/tmp/missing-child-health", controller.signal),
+		(error: unknown) => error instanceof Error && error.name === "AbortError",
+	);
+	await assert.rejects(
+		waitForChildExtensionHealth("/tmp/missing-child-health", {
+			timeoutMs: 10_000,
+			signal: controller.signal,
+		}),
+		(error: unknown) => error instanceof Error && error.name === "AbortError",
+	);
+	await assert.rejects(
+		writeChildExtensionHealthSignal(
+			join(tmpdir(), "pi-aborted-child-health", "marker"),
+			controller.signal,
+		),
+		(error: unknown) => error instanceof Error && error.name === "AbortError",
+	);
+});
+
 test("temporary lease read errors retry before self-termination", async () => {
 	let releaseFirst!: () => void;
 	let firstStarted!: () => void;

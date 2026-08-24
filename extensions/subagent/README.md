@@ -46,11 +46,17 @@ The marker does not use child stdout. It therefore cannot corrupt the RPC JSONL 
 
 The parent must verify the exact marker after RPC process startup and before it sends the first prompt. A missing, malformed, oversized, or unreadable marker means that startup failed.
 
+The child bounds marker file operations and cancels them during session shutdown. The parent must preserve the same startup deadline when it waits for health.
+
 A successful `get_state` response does not prove that `child.ts` loaded. The parent must check both health and RPC readiness.
 
 ## Ownership and leases
 
-The extension stores controller state below the configured Pi agent directory:
+The process-local controller owns live child transports and runtime state.
+
+A persisted parent session is optional. It adds a registry and lease for durable status and resume, but it does not gate ephemeral child launch.
+
+When durable ownership exists, the extension stores its state below the configured Pi agent directory:
 
 ```text
 <sessions>/subagents/controllers/<owner-key>/
@@ -58,23 +64,21 @@ The extension stores controller state below the configured Pi agent directory:
   registry.json
 ```
 
-The parent session file and session ID define the durable owner. A process-wide controller ID identifies the live controller. A renewable lease grants mutation authority.
-
 A child ID identifies one logical child. A random incarnation identifies one child process instance.
 
-A controller loads only registry entries for its exact owner. A controller without a persisted parent session file and session ID cannot create a lease or launch a child.
+A durable controller loads only registry entries for its exact owner. An ephemeral controller keeps live ownership in memory and does not promise recovery after process loss.
 
-The lease expires after 30 seconds. Another controller can reclaim it after a five-second stale grace period. Renewal requires the exact owner and controller record.
+A durable lease expires after 30 seconds. Another controller can reclaim it after a five-second stale grace period. Renewal requires the exact owner and controller record.
 
-The same controller ID survives a Pi reload. A process-wide runtime map preserves live RPC transports while the replacement extension reloads its registry.
+The same controller ID survives a Pi reload. A process-wide runtime map preserves live RPC transports and memory ownership while the replacement extension reloads.
 
-A fresh process cannot adopt an unavailable child. Reconciliation marks an unavailable alive entry as stopped.
+A fresh process cannot adopt an unavailable child. Reconciliation marks an unavailable durable entry as stopped.
 
 Each child checks its lease with serialized checks. A check reads at most 4 KiB. A stale check result cannot fence a newer monitor generation.
 
 A successfully read invalid, expired, missing, or replaced record makes the child self-fence. Temporary read errors receive three consecutive retries before the child self-fences.
 
-The parent also terminates local children after it loses lease authority.
+When durable ownership exists, the parent also terminates local children after lease loss.
 
 ## Storage and durable state
 
@@ -173,6 +177,8 @@ The inspector reads at most the most recent 512 KiB of transcript data. It keeps
 
 The inspector reads at most the first 64 KiB of the captured effective prompt. It reports prompt truncation instead of reading the complete file before display bounds apply.
 
+Each inspector file operation has a deadline and an AbortSignal. Selection changes and inspector disposal cancel stale reads. A stalled read cannot block the next selected child indefinitely.
+
 The inspector sanitizes all untrusted text before terminal rendering. These bounds do not weaken terminal sanitization.
 
 The reader preserves a requested offset when the current page has no messages. A later append can then make that offset visible.
@@ -215,6 +221,8 @@ The custom message details include the direct owner session file, owner session 
 
 The parent queues each wake before optional registry persistence or caller output work. Shutdown, lease loss, and explicit child termination suppress unsent wakes.
 
+Reload queues accept at most 512 records. Overflow retains the queued records, rejects later records, and emits one terminal diagnostic. The parent must fence that runtime instead of silently dropping lifecycle events.
+
 The queue sends records separately. It does not promise durability, recovery after process loss, or notification for process stalls or close events.
 
 ## Tools
@@ -252,7 +260,7 @@ The new process starts its run counter from the durable logical cursor. A resume
 
 The previous incarnation cannot mutate the resumed handle. The new process receives a new transport and process ID.
 
-The owner lease must remain available before resume starts.
+A durable resume requires the owner lease. An ephemeral controller can resume only while its process-local ownership remains active.
 
 ## Verification
 

@@ -109,10 +109,91 @@ const MAX_TRANSCRIPT_LINES = 400;
 const MAX_TRANSCRIPT_CHARS = 256 * 1024;
 const MAX_TRANSCRIPT_READ_BYTES = 512 * 1024;
 const MAX_PROMPT_READ_BYTES = 64 * 1024;
+const DEFAULT_FILE_OPERATION_TIMEOUT_MS = 5_000;
+
+export interface SubagentInspectorOptions {
+	fileOperationTimeoutMs?: number;
+}
 
 interface BoundedTextRead {
 	text: string;
 	truncated: boolean;
+}
+
+function abortError(): Error {
+	const error = new Error("The inspector file operation was aborted.");
+	error.name = "AbortError";
+	return error;
+}
+
+function timeoutError(label: string): Error {
+	const error = new Error(`Timed out during inspector file ${label}.`);
+	error.name = "TimeoutError";
+	return error;
+}
+
+function positiveTimeout(value: number | undefined): number {
+	return Number.isFinite(value) && value !== undefined
+		? Math.max(1, Math.floor(value))
+		: DEFAULT_FILE_OPERATION_TIMEOUT_MS;
+}
+
+/** Race one file operation against cancellation and a deadline. */
+function boundedFileOperation<T>(
+	operation: () => PromiseLike<T>,
+	signal: AbortSignal | undefined,
+	timeoutMs: number,
+	label: string,
+	onLateResolve?: (value: T) => void,
+): Promise<T> {
+	return new Promise<T>((resolve, reject) => {
+		let settled = false;
+		let timer: NodeJS.Timeout | undefined;
+		const cleanup = () => {
+			if (timer) clearTimeout(timer);
+			signal?.removeEventListener("abort", onAbort);
+		};
+		const finish = (callback: () => void) => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			callback();
+		};
+		const onAbort = () => finish(() => reject(abortError()));
+		if (signal?.aborted) {
+			onAbort();
+			return;
+		}
+		signal?.addEventListener("abort", onAbort, { once: true });
+		timer = setTimeout(
+			() => finish(() => reject(timeoutError(label))),
+			positiveTimeout(timeoutMs),
+		);
+		timer.unref?.();
+		let pending: PromiseLike<T>;
+		try {
+			pending = operation();
+		} catch (error) {
+			finish(() => reject(error));
+			return;
+		}
+		void Promise.resolve(pending).then(
+			(value) => {
+				if (settled) {
+					try {
+						onLateResolve?.(value);
+					} catch {
+						// A late cleanup callback cannot escape the inspector.
+					}
+					return;
+				}
+				finish(() => resolve(value));
+			},
+			(error) => {
+				if (!settled) finish(() => reject(error));
+			},
+		);
+	});
 }
 
 /** Read only a bounded prefix or tail of a file before parsing its contents. */
@@ -121,11 +202,32 @@ async function readBoundedText(
 	path: string,
 	maxBytes: number,
 	fromEnd = false,
+	signal?: AbortSignal,
+	timeoutMs = DEFAULT_FILE_OPERATION_TIMEOUT_MS,
 ): Promise<BoundedTextRead> {
 	let file: Awaited<ReturnType<typeof fs.open>> | undefined;
+	const closeLateFile = (lateFile: Awaited<ReturnType<typeof fs.open>>) => {
+		void boundedFileOperation(
+			() => lateFile.close(),
+			undefined,
+			timeoutMs,
+			"close",
+		).catch(() => {});
+	};
 	try {
-		file = await files.open(path, "r");
-		const stat = await file.stat();
+		file = await boundedFileOperation(
+			() => files.open(path, "r"),
+			signal,
+			timeoutMs,
+			"open",
+			closeLateFile,
+		);
+		const stat = await boundedFileOperation(
+			() => file!.stat(),
+			signal,
+			timeoutMs,
+			"stat",
+		);
 		const size = Number(stat.size);
 		if (!Number.isSafeInteger(size) || size < 0)
 			throw new Error("File size is invalid.");
@@ -135,11 +237,17 @@ async function readBoundedText(
 		const buffer = Buffer.allocUnsafe(capacity);
 		let bytesRead = 0;
 		while (bytesRead < capacity) {
-			const result = await file.read(
-				buffer,
-				bytesRead,
-				capacity - bytesRead,
-				start + bytesRead,
+			const result = await boundedFileOperation(
+				() =>
+					file!.read(
+						buffer,
+						bytesRead,
+						capacity - bytesRead,
+						start + bytesRead,
+					),
+				signal,
+				timeoutMs,
+				"read",
 			);
 			if (result.bytesRead <= 0) break;
 			bytesRead += result.bytesRead;
@@ -151,7 +259,15 @@ async function readBoundedText(
 			truncated,
 		};
 	} finally {
-		await file?.close().catch(() => {});
+		if (file) {
+			const closeSignal = signal?.aborted ? undefined : signal;
+			await boundedFileOperation(
+				() => file!.close(),
+				closeSignal,
+				timeoutMs,
+				"close",
+			).catch(() => {});
+		}
 	}
 }
 
@@ -338,6 +454,8 @@ export class SubagentInspector implements Focusable {
 	private transcriptReadPending = false;
 	private transcriptDelay?: NodeJS.Timeout;
 	private readonly transcriptLastReadAt = new Map<string, number>();
+	private readonly readControllers = new Set<AbortController>();
+	private readonly fileOperationTimeoutMs: number;
 	private followingLive = true;
 
 	constructor(
@@ -346,7 +464,9 @@ export class SubagentInspector implements Focusable {
 		private readonly keybindings: KeybindingsManager,
 		private readonly callbacks: SubagentInspectorCallbacks,
 		private readonly files: InspectorFiles = fs,
+		options: SubagentInspectorOptions = {},
 	) {
+		this.fileOperationTimeoutMs = positiveTimeout(options.fileOperationTimeoutMs);
 		this.reconcileRefreshTimer();
 	}
 
@@ -354,6 +474,7 @@ export class SubagentInspector implements Focusable {
 		if (this.disposed) return;
 		this.disposed = true;
 		this.requestGeneration += 1;
+		this.abortReads();
 		if (this.refreshTimer) clearInterval(this.refreshTimer);
 		this.refreshTimer = undefined;
 		if (this.transcriptDelay) clearTimeout(this.transcriptDelay);
@@ -367,8 +488,13 @@ export class SubagentInspector implements Focusable {
 			this.keybindings.matches(data, "tui.select.cancel") ||
 			data === "q"
 		) {
-			if (this.view === "list") this.callbacks.onClose();
-			else this.showList();
+			if (this.view === "list") {
+				try {
+					this.callbacks.onClose();
+				} catch (error) {
+					this.reportRefreshError(error);
+				}
+			} else this.showList();
 			return;
 		}
 
@@ -523,9 +649,13 @@ export class SubagentInspector implements Focusable {
 
 	refresh(): void {
 		if (this.disposed) return;
-		this.ensureSelection();
-		this.reconcileRefreshTimer();
-		this.requestRender();
+		try {
+			this.ensureSelection();
+			this.reconcileRefreshTimer();
+			this.requestRender();
+		} catch (error) {
+			this.reportRefreshError(error);
+		}
 	}
 
 	private contentLines(width: number): string[] {
@@ -917,18 +1047,43 @@ export class SubagentInspector implements Focusable {
 
 	private invalidateReads(): void {
 		this.requestGeneration += 1;
+		this.abortReads();
 		this.promptContent = undefined;
 		this.transcriptContent = undefined;
 		this.transcriptReadPending = false;
 	}
 
+	private beginRead(): AbortController {
+		const controller = new AbortController();
+		this.readControllers.add(controller);
+		return controller;
+	}
+
+	private finishRead(controller: AbortController): void {
+		this.readControllers.delete(controller);
+	}
+
+	private abortReads(): void {
+		for (const controller of this.readControllers) controller.abort();
+		this.readControllers.clear();
+	}
+
+	private reportRefreshError(error: unknown): void {
+		const message = error instanceof Error ? error.message : String(error);
+		this.flash = `Inspector refresh failed: ${message.slice(0, 512)}`;
+	}
+
 	private async loadPrompt(path: string, generation: number): Promise<void> {
-		let content: string[];
+		const controller = this.beginRead();
+		let content: string[] | undefined;
 		try {
 			const snapshot = await readBoundedText(
 				this.files,
 				path,
 				MAX_PROMPT_READ_BYTES,
+				false,
+				controller.signal,
+				this.fileOperationTimeoutMs,
 			);
 			content = snapshot.text.split("\n");
 			if (snapshot.truncated)
@@ -939,122 +1094,174 @@ export class SubagentInspector implements Focusable {
 			content = [
 				`No captured Pi effective system prompt yet (${error instanceof Error ? error.message : String(error)}).`,
 			];
+		} finally {
+			this.finishRead(controller);
 		}
-		if (
-			this.disposed ||
-			generation !== this.requestGeneration ||
-			this.view !== "task" ||
-			this.selected()?.promptPath !== path
-		)
-			return;
-		this.promptContent = content;
-		this.requestRender();
+		try {
+			if (
+				!content ||
+				this.disposed ||
+				generation !== this.requestGeneration ||
+				this.view !== "task" ||
+				this.selected()?.promptPath !== path
+			)
+				return;
+			this.promptContent = content;
+			this.requestRender();
+		} catch (error) {
+			this.reportRefreshError(error);
+		}
 	}
 
 	private async refreshTranscript(
 		handle: InspectorHandle,
 		generation: number,
 	): Promise<void> {
-		if (this.disposed || generation !== this.requestGeneration || this.view !== "live")
-			return;
-		const path = handle.sessionPath;
-		const sinceLastRead =
-			Date.now() - (this.transcriptLastReadAt.get(path) ?? 0);
-		if (sinceLastRead < 1_000) {
-			if (!this.transcriptDelay) {
-				this.transcriptDelay = setTimeout(() => {
-					this.transcriptDelay = undefined;
-					const selected = this.view === "live" ? this.selected() : undefined;
-					if (selected)
-						void this.refreshTranscript(selected, this.requestGeneration);
-				}, 1_000 - sinceLastRead);
-			}
-			return;
-		}
-		if (this.transcriptReadActive) {
-			this.transcriptReadPending = true;
-			return;
-		}
-		this.transcriptReadActive = true;
-		this.transcriptLastReadAt.set(path, Date.now());
-		let content: string[];
+		let controller: AbortController | undefined;
+		let started = false;
+		let path: string | undefined;
+		let content: string[] | undefined;
 		try {
-			const stat = await this.files.stat(path);
 			if (
-				this.transcriptCache?.path === path &&
-				this.transcriptCache.size === stat.size &&
-				this.transcriptCache.mtimeMs === stat.mtimeMs
-			) {
-				content = this.transcriptCache.lines;
-			} else {
-				const snapshot = await readBoundedText(
-					this.files,
-					path,
-					MAX_TRANSCRIPT_READ_BYTES,
-					true,
+				this.disposed ||
+				generation !== this.requestGeneration ||
+				this.view !== "live"
+			)
+				return;
+			path = handle.sessionPath;
+			const sinceLastRead =
+				Date.now() - (this.transcriptLastReadAt.get(path) ?? 0);
+			if (sinceLastRead < 1_000) {
+				if (!this.transcriptDelay) {
+					this.transcriptDelay = setTimeout(() => {
+						this.transcriptDelay = undefined;
+						try {
+							const selected =
+								this.view === "live" ? this.selected() : undefined;
+							if (selected)
+								void this.refreshTranscript(
+									selected,
+									this.requestGeneration,
+								);
+						} catch (error) {
+							this.reportRefreshError(error);
+						}
+					}, 1_000 - sinceLastRead);
+				}
+				return;
+			}
+			if (this.transcriptReadActive) {
+				this.transcriptReadPending = true;
+				return;
+			}
+			this.transcriptReadActive = true;
+			started = true;
+			this.transcriptLastReadAt.set(path, Date.now());
+			controller = this.beginRead();
+			try {
+				const stat = await boundedFileOperation(
+					() => this.files.stat(path!),
+					controller.signal,
+					this.fileOperationTimeoutMs,
+					"stat",
 				);
-				let raw = snapshot.text;
-				const lines: string[] = [];
-				if (snapshot.truncated) {
-					const boundary = raw.indexOf("\n");
-					if (boundary < 0) {
-						lines.push(
-							"[bounded transcript tail contains no complete JSONL record]",
-						);
-						raw = "";
-					} else {
-						// The first tail fragment can start inside an older JSONL record.
-						raw = raw.slice(boundary + 1);
-					}
-				}
-				const records = raw.split("\n");
-				const partial = records.pop();
-				for (const record of records) {
-					if (!record) continue;
-					try {
-						lines.push(transcriptLine(JSON.parse(record)));
-					} catch (error) {
-						lines.push(
-							`[malformed JSONL record] ${error instanceof Error ? error.message : String(error)}: ${record}`,
-						);
-					}
-				}
-				if (partial)
-					lines.push(`[partial JSONL record while Pi writes] ${partial}`);
-				const bounded = boundTranscript(lines);
-				if (snapshot.truncated)
-					bounded.unshift(
-						`… earlier transcript records omitted (inspector read the last ${MAX_TRANSCRIPT_READ_BYTES} bytes) …`,
+				if (
+					this.transcriptCache?.path === path &&
+					this.transcriptCache.size === stat.size &&
+					this.transcriptCache.mtimeMs === stat.mtimeMs
+				) {
+					content = this.transcriptCache.lines;
+				} else {
+					const snapshot = await readBoundedText(
+						this.files,
+						path,
+						MAX_TRANSCRIPT_READ_BYTES,
+						true,
+						controller.signal,
+						this.fileOperationTimeoutMs,
 					);
-				content =
-					bounded.length > 0 ? bounded : ["No persisted transcript yet."];
-				this.transcriptCache = {
-					path,
-					size: stat.size,
-					mtimeMs: stat.mtimeMs,
-					lines: content,
-				};
+					let raw = snapshot.text;
+					const lines: string[] = [];
+					if (snapshot.truncated) {
+						const boundary = raw.indexOf("\n");
+						if (boundary < 0) {
+							lines.push(
+								"[bounded transcript tail contains no complete JSONL record]",
+							);
+							raw = "";
+						} else {
+							// The first tail fragment can start inside an older JSONL record.
+							raw = raw.slice(boundary + 1);
+						}
+					}
+					const records = raw.split("\n");
+					const partial = records.pop();
+					for (const record of records) {
+						if (!record) continue;
+						try {
+							lines.push(transcriptLine(JSON.parse(record)));
+						} catch (error) {
+							lines.push(
+								`[malformed JSONL record] ${error instanceof Error ? error.message : String(error)}: ${record}`,
+							);
+						}
+					}
+					if (partial)
+						lines.push(`[partial JSONL record while Pi writes] ${partial}`);
+					const bounded = boundTranscript(lines);
+					if (snapshot.truncated)
+						bounded.unshift(
+							`… earlier transcript records omitted (inspector read the last ${MAX_TRANSCRIPT_READ_BYTES} bytes) …`,
+						);
+					content =
+						bounded.length > 0 ? bounded : ["No persisted transcript yet."];
+					this.transcriptCache = {
+						path,
+						size: stat.size,
+						mtimeMs: stat.mtimeMs,
+						lines: content,
+					};
+				}
+			} catch (error) {
+				content = [
+					`No persisted transcript yet (${error instanceof Error ? error.message : String(error)}).`,
+				];
 			}
 		} catch (error) {
-			content = [
-				`No persisted transcript yet (${error instanceof Error ? error.message : String(error)}).`,
-			];
-		}
-		this.transcriptReadActive = false;
-		if (
-			!this.disposed &&
-			generation === this.requestGeneration &&
-			this.view === "live" &&
-			this.selected()?.sessionPath === path
-		) {
-			this.transcriptContent = content;
-			this.requestRender();
-		}
-		if (this.transcriptReadPending && !this.disposed) {
-			this.transcriptReadPending = false;
-			const selected = this.view === "live" ? this.selected() : undefined;
-			if (selected)
-				void this.refreshTranscript(selected, this.requestGeneration);
+			this.reportRefreshError(error);
+			if (started && path && !content)
+				content = [
+					`No persisted transcript yet (${error instanceof Error ? error.message : String(error)}).`,
+				];
+		} finally {
+			if (!started) return;
+			if (controller) this.finishRead(controller);
+			this.transcriptReadActive = false;
+			try {
+				if (
+					content &&
+					path &&
+					!this.disposed &&
+					generation === this.requestGeneration &&
+					this.view === "live" &&
+					this.selected()?.sessionPath === path
+				) {
+					this.transcriptContent = content;
+					this.requestRender();
+				}
+				if (this.transcriptReadPending && !this.disposed) {
+					this.transcriptReadPending = false;
+					const selected =
+						this.view === "live" ? this.selected() : undefined;
+					if (selected)
+						void this.refreshTranscript(
+							selected,
+							this.requestGeneration,
+						);
+				}
+			} catch (error) {
+				this.reportRefreshError(error);
+			}
 		}
 	}
 
@@ -1067,11 +1274,19 @@ export class SubagentInspector implements Focusable {
 		);
 		if (active && !this.refreshTimer) {
 			this.refreshTimer = setInterval(() => {
-				if (this.disposed) return;
-				const selected = this.view === "live" ? this.selected() : undefined;
-				if (selected)
-					void this.refreshTranscript(selected, this.requestGeneration);
-				this.requestRender();
+				try {
+					if (this.disposed) return;
+					const selected =
+						this.view === "live" ? this.selected() : undefined;
+					if (selected)
+						void this.refreshTranscript(
+							selected,
+							this.requestGeneration,
+						);
+					this.requestRender();
+				} catch (error) {
+					this.reportRefreshError(error);
+				}
 			}, 1000);
 		} else if (!active && this.refreshTimer) {
 			clearInterval(this.refreshTimer);
@@ -1131,7 +1346,12 @@ export class SubagentInspector implements Focusable {
 	}
 
 	private requestRender(): void {
-		if (!this.disposed) this.tui.requestRender();
+		if (this.disposed) return;
+		try {
+			this.tui.requestRender();
+		} catch (error) {
+			this.reportRefreshError(error);
+		}
 	}
 
 	private parseMouseScrollDelta(data: string): number {

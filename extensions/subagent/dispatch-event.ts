@@ -87,6 +87,62 @@ function invokeDispatchCallback(
  * caller should schedule another drain turn instead of draining synchronously.
  */
 export const MAX_SUBAGENT_EVENT_DRAIN_RECORDS = 128;
+export const MAX_SUBAGENT_EVENT_QUEUE_RECORDS = 512;
+
+export interface SubagentEventQueueState {
+	overflowed: boolean;
+}
+
+const overflowedEventQueues = new WeakSet<object>();
+
+/**
+ * Enqueue one reload record without discarding lifecycle evidence.
+ *
+ * Overflow is terminal for the queue. The helper retains every queued record,
+ * rejects the new record, and calls `onOverflow` once. The caller must fence
+ * the runtime and report the terminal diagnostic instead of accepting events.
+ */
+export function enqueueSubagentEventQueue(
+	queue: Record<string, unknown>[],
+	record: Record<string, unknown>,
+	options: {
+		maxRecords?: number;
+		state?: SubagentEventQueueState;
+		diagnostic?: (message: string) => void;
+		onOverflow?: () => void;
+	} = {},
+): boolean {
+	const requested = options.maxRecords ?? MAX_SUBAGENT_EVENT_QUEUE_RECORDS;
+	const maxRecords = Number.isSafeInteger(requested)
+		? Math.max(1, Math.min(MAX_SUBAGENT_EVENT_QUEUE_RECORDS, requested))
+		: MAX_SUBAGENT_EVENT_QUEUE_RECORDS;
+	const state = options.state;
+	const overflowed = state?.overflowed || overflowedEventQueues.has(queue);
+	if (overflowed) {
+		if (state) state.overflowed = true;
+		return false;
+	}
+	if (queue.length >= maxRecords) {
+		if (state) state.overflowed = true;
+		overflowedEventQueues.add(queue);
+		const message =
+			`Subagent reload event queue reached ${maxRecords} records; overflow is terminal and queued lifecycle records were retained.`;
+		try {
+			options.diagnostic?.(message);
+		} catch {
+			// A diagnostic callback cannot change the terminal queue state.
+		}
+		try {
+			options.onOverflow?.();
+		} catch {
+			// The caller still receives the explicit false overflow result.
+		}
+		return false;
+	}
+	queue.push(record);
+	return true;
+}
+
 export function drainSubagentEventQueue(
 	queue: Record<string, unknown>[],
 	consumer: (record: Record<string, unknown>) => void,

@@ -5,6 +5,7 @@ import {
 	type InspectorHandle,
 	SubagentInspector,
 	sanitizeTerminalText,
+	type SubagentInspectorOptions,
 } from "./ui.ts";
 
 function handle(
@@ -94,14 +95,25 @@ function openText(content: string): TestFileHandle {
 }
 
 type InspectorArguments = ConstructorParameters<typeof SubagentInspector>;
+interface TestInspectorOptions extends SubagentInspectorOptions {
+	throwOnRequestRender?: boolean;
+}
 
-function fixture(initial: InspectorHandle[], files?: TestFiles, rows = 60) {
+function fixture(
+	initial: InspectorHandle[],
+	files?: TestFiles,
+	rows = 60,
+	options?: TestInspectorOptions,
+) {
 	const handles = initial;
 	let renders = 0;
 	let closed = false;
 	const tui = {
 		terminal: { rows, columns: 120 },
-		requestRender: () => renders++,
+		requestRender: () => {
+			if (options?.throwOnRequestRender) throw new Error("render failed");
+			renders++;
+		},
 	} as unknown as InspectorArguments[0];
 	const theme = {
 		fg: (_color: string, text: string) => text,
@@ -135,6 +147,7 @@ function fixture(initial: InspectorHandle[], files?: TestFiles, rows = 60) {
 			},
 		},
 		files as unknown as InspectorArguments[4],
+		options,
 	);
 	return {
 		handles,
@@ -364,6 +377,58 @@ test("inspector bounds captured prompt reads and reports truncation", async () =
 	assert.match(plain(fx.inspector.render(100)), /prompt-start/);
 	fx.inspector.handleInput("\x1bOF");
 	assert.match(plain(fx.inspector.render(100)), /prompt truncated after/);
+	fx.inspector.dispose();
+});
+
+test("a stalled transcript read cancels before the next selection refreshes", async () => {
+	const reads: string[] = [];
+	let closedStalledFile = 0;
+	const files: TestFiles = {
+		stat: async (path: string) => ({
+			size: 20,
+			mtimeMs: path.includes("a.jsonl") ? 1 : 2,
+		}),
+		open: async (path: string) => {
+			reads.push(path);
+			if (path.includes("a.jsonl")) {
+				return {
+					stat: async () => ({ size: 20 }),
+					read: async () => new Promise<never>(() => {}),
+					close: async () => {
+						closedStalledFile++;
+					},
+				};
+			}
+			return openText(
+				`${JSON.stringify({ type: "session_info", name: "history-b" })}\n`,
+			);
+		},
+	};
+	const fx = fixture(
+		[handle("a"), handle("b")],
+		files,
+		40,
+		{ fileOperationTimeoutMs: 20 },
+	);
+	fx.inspector.render(100);
+	fx.inspector.handleInput("r");
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	fx.inspector.handleInput("escape");
+	fx.inspector.handleInput("down");
+	fx.inspector.handleInput("r");
+	await new Promise((resolve) => setTimeout(resolve, 80));
+	assert.ok(reads[0]?.includes("a.jsonl"));
+	assert.ok(reads.some((path) => path.includes("b.jsonl")));
+	assert.equal(closedStalledFile, 1);
+	assert.match(plain(fx.inspector.render(100)), /history-b/);
+	fx.inspector.dispose();
+});
+
+test("a failed UI refresh stays inside the inspector boundary", () => {
+	const fx = fixture([handle("a")], noFiles, 60, {
+		throwOnRequestRender: true,
+	});
+	assert.doesNotThrow(() => fx.inspector.refresh());
 	fx.inspector.dispose();
 });
 

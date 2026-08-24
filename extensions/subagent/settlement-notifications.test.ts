@@ -46,7 +46,16 @@ test("one accepted settlement sends one exact steering wake", async () => {
 		sent[0]?.message.content,
 		"Subagent a reached idle after run 1. Check subagent_status with numMessages=3.",
 	);
-	assert.deepEqual(sent[0]?.message.details.settlements, [settlement]);
+	assert.deepEqual(sent[0]?.message, {
+		customType: "subagent-settlement",
+		content:
+			"Subagent a reached idle after run 1. Check subagent_status with numMessages=3.",
+		display: true,
+		details: {
+			...settlement,
+			settlements: [settlement],
+		},
+	});
 });
 
 test("nearby settlements each send one wake with complete details", async () => {

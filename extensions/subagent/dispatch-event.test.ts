@@ -3,6 +3,7 @@ import test from "node:test";
 import {
 	dispatchSubagentEvent,
 	drainSubagentEventQueue,
+	enqueueSubagentEventQueue,
 	requestSubagentAbort,
 	type SubagentDispatchHandle,
 	type SubagentDispatchOptions,
@@ -257,6 +258,63 @@ test("dispatch callback failures become diagnostics instead of escaping", () => 
 	assert.doesNotThrow(() => completeRun(h, 1, "done"));
 	assert.equal(settledCallbacks, 1);
 	assert.match(h.diagnostics.join("\n"), /callback failed/);
+});
+
+test("reload event queue accepts records below its explicit bound", () => {
+	const queue: Record<string, unknown>[] = [];
+	const state = { overflowed: false };
+	assert.equal(
+		enqueueSubagentEventQueue(queue, { type: "agent_start" }, {
+			maxRecords: 2,
+			state,
+		}),
+		true,
+	);
+	assert.equal(
+		enqueueSubagentEventQueue(queue, { type: "agent_end" }, {
+			maxRecords: 2,
+			state,
+		}),
+		true,
+	);
+	assert.deepEqual(queue, [{ type: "agent_start" }, { type: "agent_end" }]);
+	assert.equal(state.overflowed, false);
+});
+
+test("reload event queue overflow retains boundaries and emits one terminal diagnostic", () => {
+	const queue: Record<string, unknown>[] = [
+		{ type: "agent_start" },
+		{ type: "agent_end" },
+	];
+	const state = { overflowed: false };
+	const diagnostics: string[] = [];
+	let overflows = 0;
+	assert.equal(
+		enqueueSubagentEventQueue(queue, { type: "agent_settled" }, {
+			maxRecords: 2,
+			state,
+			diagnostic: (message) => diagnostics.push(message),
+			onOverflow: () => overflows++,
+		}),
+		false,
+	);
+	assert.deepEqual(queue, [{ type: "agent_start" }, { type: "agent_end" }]);
+	assert.equal(state.overflowed, true);
+	assert.equal(overflows, 1);
+	assert.deepEqual(diagnostics, [
+		"Subagent reload event queue reached 2 records; overflow is terminal and queued lifecycle records were retained.",
+	]);
+	assert.equal(
+		enqueueSubagentEventQueue(queue, { type: "agent_settled" }, {
+			maxRecords: 2,
+			state,
+			diagnostic: (message) => diagnostics.push(message),
+			onOverflow: () => overflows++,
+		}),
+		false,
+	);
+	assert.equal(overflows, 1);
+	assert.equal(diagnostics.length, 1);
 });
 
 test("a bounded event drain retains failed records and continues later records", () => {
