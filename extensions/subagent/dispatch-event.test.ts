@@ -4,6 +4,8 @@ import {
 	dispatchSubagentEvent,
 	drainSubagentEventQueue,
 	enqueueSubagentEventQueue,
+	MAX_ACTIVE_TOOLS,
+	MAX_SUBAGENT_EVENT_QUEUE_RECORDS,
 	requestSubagentAbort,
 	type SubagentDispatchHandle,
 	type SubagentDispatchOptions,
@@ -302,7 +304,7 @@ test("reload event queue overflow retains boundaries and emits one terminal diag
 	assert.equal(state.overflowed, true);
 	assert.equal(overflows, 1);
 	assert.deepEqual(diagnostics, [
-		"Subagent reload event queue reached 2 records; overflow is terminal and queued lifecycle records were retained.",
+		"Subagent reload event queue reached its 2-record bound; overflow is terminal, accepted records were retained, and only bounded critical lifecycle records remain accepted.",
 	]);
 	assert.equal(
 		enqueueSubagentEventQueue(queue, { type: "agent_settled" }, {
@@ -314,6 +316,59 @@ test("reload event queue overflow retains boundaries and emits one terminal diag
 		false,
 	);
 	assert.equal(overflows, 1);
+	assert.equal(diagnostics.length, 1);
+});
+
+test("reload overflow reserves critical lifecycle records after an update flood", () => {
+	const queue: Record<string, unknown>[] = [];
+	const state = { overflowed: false };
+	const diagnostics: string[] = [];
+	assert.equal(
+		enqueueSubagentEventQueue(queue, { type: "agent_start" }, { state }),
+		true,
+	);
+	assert.equal(
+		enqueueSubagentEventQueue(queue, { type: "message_start" }, { state }),
+		true,
+	);
+	let updateRejected = false;
+	for (let index = 0; index < MAX_SUBAGENT_EVENT_QUEUE_RECORDS; index++) {
+		if (
+			!enqueueSubagentEventQueue(
+				queue,
+				{ type: "message_update", index },
+				{ state, diagnostic: (message) => diagnostics.push(message) },
+			)
+		) {
+			updateRejected = true;
+			break;
+		}
+	}
+	assert.equal(updateRejected, true);
+	assert.equal(state.overflowed, true);
+	assert.ok(queue.length <= MAX_SUBAGENT_EVENT_QUEUE_RECORDS);
+	for (const type of ["message_end", "agent_end", "agent_settled"]) {
+		assert.equal(
+			enqueueSubagentEventQueue(
+				queue,
+				{ type },
+				{ state, diagnostic: (message) => diagnostics.push(message) },
+			),
+			true,
+		);
+	}
+	assert.ok(queue.some((record) => record.type === "agent_start"));
+	assert.ok(queue.some((record) => record.type === "agent_end"));
+	assert.ok(queue.some((record) => record.type === "agent_settled"));
+	assert.equal(diagnostics.length, 1);
+	assert.equal(
+		enqueueSubagentEventQueue(
+			queue,
+			{ type: "message_update", index: "after-overflow" },
+			{ state, diagnostic: (message) => diagnostics.push(message) },
+		),
+		false,
+	);
 	assert.equal(diagnostics.length, 1);
 });
 
@@ -442,6 +497,78 @@ test("an abort settlement clears an unfinished assistant before the next run", (
 		),
 		true,
 	);
+});
+
+test("active tools stay bounded when tool ends are missing", () => {
+	const h = harness();
+	dispatchSubagentEvent(h.handle, { type: "agent_start", runId: 1 }, h.options);
+	for (let index = 0; index < MAX_ACTIVE_TOOLS; index++) {
+		assert.equal(
+			dispatchSubagentEvent(
+				h.handle,
+				{
+					type: "tool_execution_start",
+					toolCallId: `unclosed-${index}`,
+					toolName: "read",
+				},
+				h.options,
+			),
+			true,
+		);
+	}
+	assert.equal(h.handle.activeTools.size, MAX_ACTIVE_TOOLS);
+	assert.equal(
+		dispatchSubagentEvent(
+			h.handle,
+			{
+				type: "tool_execution_start",
+				toolCallId: "rejected",
+				toolName: "bash",
+			},
+			h.options,
+		),
+		false,
+	);
+	assert.equal(h.handle.activeTools.size, MAX_ACTIVE_TOOLS);
+	assert.match(h.diagnostics.join("\n"), /active tool limit/);
+	assert.equal(
+		dispatchSubagentEvent(
+			h.handle,
+			{
+				type: "tool_execution_update",
+				toolCallId: "unclosed-0",
+				partialResult: { content: [{ type: "text", text: "still active" }] },
+			},
+			h.options,
+		),
+		true,
+	);
+	assert.equal(
+		dispatchSubagentEvent(
+			h.handle,
+			{
+				type: "tool_execution_end",
+				toolCallId: "unclosed-0",
+				result: { content: [{ type: "text", text: "done" }] },
+			},
+			h.options,
+		),
+		true,
+	);
+	assert.equal(h.handle.activeTools.size, MAX_ACTIVE_TOOLS - 1);
+	assert.equal(
+		dispatchSubagentEvent(
+			h.handle,
+			{
+				type: "tool_execution_start",
+				toolCallId: "accepted-after-end",
+				toolName: "bash",
+			},
+			h.options,
+		),
+		true,
+	);
+	assert.equal(h.handle.activeTools.size, MAX_ACTIVE_TOOLS);
 });
 
 test("parallel tools correlate and retained identity history is bounded", () => {

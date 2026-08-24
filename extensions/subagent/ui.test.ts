@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { visibleWidth } from "@mariozechner/pi-tui";
 import {
+	MAX_TASK_DISPLAY_CHARS,
 	type InspectorHandle,
 	SubagentInspector,
 	sanitizeTerminalText,
@@ -210,6 +211,22 @@ test("status, original task, and live output have distinct hierarchy", async () 
 	assert.match(live, /RECENT ACTIVITY \/ TRANSCRIPT/);
 	assert.match(live, /\[tool\] bash · running/);
 	assert.match(live, /partial output/);
+	fx.inspector.dispose();
+});
+
+test("the original task display stays bounded for an untrusted persisted handle", async () => {
+	const child = handle("long", {
+		task: `TASK-START ${"x".repeat(MAX_TASK_DISPLAY_CHARS * 2)} TASK-END`,
+	});
+	const fx = fixture([child], noFiles, 100);
+	fx.inspector.render(2_000);
+	fx.inspector.handleInput("enter");
+	fx.inspector.handleInput("p");
+	await Promise.resolve();
+	const rendered = plain(fx.inspector.render(2_000));
+	assert.match(rendered, /TASK-START/);
+	assert.match(rendered, /original task truncated after/);
+	assert.doesNotMatch(rendered, /TASK-END/);
 	fx.inspector.dispose();
 });
 

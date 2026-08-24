@@ -22,6 +22,8 @@ The parent does not treat `agent_end` as completion. A settled run returns the c
 
 Parent tool handlers must preserve Pi cancellation through every child wait. They must race unbounded storage and process waits against that signal, then use bounded cleanup.
 
+Each child serializes at most 32 operations, including the active operation. A later operation receives a clear queue-full rejection instead of growing an unbounded waiter chain.
+
 ## Child-extension health
 
 The child extension publishes an out-of-band health marker after its startup hook registers.
@@ -152,7 +154,13 @@ An aborted settled child displays as alive and idle with an aborted outcome. It 
 
 A consumer must verify that identity before it mutates a handle. A stale runtime cannot update a replacement incarnation.
 
-Reload drains queued records in bounded batches. A failed consumer retains its record for a later retry instead of discarding it.
+Reload queues retain at most 512 records and drain at most 128 records per event-loop turn. An update flood enters a terminal runtime fence, reports one diagnostic, and rejects later updates.
+
+The queue reserves bounded slots for critical lifecycle and tool boundary records. It keeps accepted `agent_start`, `agent_end`, and `agent_settled` records deliverable after an update overflow.
+
+A failed consumer retains its record and schedules a later retry with a 25-millisecond delay. The runtime makes at most eight failed-drain retries, then leaves retained records queued.
+
+A process close callback runs only after the retained queue drains. The overflow fence closes the transport after settlement or after a bounded 250-millisecond grace period.
 
 The caller must schedule another drain turn after each batch. It must not drain an unbounded queue synchronously or start one full registry write for every stream delta.
 
@@ -221,7 +229,7 @@ The custom message details include the direct owner session file, owner session 
 
 The parent queues each wake before optional registry persistence or caller output work. Shutdown, lease loss, and explicit child termination suppress unsent wakes.
 
-Reload queues accept at most 512 records. Overflow retains the queued records, rejects later records, and emits one terminal diagnostic. The parent must fence that runtime instead of silently dropping lifecycle events.
+Reload queues accept at most 512 records. Overflow retains accepted records, emits one terminal diagnostic, and fences the runtime against later updates. Bounded critical lifecycle records remain accepted so `agent_start`, `agent_end`, and `agent_settled` remain deliverable after an update flood.
 
 The queue sends records separately. It does not promise durability, recovery after process loss, or notification for process stalls or close events.
 
@@ -229,16 +237,16 @@ The queue sends records separately. It does not promise durability, recovery aft
 
 The extension registers eight tools:
 
-- `subagent_start {task, model, thinking, name?, cwd?, systemPrompt?, outputPath?}` starts a persistent child. The response confirms acceptance only.
+- `subagent_start {task, model, thinking, name?, cwd?, systemPrompt?, outputPath?}` starts a persistent child. The caller task accepts at most 64 KiB. The response confirms acceptance only.
 - `subagent_list {includeFinished?}` lists current and retained children.
 - `subagent_status {id, messageOffset?, numMessages?}` returns bounded process and run diagnostics, settlement evidence, transcript pages, and caller output status.
 - `subagent_steer {id, message}` accepts or queues guidance. The response does not mean completion.
 - `subagent_follow_up {id, message}` accepts or queues another child run. The response does not mean completion.
 - `subagent_interrupt {id}` accepts a cooperative abort while keeping the process alive.
 - `subagent_kill {id}` terminates a child with bounded escalation.
-- `subagent_resume {id, task?}` starts a new RPC incarnation from the saved child session.
+- `subagent_resume {id, task?}` starts a new RPC incarnation from the saved child session. The optional resume task accepts at most 64 KiB.
 
-The model and thinking fields are mandatory for `subagent_start`. Nested delegated children cannot call `subagent_start`.
+The model and thinking fields are mandatory for `subagent_start`. Nested delegated children cannot call `subagent_start`. The inspector displays at most 32 KiB of the original task text.
 
 The status details include `processState`, `runState`, `runOutcome`, `settlement.status`, `lastSettledRunId`, `exitCode`, `exitSignal`, `error`, `stderrTail`, `diagnostics`, transcript status and pages, and output path and status.
 

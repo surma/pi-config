@@ -813,15 +813,31 @@ async function scenarioReloadQueue(queueCount: number, overflow: boolean): Promi
 		assert.ok(current);
 		assert.equal(current.details.runOutcome, "succeeded");
 		assert.equal(current.details.settlement.status, "settled");
-		if (!overflow)
-			assert.match(String(current.details.latestAssistantText), /reload-1-/);
+		if (overflow) assert.equal(current.details.forced, true);
+		assert.equal(
+			String(current.details.latestAssistantText),
+			`reload-1-${queueCount - 1}`,
+		);
 		const diagnostics = (current.details.diagnostics || []) as string[];
-		const overflowDiagnostic = "Reload event queue reached 512 records. Older records were discarded.";
+		const overflowDiagnostic = "overflow is terminal";
 		if (overflow)
-			assert.ok(diagnostics.includes(overflowDiagnostic), "reload overflow had no discard diagnostic");
+			assert.ok(
+				diagnostics.some((message) => message.includes(overflowDiagnostic)),
+				"reload overflow had no terminal diagnostic",
+			);
 		else
-			assert.ok(!diagnostics.includes(overflowDiagnostic), "under-limit reload discarded records");
-		return { reloaded: true, queueDelivered: true, queueCount, overflow, diagnostics };
+			assert.ok(
+				!diagnostics.some((message) => message.includes(overflowDiagnostic)),
+				"under-limit reload discarded records",
+			);
+		return {
+			reloaded: true,
+			queueDelivered: true,
+			queueCount,
+			overflow,
+			forced: current.details.forced,
+			diagnostics,
+		};
 	} finally {
 		await cleanup(runtime);
 	}

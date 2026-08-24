@@ -12,7 +12,13 @@ import {
 import { Type } from "@sinclair/typebox";
 import {
 	dispatchSubagentEvent,
+	drainSubagentEventQueue,
+	enqueueSubagentEventQueue,
+	isCriticalSubagentEvent,
+	MAX_SUBAGENT_EVENT_DRAIN_RECORDS,
+	MAX_SUBAGENT_EVENT_QUEUE_RECORDS,
 	type SubagentDispatchHandle,
+	type SubagentEventQueueState,
 } from "./dispatch-event.js";
 import {
 	createLifecycleState,
@@ -92,8 +98,11 @@ const TOOL_OUTPUT_TAIL_MAX = 16 * 1024;
 const MAX_RECENT_TOOLS = 8;
 const MAX_ACTIVE_CHILDREN = 8;
 const MAX_RETAINED_HANDLES = 24;
-const MAX_RELOAD_QUEUE_RECORDS = 512;
-const MAX_RELOAD_DRAIN_BATCH = 32;
+export const MAX_CALLER_TASK_LENGTH = 64 * 1024;
+export const MAX_QUEUED_CHILD_OPERATIONS = 32;
+const MAX_RELOAD_DRAIN_RETRIES = 8;
+const RELOAD_DRAIN_RETRY_DELAY_MS = 25;
+const OVERFLOW_TRANSPORT_FENCE_TIMEOUT_MS = 250;
 const MAX_DIAGNOSTICS = 20;
 const MAX_DIAGNOSTIC_LENGTH = 2_048;
 const MAX_STDERR_TAIL = 8 * 1024;
@@ -159,15 +168,20 @@ interface RuntimeChild {
 	incarnation: string;
 	transport: RpcChildTransport;
 	queuedRecords: RpcRecord[];
+	queueState: SubagentEventQueueState;
 	consumer?: (record: RpcRecord) => void;
 	closeConsumer?: (close: RpcProcessClose) => void;
 	closed?: RpcProcessClose;
 	diagnostics: string[];
 	handle?: SubagentHandle;
 	forced?: boolean;
+	fenced: boolean;
+	overflowFenceTimer?: NodeJS.Timeout;
 	drainTimer?: NodeJS.Timeout;
-	drainBlocked?: boolean;
-	overflowed?: boolean;
+	draining: boolean;
+	drainFailures: number;
+	drain?: () => void;
+	deliverClose?: () => void;
 }
 
 interface PendingPersistence {
@@ -200,6 +214,13 @@ function isAbortError(error: unknown): boolean {
 
 function throwIfAborted(signal?: AbortSignal): void {
 	if (signal?.aborted) throw abortError(signal.reason);
+}
+
+function assertCallerTask(task: string): void {
+	if (task.length > MAX_CALLER_TASK_LENGTH)
+		throw new Error(
+			`The subagent task exceeds the ${MAX_CALLER_TASK_LENGTH}-character limit.`,
+		);
 }
 
 /** Observe an operation while bounding both cancellation and slow dependencies. */
@@ -484,7 +505,51 @@ function addRuntimeDiagnostic(runtime: RuntimeChild, message: string): void {
 		runtime.diagnostics.splice(0, runtime.diagnostics.length - MAX_DIAGNOSTICS);
 }
 
+function fenceRuntimeTransport(runtime: RuntimeChild): void {
+	if (runtime.overflowFenceTimer) {
+		clearTimeout(runtime.overflowFenceTimer);
+		runtime.overflowFenceTimer = undefined;
+	}
+	if (runtime.transport.isClosed) return;
+	runtime.forced = true;
+	try {
+		runtime.transport.forceClose({
+			code: null,
+			signal: "SIGKILL",
+			error: new Error("Reload event queue overflowed; runtime transport was fenced."),
+			osCloseObserved: false,
+			forced: true,
+		});
+	} catch (error) {
+		addRuntimeDiagnostic(
+			runtime,
+			`Reload runtime transport fence failed: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+}
+
+function scheduleOverflowTransportFence(runtime: RuntimeChild): void {
+	if (runtime.overflowFenceTimer || runtime.transport.isClosed) return;
+	runtime.overflowFenceTimer = setTimeout(() => {
+		runtime.overflowFenceTimer = undefined;
+		fenceRuntimeTransport(runtime);
+	}, OVERFLOW_TRANSPORT_FENCE_TIMEOUT_MS);
+	runtime.overflowFenceTimer.unref?.();
+}
+
+function maybeFenceRuntimeAfterRecord(
+	runtime: RuntimeChild,
+	record: RpcRecord,
+): void {
+	if (runtime.fenced && record.type === "agent_settled")
+		fenceRuntimeTransport(runtime);
+}
+
 function removeRuntime(runtime: RuntimeChild, clearQueue = true): void {
+	if (runtime.overflowFenceTimer) {
+		clearTimeout(runtime.overflowFenceTimer);
+		runtime.overflowFenceTimer = undefined;
+	}
 	if (runtime.drainTimer) {
 		clearTimeout(runtime.drainTimer);
 		runtime.drainTimer = undefined;
@@ -492,41 +557,68 @@ function removeRuntime(runtime: RuntimeChild, clearQueue = true): void {
 	runtime.consumer = undefined;
 	runtime.closeConsumer = undefined;
 	runtime.handle = undefined;
-	runtime.drainBlocked = undefined;
+	runtime.drain = undefined;
+	runtime.deliverClose = undefined;
+	runtime.draining = false;
+	runtime.drainFailures = 0;
 	if (clearQueue) runtime.queuedRecords.length = 0;
 	if (runtimeChildren.get(runtime.id) === runtime) runtimeChildren.delete(runtime.id);
 }
 
-function isDiscardableReloadRecord(record: RpcRecord): boolean {
-	return record.type === "message_update" || record.type === "tool_execution_update";
+/** Queue one detached runtime record through the shared bounded queue contract. */
+export function queueRuntimeRecord(runtime: RuntimeChild, record: RpcRecord): boolean {
+	if (runtime.queueState.overflowed) runtime.fenced = true;
+	if (runtime.fenced && !isCriticalSubagentEvent(record)) return false;
+	const accepted = enqueueSubagentEventQueue(runtime.queuedRecords, record, {
+		maxRecords: MAX_SUBAGENT_EVENT_QUEUE_RECORDS,
+		state: runtime.queueState,
+		diagnostic: (message) => addRuntimeDiagnostic(runtime, message),
+		onOverflow: () => {
+			runtime.fenced = true;
+			scheduleOverflowTransportFence(runtime);
+		},
+	});
+	if (runtime.queueState.overflowed) runtime.fenced = true;
+	if (accepted) maybeFenceRuntimeAfterRecord(runtime, record);
+	return accepted;
 }
 
-function queueRuntimeRecord(runtime: RuntimeChild, record: RpcRecord): void {
-	if (runtime.overflowed && isDiscardableReloadRecord(record)) return;
-	if (runtime.queuedRecords.length >= MAX_RELOAD_QUEUE_RECORDS) {
-		if (!runtime.overflowed) {
-			runtime.overflowed = true;
-			runtime.drainBlocked = true;
-			addRuntimeDiagnostic(
-				runtime,
-				`Reload event queue reached ${MAX_RELOAD_QUEUE_RECORDS} records. Older records were discarded.`,
-			);
-			const retained = runtime.queuedRecords.filter(
-				(record) => !isDiscardableReloadRecord(record),
-			);
-			runtime.queuedRecords.splice(
-				0,
-				runtime.queuedRecords.length,
-				...retained,
-			);
+/** Route a runtime record without bypassing the terminal overflow fence. */
+export function routeRuntimeRecord(runtime: RuntimeChild, record: RpcRecord): boolean {
+	if (runtime.queueState.overflowed) runtime.fenced = true;
+	if (runtime.fenced && !isCriticalSubagentEvent(record)) return false;
+	if (runtime.consumer) {
+		try {
+			runtime.consumer(record);
+		} finally {
+			maybeFenceRuntimeAfterRecord(runtime, record);
 		}
-		if (isDiscardableReloadRecord(record)) return;
-		if (runtime.queuedRecords.length >= MAX_RELOAD_QUEUE_RECORDS) return;
+		return true;
 	}
-	runtime.queuedRecords.push(record);
+	return queueRuntimeRecord(runtime, record);
 }
 
-function attachRuntime(
+function scheduleRuntimeDrain(runtime: RuntimeChild, delayMs: number): void {
+	if (runtime.drainTimer || !runtime.consumer || !runtime.drain) return;
+	const drain = runtime.drain;
+	runtime.drainTimer = setTimeout(() => {
+		runtime.drainTimer = undefined;
+		if (runtime.drain === drain) drain();
+	}, Math.max(0, Math.floor(delayMs)));
+	runtime.drainTimer.unref?.();
+}
+
+/** Deliver a close event after any retained reload records drain. */
+export function noteRuntimeClose(runtime: RuntimeChild, close: RpcProcessClose): void {
+	if (runtime.overflowFenceTimer) {
+		clearTimeout(runtime.overflowFenceTimer);
+		runtime.overflowFenceTimer = undefined;
+	}
+	runtime.closed = close;
+	runtime.deliverClose?.();
+}
+
+export function attachRuntime(
 	runtime: RuntimeChild,
 	consumer: (record: RpcRecord) => void,
 	closeConsumer: (close: RpcProcessClose) => void,
@@ -534,10 +626,15 @@ function attachRuntime(
 ): void {
 	runtime.consumer = consumer;
 	runtime.closeConsumer = closeConsumer;
-	runtime.drainBlocked = false;
+	runtime.drainFailures = 0;
 	const deliverClose = () => {
 		const close = runtime.closed;
 		if (!close || runtime.closeConsumer !== closeConsumer) return;
+		if (runtime.draining || runtime.drainTimer) return;
+		if (runtime.queuedRecords.length > 0) {
+			scheduleRuntimeDrain(runtime, 0);
+			return;
+		}
 		try {
 			closeConsumer(close);
 		} catch (error) {
@@ -557,38 +654,59 @@ function attachRuntime(
 	};
 	const drain = () => {
 		runtime.drainTimer = undefined;
-		if (runtime.consumer !== consumer) return;
-		const batch = runtime.queuedRecords.splice(0, MAX_RELOAD_DRAIN_BATCH);
-		for (let index = 0; index < batch.length; index++) {
-			const record = batch[index];
-			if (!record) continue;
-			try {
-				consumer(record);
-			} catch (error) {
-				runtime.queuedRecords.unshift(...batch.slice(index));
-				runtime.drainBlocked = true;
-				addRuntimeDiagnostic(
-					runtime,
-					`Reload event handling failed: ${error instanceof Error ? error.message : String(error)}`,
-				);
-				return;
-			}
+		if (runtime.consumer !== consumer || runtime.closeConsumer !== closeConsumer)
+			return;
+		if (runtime.draining) return;
+		runtime.draining = true;
+		const queuedBefore = runtime.queuedRecords.length;
+		let delivered = 0;
+		try {
+			delivered = drainSubagentEventQueue(
+				runtime.queuedRecords,
+				(record) => {
+					try {
+						consumer(record);
+					} finally {
+						maybeFenceRuntimeAfterRecord(runtime, record);
+					}
+				},
+				{
+					maxRecords: MAX_SUBAGENT_EVENT_DRAIN_RECORDS,
+					diagnostic: (message) => addRuntimeDiagnostic(runtime, message),
+				},
+			);
+		} finally {
+			runtime.draining = false;
 		}
+		if (runtime.consumer !== consumer || runtime.closeConsumer !== closeConsumer)
+			return;
 		if (runtime.queuedRecords.length > 0) {
-			runtime.drainTimer = setTimeout(drain, 0);
-			runtime.drainTimer.unref?.();
+			const batchSize = Math.min(
+				queuedBefore,
+				MAX_SUBAGENT_EVENT_DRAIN_RECORDS,
+			);
+			if (delivered < batchSize) {
+				runtime.drainFailures++;
+				if (runtime.drainFailures <= MAX_RELOAD_DRAIN_RETRIES)
+					scheduleRuntimeDrain(runtime, RELOAD_DRAIN_RETRY_DELAY_MS);
+				else
+					addRuntimeDiagnostic(
+						runtime,
+						`Reload event drain retry limit reached after ${MAX_RELOAD_DRAIN_RETRIES} attempts; retained records remain queued.`,
+					);
+			} else {
+				runtime.drainFailures = 0;
+				scheduleRuntimeDrain(runtime, 0);
+			}
 			return;
 		}
-		runtime.overflowed = false;
+		runtime.drainFailures = 0;
 		deliverClose();
 	};
-	if (runtime.queuedRecords.length > 0) {
-		runtime.drainTimer = setTimeout(drain, 0);
-		runtime.drainTimer.unref?.();
-	} else {
-		runtime.overflowed = false;
-		deliverClose();
-	}
+	runtime.drain = drain;
+	runtime.deliverClose = deliverClose;
+	if (runtime.queuedRecords.length > 0) scheduleRuntimeDrain(runtime, 0);
+	else deliverClose();
 }
 
 function detachRuntime(runtime: RuntimeChild): void {
@@ -598,6 +716,9 @@ function detachRuntime(runtime: RuntimeChild): void {
 	}
 	runtime.consumer = undefined;
 	runtime.closeConsumer = undefined;
+	runtime.drain = undefined;
+	runtime.deliverClose = undefined;
+	runtime.draining = false;
 }
 
 function runtimeMatches(handle: SubagentHandle, runtime: RuntimeChild): boolean {
@@ -665,7 +786,7 @@ const ThinkingSchema = StringEnum([
 const TaskSpecSchema = Type.Object(
 	{
 		name: Type.Optional(Type.String()),
-		task: Type.String({ minLength: 1 }),
+		task: Type.String({ minLength: 1, maxLength: MAX_CALLER_TASK_LENGTH }),
 		cwd: Type.Optional(Type.String()),
 		model: Type.String({ minLength: 1 }),
 		thinking: ThinkingSchema,
@@ -702,6 +823,7 @@ const ResumeSchema = Type.Object({
 	task: Type.Optional(
 		Type.String({
 			minLength: 1,
+			maxLength: MAX_CALLER_TASK_LENGTH,
 			description:
 				"Initial message after the resumed session loads. If omitted, the child starts idle.",
 		}),
@@ -856,6 +978,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	const activeCount = () => sorted().filter(active).length;
 	const requireLease = (): boolean => leaseHeld && owner !== null;
 	const childOperationTails = new Map<string, Promise<void>>();
+	const childOperationCounts = new Map<string, number>();
 	let launchReservationTail = Promise.resolve();
 	async function withLaunchReservation<T>(
 		signal: AbortSignal | undefined,
@@ -897,6 +1020,12 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		operation: () => Promise<T>,
 	): Promise<T> {
 		throwIfAborted(signal);
+		const operationCount = childOperationCounts.get(handle.id) || 0;
+		if (operationCount >= MAX_QUEUED_CHILD_OPERATIONS)
+			throw new Error(
+				`The subagent operation queue is full at ${MAX_QUEUED_CHILD_OPERATIONS} operations.`,
+			);
+		childOperationCounts.set(handle.id, operationCount + 1);
 		const previous = childOperationTails.get(handle.id) || Promise.resolve();
 		let release!: () => void;
 		let released = false;
@@ -907,6 +1036,9 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			if (released) return;
 			released = true;
 			release();
+			const remaining = childOperationCounts.get(handle.id) || 0;
+			if (remaining <= 1) childOperationCounts.delete(handle.id);
+			else childOperationCounts.set(handle.id, remaining - 1);
 			if (childOperationTails.get(handle.id) === current)
 				childOperationTails.delete(handle.id);
 		};
@@ -1575,7 +1707,12 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	): void {
 		if (runtime && !runtimeMatches(handle, runtime)) return;
 		if (handle.processCloseHandled) {
-			if (runtime && runtimeChildren.get(runtime.id) === runtime)
+			if (
+				runtime &&
+				runtimeChildren.get(runtime.id) === runtime &&
+				runtime.queuedRecords.length === 0 &&
+				!runtime.draining
+			)
 				removeRuntime(runtime);
 			return;
 		}
@@ -1706,12 +1843,15 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			id: handle.id,
 			incarnation: handle.incarnation,
 			queuedRecords: [],
+			queueState: { overflowed: false },
 			diagnostics: [],
+			fenced: false,
+			draining: false,
+			drainFailures: 0,
 		} as RuntimeChild;
 		const transport = new RpcChildTransport(child, {
 			onRecord: (record) => {
-				if (runtime.consumer) runtime.consumer(record);
-				else queueRuntimeRecord(runtime, record);
+				routeRuntimeRecord(runtime, record);
 			},
 			onDiagnostic: (message) => {
 				if (runtime.handle && runtimeMatches(runtime.handle, runtime))
@@ -1719,9 +1859,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				else if (!runtime.handle) addRuntimeDiagnostic(runtime, message);
 			},
 			onClose: (close) => {
-				runtime.closed = close;
 				try {
-					if (runtime.closeConsumer) runtime.closeConsumer(close);
+					noteRuntimeClose(runtime, close);
 				} catch (error) {
 					addRuntimeDiagnostic(
 						runtime,
@@ -2074,6 +2213,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		outputPath?: string,
 		signal?: AbortSignal,
 	): Promise<SubagentHandle> {
+		assertCallerTask(spec.task);
 		if (activeCount() + pendingLaunches >= MAX_ACTIVE_CHILDREN)
 			throw new Error(`The active subagent limit of ${MAX_ACTIVE_CHILDREN} has been reached.`);
 		pendingLaunches++;
@@ -2222,6 +2362,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		signal?: AbortSignal,
 	): Promise<void> {
 		throwIfAborted(signal);
+		if (task !== undefined) assertCallerTask(task);
 		if (!(await requireCurrentAuthority(signal)))
 			throw new Error(await leaseConflictMessage(signal));
 		const resolvedOwner = owner;

@@ -32,6 +32,8 @@ export interface SubagentUsageStats {
 
 // Independent from active display state so delayed prior-run records remain inert.
 const MAX_KNOWN_TOOL_CALL_IDS = 256;
+/** Maximum number of tool calls that can remain active without an end record. */
+export const MAX_ACTIVE_TOOLS = 64;
 
 export interface SubagentDispatchHandle
 	extends LifecycleState,
@@ -88,19 +90,63 @@ function invokeDispatchCallback(
  */
 export const MAX_SUBAGENT_EVENT_DRAIN_RECORDS = 128;
 export const MAX_SUBAGENT_EVENT_QUEUE_RECORDS = 512;
+/** Reserved queue slots for lifecycle boundaries after an update flood. */
+export const MAX_SUBAGENT_EVENT_CRITICAL_RECORDS = 8;
 
 export interface SubagentEventQueueState {
 	overflowed: boolean;
 }
 
 const overflowedEventQueues = new WeakSet<object>();
+const criticalEventTypes = new Set([
+	"agent_start",
+	"message_start",
+	"message_end",
+	"agent_end",
+	"agent_settled",
+	"tool_execution_start",
+	"tool_execution_end",
+	"extension_error",
+]);
+
+/** Identify records that preserve lifecycle and tool boundaries after overflow. */
+export function isCriticalSubagentEvent(
+	record: Record<string, unknown>,
+): boolean {
+	return typeof record.type === "string" && criticalEventTypes.has(record.type);
+}
+
+function markEventQueueOverflow(
+	queue: Record<string, unknown>[],
+	maxRecords: number,
+	state: SubagentEventQueueState | undefined,
+	options: {
+		diagnostic?: (message: string) => void;
+		onOverflow?: () => void;
+	},
+): void {
+	if (state) state.overflowed = true;
+	overflowedEventQueues.add(queue);
+	const message =
+		`Subagent reload event queue reached its ${maxRecords}-record bound; overflow is terminal, accepted records were retained, and only bounded critical lifecycle records remain accepted.`;
+	try {
+		options.diagnostic?.(message);
+	} catch {
+		// A diagnostic callback cannot change the terminal queue state.
+	}
+	try {
+		options.onOverflow?.();
+	} catch {
+		// The caller still receives the explicit overflow state.
+	}
+}
 
 /**
- * Enqueue one reload record without discarding lifecycle evidence.
+ * Enqueue one reload record without discarding accepted lifecycle evidence.
  *
- * Overflow is terminal for the queue. The helper retains every queued record,
- * rejects the new record, and calls `onOverflow` once. The caller must fence
- * the runtime and report the terminal diagnostic instead of accepting events.
+ * The queue reserves critical boundary slots before overflow. An update flood
+ * enters a terminal fence, rejects later updates, and still accepts critical
+ * lifecycle records until the finite queue bound is full.
  */
 export function enqueueSubagentEventQueue(
 	queue: Record<string, unknown>[],
@@ -116,26 +162,30 @@ export function enqueueSubagentEventQueue(
 	const maxRecords = Number.isSafeInteger(requested)
 		? Math.max(1, Math.min(MAX_SUBAGENT_EVENT_QUEUE_RECORDS, requested))
 		: MAX_SUBAGENT_EVENT_QUEUE_RECORDS;
+	const criticalReserve = Math.min(
+		MAX_SUBAGENT_EVENT_CRITICAL_RECORDS,
+		Math.max(0, maxRecords - 1),
+	);
 	const state = options.state;
 	const overflowed = state?.overflowed || overflowedEventQueues.has(queue);
+	const critical = isCriticalSubagentEvent(record);
 	if (overflowed) {
 		if (state) state.overflowed = true;
-		return false;
+		if (!critical || queue.length >= maxRecords) return false;
+		queue.push(record);
+		return true;
 	}
-	if (queue.length >= maxRecords) {
-		if (state) state.overflowed = true;
-		overflowedEventQueues.add(queue);
-		const message =
-			`Subagent reload event queue reached ${maxRecords} records; overflow is terminal and queued lifecycle records were retained.`;
-		try {
-			options.diagnostic?.(message);
-		} catch {
-			// A diagnostic callback cannot change the terminal queue state.
-		}
-		try {
-			options.onOverflow?.();
-		} catch {
-			// The caller still receives the explicit false overflow result.
+	const criticalCount = queue.reduce(
+		(count, queued) => count + (isCriticalSubagentEvent(queued) ? 1 : 0),
+		0,
+	);
+	const remainingCriticalReserve = Math.max(0, criticalReserve - criticalCount);
+	const regularLimit = maxRecords - remainingCriticalReserve;
+	if (queue.length >= maxRecords || (!critical && queue.length >= regularLimit)) {
+		markEventQueueOverflow(queue, maxRecords, state, options);
+		if (critical && queue.length < maxRecords) {
+			queue.push(record);
+			return true;
 		}
 		return false;
 	}
@@ -355,12 +405,19 @@ export function dispatchSubagentEvent(
 			}
 			if (!requireActiveRun(handle, options, "tool_execution_start"))
 				return false;
-			if (!rememberNewToolCallId(handle, record.toolCallId)) {
+			if (handle.knownToolCallIds.includes(record.toolCallId)) {
 				options.diagnostic(
 					"Ignored duplicate or delayed tool_execution_start for a previously seen toolCallId.",
 				);
 				return false;
 			}
+			if (handle.activeTools.size >= MAX_ACTIVE_TOOLS) {
+				options.diagnostic(
+					`Rejected tool_execution_start because the active tool limit of ${MAX_ACTIVE_TOOLS} was reached.`,
+				);
+				return false;
+			}
+			if (!rememberNewToolCallId(handle, record.toolCallId)) return false;
 			corroborateRun(handle);
 			handle.activeTools.set(record.toolCallId, {
 				toolCallId: record.toolCallId,

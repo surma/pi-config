@@ -14,7 +14,14 @@ import test from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import type { TSchema } from "@sinclair/typebox";
 import { Check } from "@sinclair/typebox/value";
-import subagentExtension from "./index.ts";
+import subagentExtension, {
+	attachRuntime,
+	MAX_CALLER_TASK_LENGTH,
+	MAX_QUEUED_CHILD_OPERATIONS,
+	noteRuntimeClose,
+	routeRuntimeRecord,
+} from "./index.ts";
+import { MAX_SUBAGENT_EVENT_QUEUE_RECORDS } from "./dispatch-event.ts";
 import { RpcChildTransport } from "./rpc.js";
 import { leasePath, ownerRegistryPath } from "./owner.ts";
 
@@ -268,6 +275,117 @@ const toolNames = [
 	"subagent_resume",
 ];
 
+function testRuntime(records: Record<string, unknown>[] = []): any {
+	const runtime: any = {
+		id: "runtime-test",
+		incarnation: "incarnation-test",
+		queuedRecords: records,
+		queueState: { overflowed: false },
+		diagnostics: [],
+		fenced: false,
+		draining: false,
+		drainFailures: 0,
+		forceCloseCalls: 0,
+	};
+	runtime.transport = {
+		isClosed: false,
+		forceClose(close: Record<string, unknown>) {
+			this.isClosed = true;
+			runtime.forceCloseCalls++;
+			noteRuntimeClose(runtime, close);
+		},
+	};
+	return runtime;
+}
+
+test("runtime reload queue preserves critical lifecycle records and fences updates", async () => {
+	const runtime = testRuntime();
+	assert.equal(routeRuntimeRecord(runtime, { type: "agent_start" }), true);
+	assert.equal(routeRuntimeRecord(runtime, { type: "message_start" }), true);
+	let rejected = false;
+	for (let index = 0; index < MAX_SUBAGENT_EVENT_QUEUE_RECORDS; index++) {
+		if (!routeRuntimeRecord(runtime, { type: "message_update", index })) {
+			rejected = true;
+			break;
+		}
+	}
+	assert.equal(rejected, true);
+	assert.equal(runtime.fenced, true);
+	assert.equal(runtime.queuedRecords.length <= MAX_SUBAGENT_EVENT_QUEUE_RECORDS, true);
+	assert.equal(routeRuntimeRecord(runtime, { type: "message_end" }), true);
+	assert.equal(routeRuntimeRecord(runtime, { type: "agent_end" }), true);
+	assert.equal(routeRuntimeRecord(runtime, { type: "agent_settled" }), true);
+	const expected = runtime.queuedRecords.map((record: Record<string, unknown>) => record.type);
+	const seen: unknown[] = [];
+	attachRuntime(
+		runtime,
+		(record) => seen.push(record.type),
+		() => {},
+	);
+	await waitFor(() => seen.length === expected.length);
+	await waitFor(() => runtime.forceCloseCalls === 1);
+	assert.deepEqual(seen, expected);
+	assert.equal(runtime.queuedRecords.length, 0);
+	assert.equal(runtime.transport.isClosed, true);
+	const seenBeforeFence = seen.length;
+	assert.equal(routeRuntimeRecord(runtime, { type: "message_update", index: "late" }), false);
+	assert.equal(seen.length, seenBeforeFence);
+	assert.equal(
+		(runtime.diagnostics as string[]).filter((message) => message.includes("overflow is terminal")).length,
+		1,
+	);
+});
+
+test("a failed runtime drain retains its record and retries in a later turn", async () => {
+	const runtime = testRuntime([
+		{ type: "first" },
+		{ type: "second" },
+	]);
+	let failFirst = true;
+	const seen: string[] = [];
+	let closed = 0;
+	noteRuntimeClose(runtime, { code: 0, signal: null, osCloseObserved: true, forced: false });
+	attachRuntime(
+		runtime,
+		(record) => {
+			if (record.type === "first" && failFirst) {
+				failFirst = false;
+				throw new Error("transient consumer failure");
+			}
+			seen.push(String(record.type));
+		},
+		() => {
+			closed++;
+		},
+	);
+	assert.equal(closed, 0);
+	await waitFor(() => closed === 1, 500);
+	assert.deepEqual(seen, ["second", "first"]);
+	assert.equal(runtime.queuedRecords.length, 0);
+});
+
+test("runtime close waits for the queued lifecycle drain", async () => {
+	const runtime = testRuntime([
+		{ type: "agent_start" },
+		{ type: "agent_end" },
+		{ type: "agent_settled" },
+	]);
+	const seen: string[] = [];
+	let closed = 0;
+	attachRuntime(
+		runtime,
+		(record) => seen.push(String(record.type)),
+		() => {
+			closed++;
+		},
+	);
+	noteRuntimeClose(runtime, { code: 17, signal: null, osCloseObserved: true, forced: false });
+	assert.equal(closed, 0);
+	await waitFor(() => closed === 1, 500);
+	assert.deepEqual(seen, ["agent_start", "agent_end", "agent_settled"]);
+	assert.equal(runtime.queuedRecords.length, 0);
+});
+
 test("the extension registers all eight tools and three commands", () => {
 	const commands: string[] = [];
 	const { tools } = setup(new Map(), [], commands);
@@ -275,7 +393,7 @@ test("the extension registers all eight tools and three commands", () => {
 	assert.deepEqual(commands, ["subagents", "subagents-toggle", "subagents-kill-all"]);
 	const start = requireTool(tools, "subagent_start").parameters as {
 		properties: {
-			task: { minLength?: number };
+			task: { minLength?: number; maxLength?: number };
 			model: { minLength?: number };
 			thinking: unknown;
 			outputPath: { minLength?: number };
@@ -283,9 +401,14 @@ test("the extension registers all eight tools and three commands", () => {
 		required?: string[];
 	};
 	assert.equal(start.properties.task.minLength, 1);
+	assert.equal(start.properties.task.maxLength, MAX_CALLER_TASK_LENGTH);
 	assert.equal(start.properties.model.minLength, 1);
 	assert.equal(start.properties.outputPath.minLength, 1);
 	assert.deepEqual(new Set(start.required), new Set(["task", "model", "thinking"]));
+	const resume = requireTool(tools, "subagent_resume").parameters as {
+		properties: { task?: { maxLength?: number } };
+	};
+	assert.equal(resume.properties.task?.maxLength, MAX_CALLER_TASK_LENGTH);
 });
 
 test("tool schemas accept valid values and reject invalid values", () => {
@@ -309,6 +432,22 @@ test("tool schemas accept valid values and reject invalid values", () => {
 		assert.equal(Check(schema, valid), true, `${name} valid`);
 		assert.equal(Check(schema, invalid), false, `${name} invalid`);
 	}
+	const longTask = "x".repeat(MAX_CALLER_TASK_LENGTH + 1);
+	assert.equal(
+		Check(requireTool(tools, "subagent_start").parameters as TSchema, {
+			task: longTask,
+			model: "provider/model",
+			thinking: "off",
+		}),
+		false,
+	);
+	assert.equal(
+		Check(requireTool(tools, "subagent_resume").parameters as TSchema, {
+			id: "child",
+			task: longTask,
+		}),
+		false,
+	);
 });
 
 test("nested children cannot start another delegated child", async () => {
@@ -477,6 +616,74 @@ test("a canceled queue waiter cannot overlap a live predecessor", async () => {
 		await requireTool(tools, "subagent_kill").execute("kill", { id: childId });
 	} finally {
 		prototype.send = originalSend;
+		await handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
+		if (old.agentDirectory === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = old.agentDirectory;
+		if (old.pi === undefined) delete process.env.PI_SUBAGENT_PI_BIN;
+		else process.env.PI_SUBAGENT_PI_BIN = old.pi;
+		if (old.depth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
+		else process.env.PI_SUBAGENT_DEPTH = old.depth;
+	}
+});
+
+test("same-child operation queues reject work beyond the finite bound", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "pi-rpc-operation-limit-"));
+	const agentDirectory = join(directory, "agent");
+	const parentSession = join(directory, "parent.jsonl");
+	const logPath = join(directory, "invocations.jsonl");
+	await writeFile(parentSession, "parent\\n");
+	const binary = await fakePi(directory, logPath, "queue-message");
+	const old = {
+		agentDirectory: process.env.PI_CODING_AGENT_DIR,
+		pi: process.env.PI_SUBAGENT_PI_BIN,
+		depth: process.env.PI_SUBAGENT_DEPTH,
+	};
+	process.env.PI_CODING_AGENT_DIR = agentDirectory;
+	process.env.PI_SUBAGENT_PI_BIN = binary;
+	delete process.env.PI_SUBAGENT_DEPTH;
+	const handlers = new Map<string, TestHandler>();
+	const { tools } = setup(handlers);
+	const ctx = context(parentSession, "operation-limit-parent", directory);
+	try {
+		await handlers.get("session_start")?.({ reason: "startup" }, ctx);
+		const started = await requireTool(tools, "subagent_start").execute(
+			"start",
+			{ task: "initial", model: "provider/model", thinking: "off" },
+			undefined,
+			undefined,
+			ctx,
+		);
+		const childId = String(started.details.handle.id);
+		const controllers = Array.from(
+			{ length: MAX_QUEUED_CHILD_OPERATIONS + 2 },
+			() => new AbortController(),
+		);
+		let settled = 0;
+		let rejectedByLimit = 0;
+		const operations = controllers.map((controller, index) =>
+			requireTool(tools, "subagent_follow_up")
+				.execute(
+					`operation-${index}`,
+					{ id: childId, message: `operation-${index}` },
+					controller.signal,
+				)
+				.then(
+					(result) => {
+						settled++;
+						if (result.details.accepted === false) rejectedByLimit++;
+					},
+					() => {
+						settled++;
+					},
+				),
+		);
+		await new Promise((resolve) => setTimeout(resolve, 40));
+		assert.ok(rejectedByLimit > 0, "the operation queue accepted unlimited waiters");
+		assert.ok(settled < operations.length, "the live predecessor did not hold queued work");
+		for (const controller of controllers) controller.abort(new Error("cancel queued work"));
+		await Promise.all(operations);
+		await requireTool(tools, "subagent_kill").execute("kill", { id: childId });
+	} finally {
 		await handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
 		if (old.agentDirectory === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = old.agentDirectory;

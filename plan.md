@@ -10,7 +10,13 @@ This repository uses native Pi RPC child processes. This note replaces the old t
 - A logical child keeps its ID across resume. Each process incarnation has a new identity.
 - Runtime callbacks require the current runtime object and incarnation. Stale callbacks remain inert.
 - `/reload` detaches consumers and preserves live transports in process-global state.
-- Reload consumers drain records in bounded batches. A failed consumer retains its record for retry.
+- Reload queues retain at most 512 records and drain at most 128 records per event-loop turn.
+- An update overflow emits one diagnostic, fences the runtime, and rejects later updates.
+- Reserved critical lifecycle slots keep accepted `agent_start`, `agent_end`, and `agent_settled` records deliverable after overflow.
+- A failed consumer retains its record and receives up to eight later retries with a 25-millisecond delay.
+- The caller delivers a close callback only after retained records drain. The overflow fence closes the transport after settlement or a bounded 250-millisecond grace period.
+- Each child accepts at most 32 serialized operations, including the active operation.
+- The caller task and optional resume task each accept at most 64 KiB. The inspector displays at most 32 KiB of the original task.
 - The caller schedules later drain turns. It does not create a synchronous event storm.
 
 ## Protocol contract
@@ -61,9 +67,11 @@ A valid lease resets the temporary read-error count. Three consecutive temporary
 
 The status reader uses bounded JSONL pages. The inspector reads only a bounded recent transcript tail and a bounded prompt prefix.
 
-The inspector sanitizes untrusted text before terminal rendering. It uses process state and run state for refresh decisions. An aborted settled idle child does not keep a refresh timer.
+The inspector sanitizes untrusted text before terminal rendering. It displays at most 32 KiB of the original task text. It uses process state and run state for refresh decisions. An aborted settled idle child does not keep a refresh timer.
 
 Settlement wakes use `numMessages=3`. They are best-effort steering messages and are not durable completion records.
+
+The caller task and optional resume task accept at most 64 KiB. Each child serializes at most 32 operations, including the active operation.
 
 ## Historical archive
 

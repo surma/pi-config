@@ -109,6 +109,8 @@ const MAX_TRANSCRIPT_LINES = 400;
 const MAX_TRANSCRIPT_CHARS = 256 * 1024;
 const MAX_TRANSCRIPT_READ_BYTES = 512 * 1024;
 const MAX_PROMPT_READ_BYTES = 64 * 1024;
+/** Maximum sanitized task text that the inspector sends to the wrapper. */
+export const MAX_TASK_DISPLAY_CHARS = 32 * 1024;
 const DEFAULT_FILE_OPERATION_TIMEOUT_MS = 5_000;
 
 export interface SubagentInspectorOptions {
@@ -280,6 +282,19 @@ export function sanitizeTerminalText(value: unknown): string {
 			const codePoint = character.codePointAt(0) ?? 0;
 			return `\\u${codePoint.toString(16).toUpperCase().padStart(4, "0")}`;
 		});
+}
+
+function boundTaskForDisplay(value: unknown): {
+	text: string;
+	truncated: boolean;
+} {
+	const text = sanitizeTerminalText(value);
+	if (text.length <= MAX_TASK_DISPLAY_CHARS)
+		return { text, truncated: false };
+	let end = MAX_TASK_DISPLAY_CHARS;
+	const last = text.charCodeAt(end - 1);
+	if (last >= 0xd800 && last <= 0xdbff) end--;
+	return { text: text.slice(0, Math.max(1, end)), truncated: true };
 }
 
 function elapsed(from: number, until = Date.now()): string {
@@ -818,7 +833,16 @@ export class SubagentInspector implements Focusable {
 			return [this.theme.fg("warning", "Selected handle no longer exists.")];
 		const lines: string[] = [];
 		this.pushHeading(lines, "ORIGINAL DELEGATED TASK", width);
-		lines.push(...this.wrapRaw(handle.task, width, "text"));
+		const task = boundTaskForDisplay(handle.task);
+		lines.push(...this.wrapRaw(task.text, width, "text"));
+		if (task.truncated)
+			lines.push(
+				...this.wrapRaw(
+					`… original task truncated after ${MAX_TASK_DISPLAY_CHARS} characters …`,
+					width,
+					"warning",
+				),
+			);
 		lines.push("");
 		lines.push(this.theme.fg("borderMuted", "─".repeat(width)));
 		lines.push("");

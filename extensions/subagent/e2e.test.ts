@@ -234,9 +234,10 @@ e2eTest("E2E: reload reports explicit overflow while preserving settlement", { t
 	assert.equal(result.queueDelivered, true);
 	assert.equal(result.overflow, true);
 	assert.ok(Number(result.queueCount) > 512);
+	assert.equal(result.forced, true);
 	assert.ok(
 		(Array.isArray(result.diagnostics) ? result.diagnostics : []).some((value) =>
-			String(value).includes("Older records were discarded"),
+			String(value).includes("overflow is terminal"),
 		),
 	);
 });
