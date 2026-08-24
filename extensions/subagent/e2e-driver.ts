@@ -6,11 +6,10 @@ import {
 	mkdtemp,
 	readFile,
 	rm,
-	symlink,
 	writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { dirname, join } from "node:path";
 import type {
 	ExtensionAPI,
@@ -359,7 +358,12 @@ async function scenarioCancellation(toolName: string): Promise<Record<string, un
 			const child = await startChild(runtime);
 			const sessionPath = child.result.details.handle.sessionPath as string;
 			await rm(sessionPath, { force: true });
-			await symlink("/dev/zero", sessionPath);
+			const fifo = spawnSync("mkfifo", [sessionPath], {
+				stdio: "ignore",
+				timeout: 1_000,
+			});
+			if (fifo.error || fifo.status !== 0)
+				throw new Error(`Could not create stalled transcript FIFO: ${String(fifo.error || fifo.status)}`);
 			await assertAbortSettles(toolName, (signal) =>
 				call(
 					runtime!,
@@ -467,8 +471,13 @@ async function scenarioPersistenceFlood(): Promise<Record<string, unknown>> {
 	let runtime: DriverRuntime | undefined;
 	try {
 		runtime = await createRuntime({ mode: "persist-flood", floodCount: 16_000 });
-		await startChild(runtime);
+		const child = await startChild(runtime);
 		await waitForMarker(runtime, "flood-done", 5_000);
+		await waitFor(
+			async () => (await status(runtime!, child.id)).details.settlement.status === "settled",
+			5_000,
+			"persistence flood settlement",
+		);
 		const startedAt = Date.now();
 		await withTimeout(
 			Promise.resolve(runtime.handlers.get("session_shutdown")?.({ reason: "quit" }, runtime.ctx)),
@@ -495,16 +504,33 @@ async function scenarioActiveLimit(): Promise<Record<string, unknown>> {
 			if (typeof result.details?.handle?.id === "string")
 				accepted.push(result.details.handle.id);
 		}
-		assert.ok(accepted.length <= 24, `accepted ${accepted.length} active children`);
+		assert.ok(accepted.length <= 8, `accepted ${accepted.length} active children`);
 		return { attempted: 28, accepted: accepted.length };
 	} finally {
 		await cleanup(runtime);
 	}
 }
 
+async function stopDirectChild(child: ChildProcess): Promise<void> {
+	if (child.exitCode !== null || child.signalCode !== null) return;
+	const closed = new Promise<void>((resolve) => {
+		child.once("close", () => resolve());
+	});
+	try {
+		child.kill("SIGKILL");
+	} catch {
+		// The child already exited.
+	}
+	await withTimeout(closed, 500, "direct child cleanup").catch(() => {});
+}
+
 async function directTransport(
 	mode: string,
-	configure: (child: ChildProcess, transport: RpcChildTransport) => Promise<Record<string, unknown>>,
+	configure: (
+		child: ChildProcess,
+		transport: RpcChildTransport,
+		diagnostics: string[],
+	) => Promise<Record<string, unknown>>,
 ): Promise<Record<string, unknown>> {
 	const root = await mkdtemp(join(tmpdir(), "pi-subagent-e2e-transport-"));
 	const markerPath = join(root, "markers.log");
@@ -528,24 +554,32 @@ async function directTransport(
 	try {
 		await waitFor(() => fileContains(markerPath, mode === "huge-record" ? "huge-record-sent" : "stdin-paused"), 2_000, `${mode} marker`);
 		return {
-			...(await configure(child, transport)),
+			...(await configure(child, transport, diagnostics)),
 			diagnostics,
 		};
 	} finally {
-		await transport.terminate({
-			abort: false,
-			termTimeoutMs: 300,
-			killTimeoutMs: 300,
-		}).catch(() => {});
+		await withTimeout(
+			transport.terminate({
+				abort: false,
+				termTimeoutMs: 300,
+				killTimeoutMs: 300,
+			}),
+			1_000,
+			"transport cleanup",
+		).catch(() => {});
+		await stopDirectChild(child);
 		await rm(root, { recursive: true, force: true }).catch(() => {});
 	}
 }
 
 async function scenarioRpcBuffer(): Promise<Record<string, unknown>> {
-	return directTransport("huge-record", async (_child, transport) => {
-		const closed = await withTimeout(transport.waitForClose(500), 800, "oversized RPC frame");
-		assert.equal(closed, true, "an oversized unterminated RPC record stayed open");
-		return { closed };
+	return directTransport("huge-record", async (_child, _transport, diagnostics) => {
+		await waitFor(
+			() => diagnostics.some((message) => message.includes("Discarded oversized unterminated RPC JSONL record.")),
+			800,
+			"oversized RPC discard diagnostic",
+		);
+		return { discarded: true };
 	});
 }
 
@@ -584,7 +618,19 @@ async function scenarioReloadQueue(): Promise<Record<string, unknown>> {
 		await waitForMarker(runtime, "flood-done", 5_000);
 		installExtension(runtime, "tui", true);
 		await runtime.handlers.get("session_start")?.({ reason: "reload" }, runtime.ctx);
-		const current = await status(runtime, child.id);
+		let current: TestResult | undefined;
+		await waitFor(
+			async () => {
+				current = await status(runtime!, child.id);
+				return (
+					current.details.runOutcome === "succeeded" &&
+					current.details.settlement.status === "settled"
+				);
+			},
+			5_000,
+			"reload queue settlement",
+		);
+		assert.ok(current);
 		assert.equal(current.details.runOutcome, "succeeded");
 		assert.equal(current.details.settlement.status, "settled");
 		assert.match(String(current.details.latestAssistantText), /reload-1-/);
@@ -653,7 +699,16 @@ async function scenarioStaleRunView(): Promise<Record<string, unknown>> {
 		const child = await startChild(runtime);
 		await call(runtime, "subagent_follow_up", { id: child.id, message: "second run" });
 		await waitForMarker(runtime, "second-run-active");
-		const current = await status(runtime, child.id);
+		let current: TestResult | undefined;
+		await waitFor(
+			async () => {
+				current = await status(runtime!, child.id);
+				return current.details.runState === "running" && current.details.completedAt === undefined;
+			},
+			2_000,
+			"second run status",
+		);
+		assert.ok(current);
 		assert.equal(current.details.runState, "running");
 		assert.equal(current.details.completedAt, undefined, "a new run kept the prior completedAt");
 		return { currentRun: 2, completedAt: current.details.completedAt };

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 const args = process.argv.slice(2);
 const mode = process.env.E2E_FAKE_MODE || "success";
@@ -44,6 +44,10 @@ if (sessionFile) {
   mkdirSync(join(sessionFile, ".."), { recursive: true });
   if (!existsSync(sessionFile)) writeFileSync(sessionFile, '{"type":"session"}\n');
 }
+if (process.env.PI_SUBAGENT_HEALTH_PATH && mode !== "extension-error") {
+  mkdirSync(dirname(process.env.PI_SUBAGENT_HEALTH_PATH), { recursive: true });
+  writeFileSync(process.env.PI_SUBAGENT_HEALTH_PATH, "pi-subagent-child-extension-ready/v1\n");
+}
 
 log({ event: "start", pid: process.pid, args, mode, sessionFile });
 if (mode === "pause-stdin") {
@@ -53,6 +57,7 @@ if (mode === "pause-stdin") {
 if (mode === "huge-record") {
   process.stdout.write("x".repeat(5 * 1024 * 1024));
   mark("huge-record-sent");
+  process.stdout.end();
 }
 if (mode === "large-transcript" && sessionFile) {
   const text = "transcript-" + "x".repeat(300 * 1024);
@@ -310,8 +315,8 @@ process.stdin.on("end", () => process.exit(0));
 process.on("SIGTERM", () => process.exit(0));
 process.on("SIGINT", () => process.exit(0));
 
-// Keep intentionally stalled modes alive without holding a test process open after cleanup.
+// Keep intentionally stalled modes alive until bounded transport cleanup kills them.
 if (mode === "huge-record" || mode === "pause-stdin") {
-  const keepAlive = setInterval(() => {}, 1_000);
-  if (mode === "huge-record") keepAlive.unref?.();
+  // Keep the stalled child alive until the transport cleanup path kills it.
+  setInterval(() => {}, 1_000);
 }

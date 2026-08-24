@@ -32,6 +32,34 @@ function terminateProcessGroup(pid: number | undefined): void {
 	}
 }
 
+async function waitForChildClose(
+	close: Promise<{ code: number | null; signal: NodeJS.Signals | null }>,
+	milliseconds = 1_000,
+): Promise<boolean> {
+	return new Promise((resolve) => {
+		let settled = false;
+		const timer = setTimeout(() => {
+			if (settled) return;
+			settled = true;
+			resolve(false);
+		}, milliseconds);
+		void close.then(
+			() => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timer);
+				resolve(true);
+			},
+			() => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timer);
+				resolve(true);
+			},
+		);
+	});
+}
+
 async function runScenario(
 	scenario: string,
 	timeoutMs = 8_000,
@@ -51,10 +79,28 @@ async function runScenario(
 	);
 	let stdout = "";
 	let stderr = "";
+	let resolveResult!: (result: DriverResult) => void;
+	const resultOutput = new Promise<DriverResult>((resolve) => {
+		resolveResult = resolve;
+	});
+	let resultResolved = false;
 	child.stdout?.setEncoding("utf8");
 	child.stderr?.setEncoding("utf8");
 	child.stdout?.on("data", (chunk: string) => {
 		stdout += chunk;
+		if (resultResolved) return;
+		for (const line of stdout.split("\n")) {
+			if (!line.trim()) continue;
+			try {
+				const parsed = JSON.parse(line) as Partial<DriverResult>;
+				if (parsed.scenario !== scenario || typeof parsed.ok !== "boolean") continue;
+				resultResolved = true;
+				resolveResult(parsed as DriverResult);
+				break;
+			} catch {
+				// The final JSON record can arrive in multiple chunks.
+			}
+		}
 	});
 	child.stderr?.on("data", (chunk: string) => {
 		stderr += chunk;
@@ -62,13 +108,14 @@ async function runScenario(
 	const close = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
 		(resolve, reject) => {
 			child.once("error", reject);
-			child.once("exit", (code, signal) => resolve({ code, signal }));
+			child.once("close", (code, signal) => resolve({ code, signal }));
 		},
 	);
 	let timer: NodeJS.Timeout | undefined;
 	try {
-		const result = await Promise.race([
-			close,
+		const outcome = await Promise.race([
+			resultOutput.then((parsed) => ({ type: "result" as const, parsed })),
+			close.then((exit) => ({ type: "close" as const, exit })),
 			new Promise<never>((_, reject) => {
 				timer = setTimeout(() => {
 					terminateProcessGroup(child.pid);
@@ -76,9 +123,20 @@ async function runScenario(
 				}, timeoutMs);
 			}),
 		]);
-		if (result.code !== 0) {
+		if (outcome.type === "result") {
+			terminateProcessGroup(child.pid);
+			if (!(await waitForChildClose(close)))
+				throw new Error(`E2E scenario ${scenario} process cleanup timed out.`);
+			assert.equal(
+				outcome.parsed.ok,
+				true,
+				`E2E scenario ${scenario} reported failure: ${JSON.stringify(outcome.parsed)}`,
+			);
+			return outcome.parsed;
+		}
+		if (outcome.exit.code !== 0) {
 			throw new Error(
-				`E2E scenario ${scenario} exited with code ${String(result.code)} signal ${String(result.signal)}.\nstdout:\n${stdout}\nstderr:\n${stderr}`,
+				`E2E scenario ${scenario} exited with code ${String(outcome.exit.code)} signal ${String(outcome.exit.signal)}.\nstdout:\n${stdout}\nstderr:\n${stderr}`,
 			);
 		}
 		const lines = stdout.trim().split("\n").filter(Boolean);
@@ -89,7 +147,8 @@ async function runScenario(
 		return parsed;
 	} catch (error) {
 		terminateProcessGroup(child.pid);
-		await close.catch(() => {});
+		if (!(await waitForChildClose(close)))
+			throw new Error(`E2E scenario ${scenario} process cleanup timed out.`, { cause: error });
 		throw error;
 	} finally {
 		if (timer) clearTimeout(timer);
@@ -146,12 +205,12 @@ e2eTest("E2E: persistence floods cannot hold shutdown", { timeout: 15_000 }, asy
 
 e2eTest("E2E: active child count stays bounded", { timeout: 35_000 }, async () => {
 	const result = await runScenario("active-child-limit", 30_000);
-	assert.ok(Number(result.accepted) <= 24);
+	assert.ok(Number(result.accepted) <= 8);
 });
 
-e2eTest("E2E: oversized unterminated RPC records cannot hold a transport", { timeout: 6_000 }, async () => {
+e2eTest("E2E: oversized unterminated RPC records are discarded with a diagnostic", { timeout: 6_000 }, async () => {
 	const result = await runScenario("rpc-buffer-limit");
-	assert.equal(result.closed, true);
+	assert.equal(result.discarded, true);
 });
 
 e2eTest("E2E: RPC stdin honors stream backpressure", { timeout: 8_000 }, async () => {
