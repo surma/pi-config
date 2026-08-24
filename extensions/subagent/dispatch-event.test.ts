@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
 	dispatchSubagentEvent,
+	drainSubagentEventQueue,
+	requestSubagentAbort,
 	type SubagentDispatchHandle,
 	type SubagentDispatchOptions,
 } from "./dispatch-event.ts";
@@ -206,6 +208,86 @@ test("explicit abort fence settles native settlement without message_end", () =>
 	assert.equal(h.handle.processState, "alive");
 	assert.equal(h.handle.lastSettledRunId, 1);
 	assert.equal(h.settled, 1);
+});
+
+test("a bare production settlement consumes abort evidence after agent_end", () => {
+	const h = harness();
+	const aborted = assistant(4, "partial", "aborted");
+	assert.equal(
+		dispatchSubagentEvent(h.handle, { type: "agent_start", runId: 1 }, h.options),
+		true,
+	);
+	assert.equal(requestSubagentAbort(h.handle, 2), true);
+	emitMessage(h, aborted);
+	assert.equal(
+		dispatchSubagentEvent(
+			h.handle,
+			{ type: "agent_end", messages: [aborted], willRetry: false },
+			h.options,
+		),
+		true,
+	);
+	assert.equal(h.handle.abortRequestedAt, 2);
+	assert.equal(
+		dispatchSubagentEvent(h.handle, { type: "agent_settled" }, h.options),
+		true,
+	);
+	assert.equal(h.handle.runOutcome, "aborted");
+	assert.equal(h.handle.runState, "idle");
+	assert.equal(h.handle.abortRequestedAt, undefined);
+});
+
+test("abort evidence is not marked after a settled idle child", () => {
+	const h = harness();
+	completeRun(h, 1, "done");
+	assert.equal(requestSubagentAbort(h.handle, 2), false);
+	assert.equal(h.handle.abortRequestedAt, undefined);
+});
+
+test("dispatch callback failures become diagnostics instead of escaping", () => {
+	const h = harness();
+	let settledCallbacks = 0;
+	h.options.update = () => {
+		throw new Error("render failed");
+	};
+	h.options.onSettled = () => {
+		settledCallbacks++;
+		throw new Error("settlement callback failed");
+	};
+	assert.doesNotThrow(() => completeRun(h, 1, "done"));
+	assert.equal(settledCallbacks, 1);
+	assert.match(h.diagnostics.join("\n"), /callback failed/);
+});
+
+test("a bounded event drain retains failed records and continues later records", () => {
+	const queue = [
+		{ type: "first" },
+		{ type: "second" },
+		{ type: "third" },
+		{ type: "fourth" },
+	];
+	const seen: string[] = [];
+	let failFirst = true;
+	const diagnostics: string[] = [];
+	const delivered = drainSubagentEventQueue(
+		queue,
+		(record) => {
+			const type = String(record.type);
+			if (type === "first" && failFirst) {
+				failFirst = false;
+				throw new Error("consumer failed");
+			}
+			seen.push(type);
+		},
+		{ maxRecords: 3, diagnostic: (message) => diagnostics.push(message) },
+	);
+	assert.equal(delivered, 2);
+	assert.deepEqual(seen, ["second", "third"]);
+	assert.deepEqual(queue, [{ type: "fourth" }, { type: "first" }]);
+	assert.match(diagnostics[0] || "", /retained for retry/);
+	drainSubagentEventQueue(queue, (record) => seen.push(String(record.type)));
+	assert.deepEqual(seen, ["second", "third", "fourth", "first"]);
+	assert.deepEqual(queue, []);
 });
 
 test("an accepted abort fences a native assistant error before agent_settled", () => {

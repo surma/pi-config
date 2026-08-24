@@ -1,4 +1,5 @@
 import * as fs from "node:fs/promises";
+import { StringDecoder } from "node:string_decoder";
 import {
 	type Focusable,
 	Key,
@@ -102,10 +103,57 @@ type InspectorTheme = {
 	bg(color: "selectedBg", text: string): string;
 	bold(text: string): string;
 };
-type InspectorFiles = Pick<typeof fs, "readFile" | "stat">;
+type InspectorFiles = Pick<typeof fs, "open" | "stat">;
 
 const MAX_TRANSCRIPT_LINES = 400;
 const MAX_TRANSCRIPT_CHARS = 256 * 1024;
+const MAX_TRANSCRIPT_READ_BYTES = 512 * 1024;
+const MAX_PROMPT_READ_BYTES = 64 * 1024;
+
+interface BoundedTextRead {
+	text: string;
+	truncated: boolean;
+}
+
+/** Read only a bounded prefix or tail of a file before parsing its contents. */
+async function readBoundedText(
+	files: InspectorFiles,
+	path: string,
+	maxBytes: number,
+	fromEnd = false,
+): Promise<BoundedTextRead> {
+	let file: Awaited<ReturnType<typeof fs.open>> | undefined;
+	try {
+		file = await files.open(path, "r");
+		const stat = await file.stat();
+		const size = Number(stat.size);
+		if (!Number.isSafeInteger(size) || size < 0)
+			throw new Error("File size is invalid.");
+		const truncatedByStat = size > maxBytes;
+		const start = fromEnd ? Math.max(0, size - maxBytes) : 0;
+		const capacity = fromEnd && truncatedByStat ? maxBytes : maxBytes + 1;
+		const buffer = Buffer.allocUnsafe(capacity);
+		let bytesRead = 0;
+		while (bytesRead < capacity) {
+			const result = await file.read(
+				buffer,
+				bytesRead,
+				capacity - bytesRead,
+				start + bytesRead,
+			);
+			if (result.bytesRead <= 0) break;
+			bytesRead += result.bytesRead;
+		}
+		const truncated = truncatedByStat || bytesRead > maxBytes;
+		const used = buffer.subarray(0, Math.min(bytesRead, maxBytes));
+		return {
+			text: new StringDecoder("utf8").end(used),
+			truncated,
+		};
+	} finally {
+		await file?.close().catch(() => {});
+	}
+}
 
 /** Render untrusted text literally without allowing it to issue terminal controls. */
 export function sanitizeTerminalText(value: unknown): string {
@@ -137,25 +185,37 @@ function stateText(handle: InspectorHandle): string {
 
 function activityText(handle: InspectorHandle): string {
 	if (handle.lifecycle === "killing") return "killing";
+	if (handle.processState === "stopped") {
+		if (handle.state === "killed") return "killed";
+		if (handle.runOutcome === "failed") return "error";
+		return "stopped";
+	}
 	if (handle.currentTool) return `tool: ${handle.currentTool}`;
 	if (handle.isStreaming) return "responding";
-	if (handle.lifecycle === "retrying") return "retrying";
-	if (handle.lifecycle === "finishing") return "finishing";
-	if (handle.lastTool) return `tool: ${handle.lastTool}`;
-	if (handle.state === "done") return "final response";
-	if (handle.state === "error") return "error";
-	if (handle.state === "killed") return "killed";
+	if (handle.runState === "retrying") return "retrying";
+	if (handle.runState === "finishing") return "finishing";
+	if (handle.lastTool && handle.runState !== "idle")
+		return `tool: ${handle.lastTool}`;
+	if (handle.runState === "idle" && handle.runOutcome === "aborted")
+		return "aborted";
+	if (handle.runState === "idle" && handle.runOutcome === "failed")
+		return "error";
+	if (handle.runState === "idle" && handle.runOutcome === "succeeded")
+		return "final response";
 	return "idle";
 }
 
 function stateColor(handle: InspectorHandle): ThemeColor {
-	if (handle.state === "done") return "success";
-	if (handle.state === "error") return "error";
-	if (
-		handle.state === "killed" ||
-		handle.lifecycle === "retrying" ||
-		handle.lifecycle === "killing"
-	)
+	if (handle.processState === "stopped") {
+		if (handle.state === "killed") return "warning";
+		return handle.runOutcome === "failed" ? "error" : "success";
+	}
+	if (handle.runState === "idle") {
+		if (handle.runOutcome === "failed") return "error";
+		if (handle.runOutcome === "aborted") return "warning";
+		if (handle.runOutcome === "succeeded") return "success";
+	}
+	if (handle.lifecycle === "retrying" || handle.lifecycle === "killing")
 		return "warning";
 	return "accent";
 }
@@ -489,7 +549,7 @@ export class SubagentInspector implements Focusable {
 			);
 			const time = this.theme.fg(
 				"dim",
-				elapsed(handle.createdAt, handle.completedAt),
+				elapsed(handle.createdAt, handle.completedAt ?? handle.settledAt),
 			);
 			let row: string;
 			if (width < 52) {
@@ -865,7 +925,16 @@ export class SubagentInspector implements Focusable {
 	private async loadPrompt(path: string, generation: number): Promise<void> {
 		let content: string[];
 		try {
-			content = (await this.files.readFile(path, "utf8")).split("\n");
+			const snapshot = await readBoundedText(
+				this.files,
+				path,
+				MAX_PROMPT_READ_BYTES,
+			);
+			content = snapshot.text.split("\n");
+			if (snapshot.truncated)
+				content.push(
+					`… prompt truncated after ${MAX_PROMPT_READ_BYTES} bytes …`,
+				);
 		} catch (error) {
 			content = [
 				`No captured Pi effective system prompt yet (${error instanceof Error ? error.message : String(error)}).`,
@@ -886,6 +955,8 @@ export class SubagentInspector implements Focusable {
 		handle: InspectorHandle,
 		generation: number,
 	): Promise<void> {
+		if (this.disposed || generation !== this.requestGeneration || this.view !== "live")
+			return;
 		const path = handle.sessionPath;
 		const sinceLastRead =
 			Date.now() - (this.transcriptLastReadAt.get(path) ?? 0);
@@ -916,10 +987,28 @@ export class SubagentInspector implements Focusable {
 			) {
 				content = this.transcriptCache.lines;
 			} else {
-				const raw = await this.files.readFile(path, "utf8");
+				const snapshot = await readBoundedText(
+					this.files,
+					path,
+					MAX_TRANSCRIPT_READ_BYTES,
+					true,
+				);
+				let raw = snapshot.text;
+				const lines: string[] = [];
+				if (snapshot.truncated) {
+					const boundary = raw.indexOf("\n");
+					if (boundary < 0) {
+						lines.push(
+							"[bounded transcript tail contains no complete JSONL record]",
+						);
+						raw = "";
+					} else {
+						// The first tail fragment can start inside an older JSONL record.
+						raw = raw.slice(boundary + 1);
+					}
+				}
 				const records = raw.split("\n");
 				const partial = records.pop();
-				const lines: string[] = [];
 				for (const record of records) {
 					if (!record) continue;
 					try {
@@ -933,6 +1022,10 @@ export class SubagentInspector implements Focusable {
 				if (partial)
 					lines.push(`[partial JSONL record while Pi writes] ${partial}`);
 				const bounded = boundTranscript(lines);
+				if (snapshot.truncated)
+					bounded.unshift(
+						`… earlier transcript records omitted (inspector read the last ${MAX_TRANSCRIPT_READ_BYTES} bytes) …`,
+					);
 				content =
 					bounded.length > 0 ? bounded : ["No persisted transcript yet."];
 				this.transcriptCache = {
@@ -967,11 +1060,11 @@ export class SubagentInspector implements Focusable {
 
 	private reconcileRefreshTimer(): void {
 		if (this.disposed) return;
-		const active = this.callbacks
-			.getHandles()
-			.some(
-				(handle) => handle.state === "starting" || handle.state === "running",
-			);
+		const active = this.callbacks.getHandles().some(
+			(handle) =>
+				handle.processState === "alive" &&
+				(handle.state === "starting" || handle.runState !== "idle"),
+		);
 		if (active && !this.refreshTimer) {
 			this.refreshTimer = setInterval(() => {
 				if (this.disposed) return;

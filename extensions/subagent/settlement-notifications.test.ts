@@ -44,7 +44,7 @@ test("one accepted settlement sends one exact steering wake", async () => {
 	});
 	assert.equal(
 		sent[0]?.message.content,
-		"Subagent a reached idle after run 1. Check subagent_status with messages=3.",
+		"Subagent a reached idle after run 1. Check subagent_status with numMessages=3.",
 	);
 	assert.deepEqual(sent[0]?.message.details.settlements, [settlement]);
 });
@@ -69,15 +69,15 @@ test("nearby settlements each send one wake with complete details", async () => 
 		]),
 		[
 			[
-				"Subagent a reached idle after run 1. Check subagent_status with messages=3.",
+				"Subagent a reached idle after run 1. Check subagent_status with numMessages=3.",
 				record("a", 1, "failed"),
 			],
 			[
-				"Subagent b reached idle after run 1. Check subagent_status with messages=3.",
+				"Subagent b reached idle after run 1. Check subagent_status with numMessages=3.",
 				record("b", 1, "aborted"),
 			],
 			[
-				"Subagent a reached idle after run 2. Check subagent_status with messages=3.",
+				"Subagent a reached idle after run 2. Check subagent_status with numMessages=3.",
 				record("a", 2, "succeeded"),
 			],
 		],
@@ -179,6 +179,30 @@ test("persistent send failure is bounded and duplicate records stay suppressed",
 	queue.queue(settlement);
 	await delay(25);
 	assert.equal(attempts, 2);
+});
+
+test("notification flushes yield after a bounded batch", async () => {
+	const sent: SettlementCustomMessage[] = [];
+	let releaseFirstBatch!: () => void;
+	let firstBatchReached!: () => void;
+	const firstBatch = new Promise<void>((resolve) => {
+		firstBatchReached = resolve;
+	});
+	const queue = new SettlementNotificationQueue((message) => {
+		sent.push(message);
+		if (sent.length !== 32) return;
+		firstBatchReached();
+		return new Promise<void>((resolve) => {
+			releaseFirstBatch = resolve;
+		});
+	});
+	for (let index = 1; index <= 40; index++)
+		queue.queue(record(`batch-${index}`, index));
+	await firstBatch;
+	assert.equal(sent.length, 32);
+	releaseFirstBatch();
+	await delay(25);
+	assert.equal(sent.length, 40);
 });
 
 test("invalid events, ineligible records, and suppressed records never wake the owner", async () => {
