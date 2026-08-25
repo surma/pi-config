@@ -20,8 +20,6 @@ export type OutputStatus =
 export type OutputWriteStatus = Exclude<OutputStatus, "pending">;
 
 export const MAX_OUTPUT_ERROR_BYTES = 2 * 1024;
-/** Caller output is rejected before filesystem work when it exceeds this bound. */
-export const MAX_OUTPUT_CONTENT_BYTES = 8 * 1024 * 1024;
 export const MAX_OUTPUT_PATH_BYTES = 16 * 1024;
 const OUTPUT_ERROR_TRUNCATION_MARKER = "… [caller output error truncated] …";
 const DEFAULT_OPERATION_TIMEOUT_MS = 5_000;
@@ -51,7 +49,6 @@ export interface OutputWriteOptions {
 	/** Total deadline for output preparation, publication, and cleanup. */
 	timeoutMs?: number;
 	signal?: AbortSignal;
-	maxContentBytes?: number;
 	io?: Partial<OutputFileSystem>;
 }
 
@@ -225,18 +222,6 @@ export async function writeCallerOutput(
 			error: "The caller output content must be a string.",
 		};
 	}
-	const maxContentBytes = Math.min(
-		MAX_OUTPUT_CONTENT_BYTES,
-		positiveLimit(options.maxContentBytes, MAX_OUTPUT_CONTENT_BYTES),
-	);
-	if (Buffer.byteLength(request.content, "utf8") > maxContentBytes) {
-		return {
-			status: "failed",
-			path,
-			error: `The caller output content exceeds ${maxContentBytes} bytes.`,
-		};
-	}
-
 	const parent = dirname(path);
 	const io = mergedIo(options);
 	const deadline = Date.now() + positiveLimit(options.timeoutMs, DEFAULT_OPERATION_TIMEOUT_MS);

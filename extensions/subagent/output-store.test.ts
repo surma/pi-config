@@ -4,7 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
-	MAX_OUTPUT_CONTENT_BYTES,
 	MAX_OUTPUT_ERROR_BYTES,
 	writeCallerOutput,
 } from "./output-store.ts";
@@ -97,15 +96,14 @@ test("an empty caller path is a failed request, not an implicit output", async (
 	});
 });
 
-test("oversized caller content is rejected before filesystem work", async () => {
+test("caller output larger than eight MiB is published exactly", async () => {
 	const directory = await temporaryDirectory();
-	const path = join(directory, "too-large.txt");
-	const result = await writeCallerOutput({
-		path,
-		content: "x".repeat(MAX_OUTPUT_CONTENT_BYTES + 1),
-	});
-	assert.equal(result.status, "failed");
-	assert.equal((await readdir(directory)).length, 0);
+	const path = join(directory, "large.txt");
+	const formerLimit = 8 * 1024 * 1024;
+	const content = "x".repeat(formerLimit + 1);
+	const result = await writeCallerOutput({ path, content });
+	assert.deepEqual(result, { status: "written", path });
+	assert.equal(await readFile(path, "utf8"), content);
 });
 
 test("filesystem waits return a failed status before they can hold the caller", async () => {

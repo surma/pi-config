@@ -521,6 +521,56 @@ async function scenarioAbortOrder(slow: boolean): Promise<Record<string, unknown
 	}
 }
 
+async function scenarioLargeAgentEnd(): Promise<Record<string, unknown>> {
+	let runtime: DriverRuntime | undefined;
+	try {
+		runtime = await createRuntime({ mode: "large-agent-end" });
+		const outputPath = join(runtime.root, "large-agent-end.md");
+		const started = await call(runtime, "subagent_start", {
+			task: "large agent end",
+			model: "provider/model",
+			thinking: "off",
+			outputPath,
+		});
+		const childId = handleId(started);
+		let current: TestResult | undefined;
+		await waitFor(
+			async () => {
+				current = await status(runtime!, childId);
+				return (
+					current.details.settlement.status === "settled" &&
+					current.details.output.status === "written" &&
+					runtime!.sent.length === 1
+				);
+			},
+			5_000,
+			"large agent_end settlement",
+		);
+		assert.ok(current);
+		assert.equal(current.details.processState, "alive");
+		assert.equal(current.details.runState, "idle");
+		assert.equal(current.details.runOutcome, "succeeded");
+		assert.equal(current.details.lastSettledRunId, 1);
+		assert.equal(current.details.settlement.status, "settled");
+		assert.equal(current.details.output.status, "written");
+		assert.equal(await readFile(outputPath, "utf8"), "result-1 large agent end");
+		assert.equal(runtime.sent.length, 1);
+		assert.equal(runtime.sent[0]?.message?.details?.runId, 1);
+		assert.ok(
+			!((current.details.diagnostics || []) as string[]).some((message) =>
+				message.includes("oversized RPC JSONL record"),
+			),
+		);
+		return {
+			settled: true,
+			wakeCount: runtime.sent.length,
+			output: current.details.output.status,
+		};
+	} finally {
+		await cleanup(runtime);
+	}
+}
+
 async function scenarioStreamFlood(): Promise<Record<string, unknown>> {
 	let runtime: DriverRuntime | undefined;
 	let watcher: ReturnType<typeof watch> | undefined;
@@ -682,7 +732,7 @@ async function directTransport(
 		requestTimeoutMs: 150,
 	});
 	try {
-		await waitFor(() => fileContains(markerPath, mode === "huge-record" ? "huge-record-sent" : "stdin-paused"), 2_000, `${mode} marker`);
+		await waitFor(() => fileContains(markerPath, mode === "unterminated-record" ? "unterminated-record-sent" : "stdin-paused"), 2_000, `${mode} marker`);
 		return {
 			...(await configure(child, transport, diagnostics)),
 			diagnostics,
@@ -702,12 +752,12 @@ async function directTransport(
 	}
 }
 
-async function scenarioRpcBuffer(): Promise<Record<string, unknown>> {
-	return directTransport("huge-record", async (_child, _transport, diagnostics) => {
+async function scenarioUnterminatedRpcRecord(): Promise<Record<string, unknown>> {
+	return directTransport("unterminated-record", async (_child, _transport, diagnostics) => {
 		await waitFor(
-			() => diagnostics.some((message) => message.includes("Discarded oversized unterminated RPC JSONL record.")),
+			() => diagnostics.some((message) => message.includes("Discarded unterminated RPC JSONL record.")),
 			800,
-			"oversized RPC discard diagnostic",
+			"unterminated RPC discard diagnostic",
 		);
 		return { discarded: true };
 	});
@@ -1158,14 +1208,16 @@ async function run(): Promise<Record<string, unknown>> {
 			return scenarioAbortOrder(false);
 		case "abort-order-slow":
 			return scenarioAbortOrder(true);
+		case "large-agent-end":
+			return scenarioLargeAgentEnd();
 		case "stream-flood":
 			return scenarioStreamFlood();
 		case "persistence-flood":
 			return scenarioPersistenceFlood();
 		case "active-child-limit":
 			return scenarioActiveLimit();
-		case "rpc-buffer-limit":
-			return scenarioRpcBuffer();
+		case "rpc-unterminated-record":
+			return scenarioUnterminatedRpcRecord();
 		case "backpressure":
 			return scenarioBackpressure();
 		case "reload-queue":
