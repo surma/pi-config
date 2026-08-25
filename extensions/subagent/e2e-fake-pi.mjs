@@ -75,9 +75,9 @@ if (mode === "pause-stdin") {
   process.stdin.pause();
   mark("stdin-paused");
 }
-if (mode === "huge-record") {
+if (mode === "unterminated-record") {
   process.stdout.write("x".repeat(5 * 1024 * 1024));
-  mark("huge-record-sent");
+  mark("unterminated-record-sent");
   process.stdout.end();
 }
 if (mode === "large-transcript" && sessionFile) {
@@ -143,7 +143,17 @@ function settleRun(runId, text, outcome = "succeeded") {
   });
   output({ type: "message_end", message: assistant });
   appendSession({ role: "assistant", content: [{ type: "text", text }] });
-  output({ type: "agent_end", messages: [assistant], willRetry: false });
+  const messages = mode === "large-agent-end"
+    ? [
+        {
+          role: "user",
+          content: [{ type: "text", text: "x".repeat(3 * 1024 * 1024) }],
+          timestamp: 999,
+        },
+        assistant,
+      ]
+    : [assistant];
+  output({ type: "agent_end", messages, willRetry: false });
   output({ type: "agent_settled" });
   activeRun = undefined;
 }
@@ -365,7 +375,7 @@ process.on("SIGTERM", () => process.exit(0));
 process.on("SIGINT", () => process.exit(0));
 
 // Keep intentionally stalled modes alive until bounded transport cleanup kills them.
-if (mode === "huge-record" || mode === "pause-stdin") {
+if (mode === "unterminated-record" || mode === "pause-stdin") {
   // Keep the stalled child alive until the transport cleanup path kills it.
   setInterval(() => {}, 1_000);
 }

@@ -102,6 +102,8 @@ The child does not persist a second copy of settled assistant output. The durabl
 
 The transport uses strict LF-only JSONL framing. It strips one optional trailing carriage return from each record.
 
+The transport accepts complete inbound records without a size limit. Native Pi defines no maximum, and `agent_end` can contain all run messages.
+
 It uses UTF-8 decoding that supports a character split across stream chunks. Unicode line separators inside JSON strings do not split records.
 
 Requests receive generated IDs. The transport resolves responses by ID, so responses can arrive out of order. Events remain asynchronous and pass to the lifecycle dispatcher.
@@ -196,6 +198,8 @@ Transcript text and file presence do not prove that a run settled.
 ## Caller output
 
 `subagent_start` accepts an optional `outputPath`. A relative path resolves against the caller session current working directory.
+
+The publisher accepts the complete captured text without a content-size limit.
 
 On settlement, the parent writes the final captured assistant text to that path without delaying event handling or wake queueing:
 

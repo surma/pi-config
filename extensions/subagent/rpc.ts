@@ -22,8 +22,6 @@ export interface RpcProcessClose {
 	forced?: boolean;
 }
 
-/** Maximum retained bytes for one native RPC JSONL record. */
-export const MAX_RPC_RECORD_BYTES = 2 * 1024 * 1024;
 /** Maximum serialized size of one outbound RPC request. */
 export const MAX_RPC_REQUEST_BYTES = 1 * 1024 * 1024;
 /** Maximum serialized bytes retained by pending outbound RPC requests. */
@@ -34,7 +32,6 @@ const DEFAULT_WRITE_TIMEOUT_MS = 5_000;
 const MAX_PENDING_REQUESTS = 128;
 
 export interface RpcJsonlFramerOptions {
-	maxRecordBytes?: number;
 	onDiagnostic?: (message: string) => void;
 }
 
@@ -190,18 +187,11 @@ function writeWithBackpressure(
 /** Strict LF-only JSONL framing for the Pi RPC protocol. */
 export class RpcJsonlFramer {
 	private readonly decoder = new StringDecoder("utf8");
-	private readonly maxRecordBytes: number;
 	private readonly onDiagnostic?: (message: string) => void;
 	private lineParts: string[] = [];
-	private lineBytes = 0;
 	private lineHasContent = false;
-	private discardingOversizedLine = false;
 
 	constructor(options: RpcJsonlFramerOptions = {}) {
-		this.maxRecordBytes = Math.min(
-			MAX_RPC_RECORD_BYTES,
-			positiveTimeout(options.maxRecordBytes, MAX_RPC_RECORD_BYTES),
-		);
 		this.onDiagnostic = options.onDiagnostic;
 	}
 
@@ -217,13 +207,8 @@ export class RpcJsonlFramer {
 		const lines: string[] = [];
 		const decoded = this.decoder.end();
 		if (decoded) this.consume(decoded, lines);
-		if (this.lineHasContent || this.lineParts.length || this.discardingOversizedLine) {
-			if (this.discardingOversizedLine) {
-				safeDiagnostic(this.onDiagnostic, "Discarded oversized unterminated RPC JSONL record.");
-			} else {
-				safeDiagnostic(this.onDiagnostic, "Discarded unterminated RPC JSONL record.");
-			}
-		}
+		if (this.lineHasContent || this.lineParts.length)
+			safeDiagnostic(this.onDiagnostic, "Discarded unterminated RPC JSONL record.");
 		this.resetLine();
 		return lines;
 	}
@@ -245,25 +230,11 @@ export class RpcJsonlFramer {
 	private append(segment: string): void {
 		if (!segment) return;
 		this.lineHasContent = true;
-		if (this.discardingOversizedLine) return;
-		const bytes = Buffer.byteLength(segment, "utf8");
-		if (this.lineBytes + bytes > this.maxRecordBytes) {
-			this.discardingOversizedLine = true;
-			this.lineParts = [];
-			this.lineBytes = 0;
-			return;
-		}
 		this.lineParts.push(segment);
-		this.lineBytes += bytes;
 	}
 
 	private finishLine(lines: string[]): void {
-		if (this.discardingOversizedLine) {
-			safeDiagnostic(
-				this.onDiagnostic,
-				`Discarded oversized RPC JSONL record exceeding ${this.maxRecordBytes} bytes.`,
-			);
-		} else if (this.lineHasContent) {
+		if (this.lineHasContent) {
 			let line = this.lineParts.join("");
 			if (line.endsWith("\r")) line = line.slice(0, -1);
 			lines.push(line);
@@ -273,9 +244,7 @@ export class RpcJsonlFramer {
 
 	private resetLine(): void {
 		this.lineParts = [];
-		this.lineBytes = 0;
 		this.lineHasContent = false;
-		this.discardingOversizedLine = false;
 	}
 }
 
@@ -332,7 +301,6 @@ export interface RpcChildTransportOptions {
 	onClose: (close: RpcProcessClose) => void;
 	requestTimeoutMs?: number;
 	writeTimeoutMs?: number;
-	maxRecordBytes?: number;
 	maxRequestBytes?: number;
 	maxPendingRequests?: number;
 	maxPendingBytes?: number;
@@ -425,7 +393,6 @@ export class RpcChildTransport {
 					process.stdout,
 					(line) => this.handleLine(line),
 					{
-						maxRecordBytes: options.maxRecordBytes,
 						onDiagnostic: (message) => this.safeDiagnostic(message),
 					},
 				)
@@ -512,13 +479,8 @@ export class RpcChildTransport {
 			throw asError(error);
 		}
 		const encodedBytes = Buffer.byteLength(encoded, "utf8");
-		const maxRecordBytes = Math.min(
-			MAX_RPC_RECORD_BYTES,
-			positiveTimeout(this.options.maxRecordBytes, MAX_RPC_RECORD_BYTES),
-		);
-		const maxRequestBytes = Math.min(maxRecordBytes, this.maxRequestBytes);
-		if (encodedBytes > maxRequestBytes)
-			throw new Error(`RPC request exceeds ${maxRequestBytes} bytes.`);
+		if (encodedBytes > this.maxRequestBytes)
+			throw new Error(`RPC request exceeds ${this.maxRequestBytes} bytes.`);
 		if (this.pendingBytes + encodedBytes > this.maxPendingBytes)
 			throw new Error(
 				`RPC request queue is full at ${this.maxPendingBytes} pending bytes.`,

@@ -152,16 +152,27 @@ test("malformed JSONL is diagnosed while valid records continue", async () => {
 	fixture.rpc.forceClose({ code: null, signal: "SIGKILL" });
 });
 
-test("oversized RPC records are discarded while later records remain readable", () => {
-	const diagnostics: string[] = [];
-	const framer = new RpcJsonlFramer({
-		maxRecordBytes: 32,
-		onDiagnostic: (message) => diagnostics.push(message),
-	});
-	const lines = framer.push(`${"x".repeat(128)}\n{"type":"later"}\n`);
-	assert.deepEqual(lines, ['{"type":"later"}']);
-	assert.equal(diagnostics.length, 1);
-	assert.match(diagnostics[0] || "", /oversized/);
+test("RPC transport delivers complete records larger than two MiB", async () => {
+	const fixture = transport();
+	const formerLimit = 2 * 1024 * 1024;
+	const text = "x".repeat(formerLimit + 1);
+	const record = {
+		type: "agent_end",
+		messages: [{ role: "assistant", content: [{ type: "text", text }] }],
+		willRetry: false,
+	};
+	const encoded = Buffer.from(`${JSON.stringify(record)}\n`);
+	assert.ok(encoded.byteLength > formerLimit);
+	const split = 1024 * 1024;
+	fixture.child.stdout.write(encoded.subarray(0, split));
+	fixture.child.stdout.write(encoded.subarray(split));
+	await tick();
+	assert.equal(fixture.records.length, 1);
+	assert.equal(fixture.records[0]?.type, "agent_end");
+	const messages = fixture.records[0]?.messages as Array<Record<string, any>>;
+	assert.equal(messages[0]?.content?.[0]?.text, text);
+	assert.deepEqual(fixture.diagnostics, []);
+	fixture.rpc.forceClose({ code: null, signal: "SIGKILL" });
 });
 
 test("correlated responses resolve out of order", async () => {
