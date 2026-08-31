@@ -6,9 +6,11 @@ import { readReserveTokens } from "./lib/compaction-settings.js";
 const ENTRY_CONFIG = "token-window-reminder-config";
 const ENTRY_REMINDER = "token-window-reminder-fired";
 const ENTRY_RESET = "token-window-reminder-reset";
-const ENTRY_HANDOFF_SUMMARY = "token-window-reminder-handoff-summary";
 
 const DEFAULT_ENABLED = true;
+const MAX_HANDOFF_OUTPUT_TOKENS = 16_275;
+// Keep four times the observed maximum output available for the handoff call.
+const MIN_HANDOFF_HEADROOM_TOKENS = MAX_HANDOFF_OUTPUT_TOKENS * 4;
 
 const AUTHORIZATION_GRANTS_DESCRIPTION = [
 	"Provide the complete closed list of authorization grants that survives this compaction boundary.",
@@ -85,25 +87,25 @@ const KEY_CONTEXT_DESCRIPTION = [
 // Editable knobs
 // =============================================================================
 //
-// Reminders fire on a STAGGERED LADDER anchored at pi's compaction point and
-// climbing into the reserve toward the hard context limit. Each rung escalates
-// the wording, pushing the model harder to stop and hand control back.
+// Reminders fire on a STAGGERED LADDER anchored at the effective compaction
+// point and climbing into the reserve toward the hard context limit. Each rung
+// escalates the wording, pushing the model harder to stop and hand control back.
 //
 // Why anchor at the compaction point (and not earlier): pi can only auto-compact
 // (summarize) at an agent-run boundary — once the model yields back to the user
 // (agent_end), never between tool turns and not while it is being steered. Below
 // the compaction point there is nothing useful to do: pi won't compact and there
-// is headroom. The FIRST reminder fires the moment usage crosses pi's compaction
-// point (`contextWindow - reserveTokens`) — the exact point pi *would* compact if
-// the model yielded. If the model keeps working instead, it eats into the reserve
-// pi holds for its response; the next two rungs escalate as it heads toward
-// running out of context entirely.
+// is headroom. The FIRST reminder fires at the effective compaction point
+// (`contextWindow - reserveTokens`). If the model keeps working instead, it eats
+// into the reserve pi holds for its response; the next two rungs escalate as it
+// heads toward running out of context entirely.
 //
 // Rungs are positioned by how far INTO THE RESERVE usage has pushed past the
 // compaction point: `reserveFraction` is the fraction of `reserveTokens` consumed
 // beyond `contextWindow - reserveTokens`. So 0.0 == exactly at the compaction
 // point and 1.0 == the full context window. `reserveTokens` is read from pi's
-// global settings (see ./lib/compaction-settings) so this tracks pi automatically.
+// global settings (see ./lib/compaction-settings), with an extension-side floor
+// so the handoff call always has enough headroom.
 //
 // Each rung carries an `escalation` line, appended on top of every lower rung's
 // line once usage reaches it, so urgency builds cumulatively and tracks the
@@ -116,12 +118,12 @@ const REMINDER_LADDER: readonly { reserveFraction: number; escalation: string }[
 			"When you reach a natural stopping point, call the `compaction_handoff` tool to record a thorough hand-off and end your turn so the next model call can resume from it.",
 	},
 	{
-		reserveFraction: 0.5,
+		reserveFraction: 0.25,
 		escalation:
 			"You are now past the compaction point and eating into the reserve pi keeps for its own response. Wrap up the current step and call `compaction_handoff` now rather than starting new work.",
 	},
 	{
-		reserveFraction: 0.85,
+		reserveFraction: 0.5,
 		escalation:
 			"URGENT: you are about to run out of context entirely. Call `compaction_handoff` immediately and stop — do not begin anything new. Yielding is the only thing that lets the next model call recover the window.",
 	},
@@ -129,6 +131,10 @@ const REMINDER_LADDER: readonly { reserveFraction: number; escalation: string }[
 
 function formatPercent(percent: number): string {
 	return Number.isInteger(percent) ? `${percent}%` : `${percent.toFixed(1)}%`;
+}
+
+function effectiveReserveTokens(): number {
+	return Math.max(readReserveTokens(), MIN_HANDOFF_HEADROOM_TOKENS);
 }
 
 // reserveFraction 0 == pi's compaction point (contextWindow - reserveTokens),
@@ -171,7 +177,7 @@ function renderWarning(rungIndex: number, usage: UsageInfo): string {
 	const remaining = Math.round(usage.tokensToFull).toLocaleString();
 	const lines = [
 		"<system_reminder>",
-		`Your context has reached pi's compaction point: now at ${usageLabel(usage)}, ~${remaining} tokens before the window is full. The live model context can reset only once you hand control back to the user — it cannot reset while you keep working or are being steered. Hand off via the \`compaction_handoff\` tool: it records a thorough hand-off (your goal, current work, next steps, and every key decision, file path, and fact needed to resume), then the next model call starts from those notes and drops the earlier transcript. Be complete, not terse — a future instance with no memory of this session depends entirely on it.`,
+		`Your context has reached the effective compaction point: now at ${usageLabel(usage)}, ~${remaining} tokens before the window is full. The live model context can reset only once you hand control back to the user — it cannot reset while you keep working or are being steered. Hand off via the \`compaction_handoff\` tool: it records a thorough hand-off (your goal, current work, next steps, and every key decision, file path, and fact needed to resume), then the next model call starts from those notes and drops the earlier transcript. Be complete, not terse — a future instance with no memory of this session depends entirely on it.`,
 	];
 	for (let i = 0; i <= rungIndex; i++) {
 		lines.push("", REMINDER_LADDER[i].escalation);
@@ -180,7 +186,7 @@ function renderWarning(rungIndex: number, usage: UsageInfo): string {
 	return lines.join("\n");
 }
 
-// Sent once after native or virtual compaction frees the context back up, so the model stops
+// Sent once after native compaction frees the context back up, so the model stops
 // acting on the earlier hand-off / yield reminders. Edit the wording freely.
 function renderRecovery(usage: UsageInfo): string {
 	return `<system_reminder>
@@ -296,8 +302,12 @@ type HandoffToolCall = {
 
 type HandoffBoundary = HandoffToolCall & {
 	assistantIndex: number;
-	tailStart: number;
-	timestamp: number;
+};
+
+type NativeHandoffBoundary = HandoffToolCall & {
+	// Absent when nothing follows the handoff tool result. The caller then falls
+	// back to the entry pi already picked in its compaction preparation.
+	firstKeptEntryId?: string;
 };
 
 function shouldContinueHandoff(value: unknown): boolean {
@@ -359,13 +369,75 @@ function findLatestSuccessfulHandoff(messages: readonly unknown[]): HandoffBound
 		for (let callIndex = calls.length - 1; callIndex >= 0; callIndex--) {
 			const call = calls[callIndex];
 			if (!successfulIds.has(call.id)) continue;
-			const timestamp = (messages[assistantIndex] as { timestamp?: unknown }).timestamp;
 			return {
 				...call,
 				assistantIndex,
-				tailStart,
-				timestamp: typeof timestamp === "number" ? timestamp : Date.now(),
 			};
+		}
+	}
+	return undefined;
+}
+
+function findLatestSuccessfulHandoffInBranch(entries: readonly unknown[]): NativeHandoffBoundary | undefined {
+	let latestCompactionIndex = -1;
+	for (let i = entries.length - 1; i >= 0; i--) {
+		const entry = entries[i];
+		if (entry && typeof entry === "object" && (entry as { type?: unknown }).type === "compaction") {
+			latestCompactionIndex = i;
+			break;
+		}
+	}
+
+	for (let assistantIndex = entries.length - 1; assistantIndex > latestCompactionIndex; assistantIndex--) {
+		const assistantEntry = entries[assistantIndex];
+		if (
+			!assistantEntry ||
+			typeof assistantEntry !== "object" ||
+			(assistantEntry as { type?: unknown }).type !== "message"
+		) {
+			continue;
+		}
+		const calls = handoffToolCalls((assistantEntry as { message?: unknown }).message);
+		if (calls.length === 0) continue;
+
+		const successfulIds = new Set<string>();
+		let tailStart = assistantIndex + 1;
+		while (tailStart < entries.length) {
+			const resultEntry = entries[tailStart];
+			if (
+				!resultEntry ||
+				typeof resultEntry !== "object" ||
+				(resultEntry as { type?: unknown }).type !== "message"
+			) {
+				break;
+			}
+			const message = (resultEntry as { message?: unknown }).message;
+			if (!message || typeof message !== "object" || (message as { role?: unknown }).role !== "toolResult") {
+				break;
+			}
+			const result = message as { toolCallId?: unknown; toolName?: unknown; isError?: unknown };
+			if (
+				result.toolName === "compaction_handoff" &&
+				result.isError === false &&
+				typeof result.toolCallId === "string"
+			) {
+				successfulIds.add(result.toolCallId);
+			}
+			tailStart++;
+		}
+
+		for (let callIndex = calls.length - 1; callIndex >= 0; callIndex--) {
+			const call = calls[callIndex];
+			if (!successfulIds.has(call.id)) continue;
+			// The handoff terminates the turn, so it is often the last entry in the
+			// branch. Leave firstKeptEntryId unset in that case rather than dropping
+			// the handoff: a valid handoff must always produce compaction content.
+			const firstKeptEntry = entries[tailStart];
+			const firstKeptEntryId =
+				firstKeptEntry && typeof firstKeptEntry === "object"
+					? (firstKeptEntry as { id?: unknown }).id
+					: undefined;
+			return typeof firstKeptEntryId === "string" ? { ...call, firstKeptEntryId } : { ...call };
 		}
 	}
 	return undefined;
@@ -471,7 +543,7 @@ function formatStatus(
 		"Token-window reminders",
 		`Status: ${enabled ? "on" : "off"}`,
 		thresholdsText,
-		`Reserve tokens (from settings): ${reserveTokens.toLocaleString()}`,
+		`Reserve tokens (effective): ${reserveTokens.toLocaleString()}`,
 		`Current context usage: ${usageText}`,
 		`Highest rung warned this episode: ${lastText}`,
 		"",
@@ -486,12 +558,12 @@ function formatStatus(
 
 export default function tokenWindowReminder(pi: ExtensionAPI) {
 	let enabled = DEFAULT_ENABLED;
-	// Read from pi's global settings (fail-safe default) and refreshed on every
-	// branch rebuild so the compaction point always matches pi's actual point.
-	let reserveTokens = readReserveTokens();
+	// Read from pi's global settings (fail-safe default) with an extension-side
+	// floor, and refresh on every branch rebuild.
+	let reserveTokens = effectiveReserveTokens();
 	// Index of the highest ladder rung already warned this episode; undefined == none.
-	// Re-armed only by native/virtual compaction, a config change, a reset, or a
-	// branch rebuild — never by usage merely dipping below a rung, so jitter around
+	// Re-armed only by native compaction, a config change, a reset, or a branch
+	// rebuild — never by usage merely dipping below a rung, so jitter around
 	// a threshold can never re-fire the same warning.
 	let lastWarnedRung: number | undefined;
 	// Set when compaction drops usage after we had warned, so the next turn can
@@ -527,7 +599,7 @@ export default function tokenWindowReminder(pi: ExtensionAPI) {
 	}
 
 	function rebuildFromBranch(ctx: ExtensionContext): void {
-		reserveTokens = readReserveTokens();
+		reserveTokens = effectiveReserveTokens();
 		enabled = DEFAULT_ENABLED;
 		lastWarnedRung = undefined;
 		recoveryPending = false;
@@ -537,7 +609,7 @@ export default function tokenWindowReminder(pi: ExtensionAPI) {
 
 		for (const entry of ctx.sessionManager.getBranch()) {
 			if (entry.type === "compaction") {
-				// Native compaction supersedes any earlier virtual boundary.
+				// Native compaction supersedes any earlier handoff boundary.
 				lastWarnedRung = undefined;
 				recoveryPending = false;
 				handoffAwaitingFreshUsage = false;
@@ -629,7 +701,7 @@ export default function tokenWindowReminder(pi: ExtensionAPI) {
 		// Announce recovery once usage is known again after a compaction dropped it.
 		if (recoveryPending) {
 			recoveryPending = false;
-			// Rung 0 sits exactly at pi's compaction point.
+			// Rung 0 sits exactly at the effective compaction point.
 			const compactionPoint = rungThresholdTokens(REMINDER_LADDER[0].reserveFraction, contextWindow, reserveTokens);
 			if (tokens < compactionPoint) {
 				lastWarnedRung = undefined;
@@ -642,7 +714,7 @@ export default function tokenWindowReminder(pi: ExtensionAPI) {
 
 		const rungIndex = highestRungAtOrBelow(tokens, contextWindow, reserveTokens);
 		// Below the compaction point. Do NOT re-arm here — re-arming only on native
-		// or virtual compaction is what keeps jitter around a threshold from re-firing.
+		// compaction is what keeps jitter around a threshold from re-firing.
 		if (rungIndex < 0) return;
 		if (lastWarnedRung !== undefined && rungIndex <= lastWarnedRung) return;
 
@@ -702,7 +774,7 @@ export default function tokenWindowReminder(pi: ExtensionAPI) {
 			continue: Type.Optional(
 				Type.Boolean({
 					default: true,
-					description: "Whether Pi should automatically send `continue` after the virtual reset.",
+					description: "Whether Pi should automatically send `continue` after compaction.",
 				}),
 			),
 		}),
@@ -773,25 +845,6 @@ export default function tokenWindowReminder(pi: ExtensionAPI) {
 		},
 	});
 
-	pi.on("context", async (event) => {
-		const handoff = findLatestSuccessfulHandoff(event.messages);
-		if (!handoff) return;
-
-		return {
-			messages: [
-				{
-					role: "custom",
-					customType: ENTRY_HANDOFF_SUMMARY,
-					content: renderHandoffCompactionSummary(handoff.notes, Math.max(1, handoffGeneration)),
-					display: false,
-					details: { source: "compaction_handoff", toolCallId: handoff.id },
-					timestamp: handoff.timestamp,
-				},
-				...event.messages.slice(handoff.tailStart),
-			],
-		};
-	});
-
 	pi.on("turn_end", async (event, ctx) => {
 		const completedHandoff = findLatestSuccessfulHandoff([event.message, ...event.toolResults]);
 		if (completedHandoff?.assistantIndex === 0) {
@@ -822,9 +875,17 @@ export default function tokenWindowReminder(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_before_compact", async (event) => {
-		// Own normal threshold compaction so it cannot race the virtual handoff.
-		// Explicit /compact and overflow recovery remain available as escape hatches.
-		if (event.reason === "threshold") return { cancel: true };
+		const handoff = findLatestSuccessfulHandoffInBranch(event.branchEntries);
+		if (!handoff) return;
+
+		return {
+			compaction: {
+				summary: renderHandoffCompactionSummary(handoff.notes, Math.max(1, handoffGeneration)),
+				firstKeptEntryId: handoff.firstKeptEntryId ?? event.preparation.firstKeptEntryId,
+				tokensBefore: event.preparation.tokensBefore,
+				details: { source: "compaction_handoff", toolCallId: handoff.id },
+			},
+		};
 	});
 
 	pi.on("session_compact", async (_event, _ctx) => {
