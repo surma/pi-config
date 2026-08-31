@@ -305,7 +305,9 @@ type HandoffBoundary = HandoffToolCall & {
 };
 
 type NativeHandoffBoundary = HandoffToolCall & {
-	firstKeptEntryId: string;
+	// Absent when nothing follows the handoff tool result. The caller then falls
+	// back to the entry pi already picked in its compaction preparation.
+	firstKeptEntryId?: string;
 };
 
 function shouldContinueHandoff(value: unknown): boolean {
@@ -427,11 +429,15 @@ function findLatestSuccessfulHandoffInBranch(entries: readonly unknown[]): Nativ
 		for (let callIndex = calls.length - 1; callIndex >= 0; callIndex--) {
 			const call = calls[callIndex];
 			if (!successfulIds.has(call.id)) continue;
+			// The handoff terminates the turn, so it is often the last entry in the
+			// branch. Leave firstKeptEntryId unset in that case rather than dropping
+			// the handoff: a valid handoff must always produce compaction content.
 			const firstKeptEntry = entries[tailStart];
-			if (!firstKeptEntry || typeof firstKeptEntry !== "object") return undefined;
-			const firstKeptEntryId = (firstKeptEntry as { id?: unknown }).id;
-			if (typeof firstKeptEntryId !== "string") return undefined;
-			return { ...call, firstKeptEntryId };
+			const firstKeptEntryId =
+				firstKeptEntry && typeof firstKeptEntry === "object"
+					? (firstKeptEntry as { id?: unknown }).id
+					: undefined;
+			return typeof firstKeptEntryId === "string" ? { ...call, firstKeptEntryId } : { ...call };
 		}
 	}
 	return undefined;
@@ -875,7 +881,7 @@ export default function tokenWindowReminder(pi: ExtensionAPI) {
 		return {
 			compaction: {
 				summary: renderHandoffCompactionSummary(handoff.notes, Math.max(1, handoffGeneration)),
-				firstKeptEntryId: handoff.firstKeptEntryId,
+				firstKeptEntryId: handoff.firstKeptEntryId ?? event.preparation.firstKeptEntryId,
 				tokensBefore: event.preparation.tokensBefore,
 				details: { source: "compaction_handoff", toolCallId: handoff.id },
 			},

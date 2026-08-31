@@ -61,10 +61,14 @@ function handoffBranch(
 	];
 }
 
+// Distinct from any id used in the test branches, so an assertion on this value
+// proves the handler fell back to pi's prepared cut point.
+const PREPARED_FIRST_KEPT = "pi-prepared-first-kept";
+
 function nativeCompactionEvent(branchEntries: unknown[], tokensBefore = 1234) {
 	return {
 		branchEntries,
-		preparation: { tokensBefore },
+		preparation: { tokensBefore, firstKeptEntryId: PREPARED_FIRST_KEPT },
 		reason: "threshold",
 		willRetry: false,
 		signal: new AbortController().signal,
@@ -189,8 +193,8 @@ test("a handoff at the end of the branch still supplies native compaction conten
 	);
 
 	assert.ok(nativeResult?.compaction);
-	assert.equal(typeof nativeResult.compaction.firstKeptEntryId, "string");
-	assert.ok(nativeResult.compaction.firstKeptEntryId.length > 0);
+	// Nothing follows the tool result, so pi's prepared cut point is used.
+	assert.equal(nativeResult.compaction.firstKeptEntryId, PREPARED_FIRST_KEPT);
 	assert.equal(nativeResult.compaction.tokensBefore, 6789);
 });
 
