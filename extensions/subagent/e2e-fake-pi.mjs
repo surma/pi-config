@@ -57,7 +57,24 @@ const sessionDir =
 if (!sessionFile && sessionDir) sessionFile = join(sessionDir, "child-session.jsonl");
 if (sessionFile) {
   mkdirSync(join(sessionFile, ".."), { recursive: true });
-  if (!existsSync(sessionFile)) writeFileSync(sessionFile, '{"type":"session"}\n');
+  if (!existsSync(sessionFile)) {
+    writeFileSync(
+      sessionFile,
+      `${JSON.stringify({
+        type: "session",
+        id: "child-session",
+        cwd: process.cwd(),
+        timestamp: new Date().toISOString(),
+      })}\n${JSON.stringify({
+        type: "model_change",
+        provider: "provider",
+        modelId: "model",
+      })}\n${JSON.stringify({
+        type: "thinking_level_change",
+        thinkingLevel: "off",
+      })}\n`,
+    );
+  }
 }
 if (process.env.PI_SUBAGENT_HEALTH_PATH) {
   mkdirSync(dirname(process.env.PI_SUBAGENT_HEALTH_PATH), { recursive: true });
@@ -257,7 +274,7 @@ function startPrompt(message) {
     poll.unref?.();
     return;
   }
-  if (mode === "stream-flood" || mode === "persist-flood") {
+  if (mode === "stream-flood" || mode === "completion-flood") {
     mark("flood-start");
     floodRun(runId, mode);
     return;

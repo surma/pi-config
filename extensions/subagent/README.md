@@ -34,8 +34,6 @@ The default marker path is:
 <session-dir>/child-extension-health-<incarnation>.marker
 ```
 
-The parent can override that path with `PI_SUBAGENT_HEALTH_PATH`. The parent must use a unique path for each child incarnation.
-
 The marker contains exactly these UTF-8 bytes:
 
 ```text
@@ -52,35 +50,17 @@ The child bounds marker file operations and cancels them during session shutdown
 
 A successful `get_state` response does not prove that `child.ts` loaded. The parent must check both health and RPC readiness.
 
-## Ownership and leases
+## Process-local ownership
 
-The process-local controller owns live child transports and runtime state.
+The controller owns live child transports and runtime state in the current Pi process.
 
-A persisted parent session is optional. It adds a registry and lease for durable status and resume, but it does not gate ephemeral child launch.
-
-When durable ownership exists, the extension stores its state below the configured Pi agent directory:
-
-```text
-<sessions>/subagents/controllers/<owner-key>/
-  lease.json
-  registry.json
-```
+The extension has no central controller registry or lease. A parent session does not gate child launch, and no operation depends on lease state.
 
 A child ID identifies one logical child. A random incarnation identifies one child process instance.
 
-A durable controller loads only registry entries for its exact owner. An ephemeral controller keeps live ownership in memory and does not promise recovery after process loss.
+A process-wide runtime map preserves live RPC transports and memory ownership while Pi reloads the extension. Reload rebinds only retained live runtimes with the same owner and incarnation.
 
-A durable lease expires after 30 seconds. Another controller can reclaim it after a five-second stale grace period. Renewal requires the exact owner and controller record.
-
-The same controller ID survives a Pi reload. A process-wide runtime map preserves live RPC transports and memory ownership while the replacement extension reloads.
-
-A fresh process cannot adopt an unavailable child. Reconciliation marks an unavailable durable entry as stopped.
-
-Each child checks its lease with serialized checks. A check reads at most 4 KiB. A stale check result cannot fence a newer monitor generation.
-
-A successfully read invalid, expired, missing, or replaced record makes the child self-fence. Temporary read errors receive three consecutive retries before the child self-fences.
-
-When durable ownership exists, the parent also terminates local children after lease loss.
+A fresh Pi process does not list or status children from another process. It can resume a stopped child when its child session file still exists.
 
 ## Storage and durable state
 
@@ -92,11 +72,11 @@ Each logical child uses this private directory:
   child-session.jsonl
 ```
 
-The child captures the effective system prompt. The Pi session file remains the authority for transcript inspection and resume.
+The child captures the effective system prompt. The Pi session file provides the transcript, working directory, model, thinking level, and resume parameters.
 
-The controller registry stores process identity, ownership, diagnostics, the monotonic run cursor, the last settled run ID, settlement status, and caller output status.
+The extension keeps process state, run cursors, settlement status, diagnostics, and output status in memory. It does not write a second durable controller state file.
 
-The child does not persist a second copy of settled assistant output. The durable run cursor prevents a resumed process from reusing an earlier run ID.
+The child session file remains after the controller process exits. Resume reads its session header and records, then starts a new process incarnation.
 
 ## RPC protocol
 
@@ -164,7 +144,7 @@ A failed consumer retains its record and schedules a later retry with a 25-milli
 
 A process close callback runs only after the retained queue drains. The overflow fence closes the transport after settlement or after a bounded 250-millisecond grace period.
 
-The caller must schedule another drain turn after each batch. It must not drain an unbounded queue synchronously or start one full registry write for every stream delta.
+The caller must schedule another drain turn after each batch. It must not drain an unbounded queue synchronously.
 
 ## Transcript inspection
 
@@ -231,7 +211,7 @@ Subagent <id> reached idle after run <runId>. Check subagent_status with numMess
 
 The custom message details include the direct owner session file, owner session ID, child ID, incarnation, run ID, event kind, outcome, and a `settlements` array containing that record.
 
-The parent queues each wake before optional registry persistence or caller output work. Shutdown, lease loss, and explicit child termination suppress unsent wakes.
+The parent queues each wake before optional caller output work. Shutdown and explicit child termination suppress unsent wakes.
 
 Reload queues accept at most 512 records. Overflow retains accepted records, emits one terminal diagnostic, and fences the runtime against later updates. Bounded critical lifecycle records remain accepted so `agent_start`, `agent_end`, and `agent_settled` remain deliverable after an update flood.
 
@@ -266,13 +246,17 @@ It sanitizes untrusted text before rendering it.
 
 ## Resume
 
-`subagent_resume` applies only to a stopped child with a nonempty saved session file. It keeps the logical child ID and creates a new incarnation.
+`subagent_resume` applies to a stopped child with a nonempty saved session file. It keeps the logical child ID and creates a new incarnation.
 
-The new process starts its run counter from the durable logical cursor. A resume task starts the next run. Without a task, the resumed child starts idle.
+The extension locates the child session below `<agent-dir>/sessions/subagents/<child-id>/`. It reads the session header for the working directory. It uses the latest model and thinking-level records, with message and initial-level fallbacks.
+
+The new process starts its run counter from the in-memory logical cursor when the handle remains local. A resume task starts the next run. Without a task, the resumed child starts idle.
+
+A stopped child can resume from its session file after a fresh Pi process starts. The fresh process does not list that child until the resume operation loads it.
 
 The previous incarnation cannot mutate the resumed handle. The new process receives a new transport and process ID.
 
-A durable resume requires the owner lease. An ephemeral controller can resume only while its process-local ownership remains active.
+Resuming a child that is live in another controller is undefined. The shared child session transcript can be corrupted, like any session file shared by two Pi processes.
 
 ## Verification
 
@@ -282,4 +266,4 @@ Run the deterministic suite from this directory:
 PI_TEST_PACKAGE_DIR=/path/to/pi-0.84.1 ./test.sh
 ```
 
-The suite covers lifecycle dispatch, transcript projection and pagination, caller output publication, settlement notifications, owner leases, registry isolation, strict RPC framing, correlated responses, bounded termination, launch arguments, all eight tools, reload, resume, process-close evidence, abort acceptance, child-extension health helpers, and the inspector.
+The suite covers lifecycle dispatch, transcript projection and pagination, caller output publication, settlement notifications, strict RPC framing, correlated responses, bounded termination, launch arguments, all eight tools, reload, resume, process-close evidence, abort acceptance, child-extension health helpers, and the inspector.

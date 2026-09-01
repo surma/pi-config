@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { spawn } from "node:child_process";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import nodeTest from "node:test";
@@ -16,6 +17,34 @@ function e2eTest(
 const directory = dirname(fileURLToPath(import.meta.url));
 const driver = join(directory, "e2e-driver.ts");
 const fakePi = join(directory, "e2e-fake-pi.mjs");
+const parentDeathFixture = join(directory, "e2e-parent-death.mjs");
+
+async function waitForFile(path: string, milliseconds: number): Promise<string> {
+	const deadline = Date.now() + milliseconds;
+	for (;;) {
+		try {
+			const value = await readFile(path, "utf8");
+			if (value) return value;
+		} catch {
+			// The fixture writes the file after it starts the child.
+		}
+		if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${path}.`);
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+}
+
+async function waitForProcessExit(pid: number, milliseconds: number): Promise<boolean> {
+	const deadline = Date.now() + milliseconds;
+	for (;;) {
+		try {
+			process.kill(pid, 0);
+		} catch {
+			return true;
+		}
+		if (Date.now() >= deadline) return false;
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+}
 
 type DriverResult = Record<string, unknown> & { ok: boolean; scenario: string };
 
@@ -193,16 +222,16 @@ e2eTest("E2E: slow production abort remains accepted after settlement", { timeou
 	assert.equal(result.interrupted, true);
 });
 
-e2eTest("E2E: stream updates keep registry persistence bounded", { timeout: 12_000 }, async () => {
+e2eTest("E2E: stream floods preserve the latest local state", { timeout: 12_000 }, async () => {
 	const result = await runScenario("stream-flood", 9_000);
-	assert.ok(Number(result.registrySaves) > 0);
-	assert.ok(Number(result.registrySaves) < 100);
+	assert.equal(result.runOutcome, "succeeded");
 });
 
-e2eTest("E2E: persistence floods save current state and cannot hold shutdown", { timeout: 15_000 }, async () => {
-	const result = await runScenario("persistence-flood", 12_000);
-	assert.ok(Number(result.registrySaves) > 0);
+e2eTest("E2E: completion floods cannot hold shutdown", { timeout: 15_000 }, async () => {
+	const result = await runScenario("completion-flood", 12_000);
 	assert.ok(Number(result.shutdownMs) < 1_000);
+	assert.equal(result.runOutcome, "succeeded");
+	assert.equal(result.settlementStatus, "settled");
 });
 
 e2eTest("E2E: active child count stays bounded", { timeout: 35_000 }, async () => {
@@ -227,6 +256,33 @@ e2eTest("E2E: RPC stdin bounds pending requests and queued bytes", { timeout: 8_
 	assert.ok(Number(result.pendingBefore) > 0);
 	assert.equal(Number(result.pendingAfter), 0);
 	assert.ok(Number(result.queuedBytesBefore) <= 16 * 1024 * 1024);
+});
+
+e2eTest("E2E: a child exits when its fixture parent dies", { timeout: 8_000 }, async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-subagent-parent-death-"));
+	const pidPath = join(root, "child.pid");
+	const parent = spawn(process.execPath, [parentDeathFixture, fakePi, pidPath], {
+		stdio: "ignore",
+	});
+	const parentClose = new Promise<void>((resolve) => parent.once("close", () => resolve()));
+	let childPid: number | undefined;
+	try {
+		childPid = Number(await waitForFile(pidPath, 2_000));
+		assert.ok(Number.isInteger(childPid) && childPid > 0);
+		parent.kill("SIGKILL");
+		await parentClose;
+		assert.equal(await waitForProcessExit(childPid, 2_000), true);
+	} finally {
+		if (parent.exitCode === null && parent.signalCode === null) parent.kill("SIGKILL");
+		if (childPid && !(await waitForProcessExit(childPid, 100))) {
+			try {
+				process.kill(childPid, "SIGKILL");
+			} catch {
+				// The child already exited.
+			}
+		}
+		await rm(root, { recursive: true, force: true });
+	}
 });
 
 e2eTest("E2E: reload drains under-limit records without losing settlement", { timeout: 12_000 }, async () => {
@@ -277,9 +333,9 @@ e2eTest("E2E: large valid transcript records remain readable", { timeout: 8_000 
 	assert.equal(result.transcript, "available");
 });
 
-e2eTest("E2E: launch stops when its initial registry save fails", { timeout: 8_000 }, async () => {
-	const result = await runScenario("launch-persistence");
-	assert.equal(result.childStarted, false);
+e2eTest("E2E: launch works after startup", { timeout: 8_000 }, async () => {
+	const result = await runScenario("launch-after-startup");
+	assert.equal(result.childStarted, true);
 });
 
 e2eTest("E2E: ephemeral parent sessions can start children", { timeout: 8_000 }, async () => {

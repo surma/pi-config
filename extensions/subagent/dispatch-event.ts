@@ -175,12 +175,7 @@ export function enqueueSubagentEventQueue(
 		queue.push(record);
 		return true;
 	}
-	const criticalCount = queue.reduce(
-		(count, queued) => count + (isCriticalSubagentEvent(queued) ? 1 : 0),
-		0,
-	);
-	const remainingCriticalReserve = Math.max(0, criticalReserve - criticalCount);
-	const regularLimit = maxRecords - remainingCriticalReserve;
+	const regularLimit = maxRecords - criticalReserve;
 	if (queue.length >= maxRecords || (!critical && queue.length >= regularLimit)) {
 		markEventQueueOverflow(queue, maxRecords, state, options);
 		if (critical && queue.length < maxRecords) {
@@ -655,7 +650,7 @@ export function dispatchSubagentEvent(
 			handle.error = handle.finalError;
 			const settled = currentRun(handle);
 			if (!settled) return false;
-			// Notify the parent before it starts any optional persistence or output work.
+			// Notify the parent before it starts any optional output work.
 			options.onSettled(settled);
 			options.update();
 			return true;
