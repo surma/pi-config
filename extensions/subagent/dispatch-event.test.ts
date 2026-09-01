@@ -319,6 +319,35 @@ test("reload event queue overflow retains boundaries and emits one terminal diag
 	assert.equal(diagnostics.length, 1);
 });
 
+test("reload overflow reserves later lifecycle boundaries after queued critical records", () => {
+	const queue: Record<string, unknown>[] = [];
+	const state = { overflowed: false };
+	for (const type of [
+		"agent_start",
+		"message_start",
+		"tool_execution_start",
+		"tool_execution_start",
+		"tool_execution_start",
+		"tool_execution_end",
+		"tool_execution_end",
+		"tool_execution_end",
+	])
+		assert.equal(enqueueSubagentEventQueue(queue, { type }, { state }), true);
+	for (let index = 0; index < 504; index++)
+		assert.equal(
+			enqueueSubagentEventQueue(queue, { type: "message_update", index }, { state }),
+			index < 496,
+		);
+	assert.equal(
+		enqueueSubagentEventQueue(queue, { type: "agent_end" }, { state }),
+		true,
+	);
+	assert.equal(
+		enqueueSubagentEventQueue(queue, { type: "agent_settled" }, { state }),
+		true,
+	);
+});
+
 test("reload overflow reserves critical lifecycle records after an update flood", () => {
 	const queue: Record<string, unknown>[] = [];
 	const state = { overflowed: false };

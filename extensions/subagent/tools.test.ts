@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import {
 	appendFile,
 	chmod,
 	mkdir,
 	mkdtemp,
+	readdir,
+	realpath,
 	readFile,
-	rm,
 	writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -23,7 +25,6 @@ import subagentExtension, {
 } from "./index.ts";
 import { MAX_SUBAGENT_EVENT_QUEUE_RECORDS } from "./dispatch-event.ts";
 import { RpcChildTransport } from "./rpc.js";
-import { leasePath, ownerRegistryPath } from "./owner.ts";
 
 // The test process can inherit the delegated-child marker from the parent harness.
 delete process.env.PI_SUBAGENT_DEPTH;
@@ -126,7 +127,13 @@ const sessionDir = process.env.PI_SUBAGENT_SESSION_DIR;
 if (!sessionFile && sessionDir) sessionFile = join(sessionDir, "child-session.jsonl");
 if (sessionFile) {
   mkdirSync(join(sessionFile, ".."), { recursive: true });
-  if (!existsSync(sessionFile)) writeFileSync(sessionFile, "{\\"type\\":\\"session\\"}\\n");
+  if (!existsSync(sessionFile)) {
+    const timestamp = new Date().toISOString();
+    writeFileSync(sessionFile,
+      JSON.stringify({ type: "session", version: 3, id: "child-session", timestamp, cwd: process.cwd() }) + "\\n" +
+      JSON.stringify({ type: "model_change", id: "model", parentId: null, timestamp, provider: "provider", modelId: "model" }) + "\\n" +
+      JSON.stringify({ type: "thinking_level_change", id: "thinking", parentId: "model", timestamp, thinkingLevel: "off" }) + "\\n");
+  }
 }
 const healthPath = process.env.PI_SUBAGENT_HEALTH_PATH;
 if (healthPath && mode !== "extension-error") {
@@ -694,12 +701,13 @@ test("same-child operation queues reject work beyond the finite bound", async ()
 	}
 });
 
-test("RPC child lifecycle supports settlement wakes, output collisions, transcript paging, reload, and resume", async () => {
+test("RPC child lifecycle supports settlement wakes, output collisions, transcript paging, runtime-only reload, and session-only resume", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "pi-rpc-tools-"));
 	const agentDirectory = join(directory, "agent");
 	const parentSession = join(directory, "parent.jsonl");
 	const logPath = join(directory, "invocations.jsonl");
 	const outputPath = join(directory, "deliverable.txt");
+	const controllerDirectory = join(agentDirectory, "sessions", "subagents", "controllers");
 	await writeFile(parentSession, "parent\n");
 	const binary = await fakePi(directory, logPath);
 	const old = {
@@ -719,6 +727,10 @@ test("RPC child lifecycle supports settlement wakes, output collisions, transcri
 	let shutdownHandlers = handlers;
 	try {
 		await handlers.get("session_start")?.({ reason: "startup" }, ctx);
+		await assert.rejects(
+			readdir(controllerDirectory),
+			(error: any) => error?.code === "ENOENT",
+		);
 		const started = await requireTool(tools, "subagent_start").execute(
 			"start-request",
 			{
@@ -815,33 +827,30 @@ test("RPC child lifecycle supports settlement wakes, output collisions, transcri
 		assert.equal(reloadedList.details.handles[0]?.lifecycle, "idle");
 
 		await requireTool(reloaded.tools, "subagent_kill").execute("kill", { id: childId });
-		const killedRegistry = JSON.parse(
-			await readFile(
-				ownerRegistryPath(agentDirectory, {
-					ownerSessionFile: parentSession,
-					ownerSessionId: "parent-session",
-				}),
-				"utf8",
-			),
-		) as Record<string, unknown>[];
-		assert.equal(typeof killedRegistry[0]?.killRequestedAt, "number");
 		await reloaded.handlers.get("session_shutdown")?.({ reason: "reload" }, ctx);
 		const afterKillReload = setup(new Map(), sent);
 		shutdownHandlers = afterKillReload.handlers;
 		await afterKillReload.handlers.get("session_start")?.({ reason: "reload" }, ctx);
-		const killed = await requireTool(afterKillReload.tools, "subagent_status").execute("killed-status", {
-			id: childId,
-		});
-		assert.equal(killed.details.processState, "stopped");
-		assert.equal(typeof killed.details.killRequestedAt, "number");
-		assert.equal(killed.details.state, "killed");
-		assert.equal(killed.details.lifecycle, "killed");
+		const emptyAfterReload = await requireTool(afterKillReload.tools, "subagent_list").execute("empty-after-reload", {});
+		assert.equal(emptyAfterReload.details.handles.length, 0);
+		await assert.rejects(
+			readdir(controllerDirectory),
+			(error: any) => error?.code === "ENOENT",
+		);
+		await appendFile(
+			sessionPath,
+			`${JSON.stringify({ type: "model_change", id: "model-latest", parentId: null, timestamp: new Date().toISOString(), provider: "other", modelId: "latest" })}\n` +
+			`${JSON.stringify({ type: "thinking_level_change", id: "thinking-latest", parentId: null, timestamp: new Date().toISOString(), thinkingLevel: "high" })}\n`,
+		);
 		const resumed = await requireTool(afterKillReload.tools, "subagent_resume").execute("resume", {
 			id: childId,
 			task: "resumed",
 		});
 		assert.match(resumed.content[0]?.text || "", /new RPC process incarnation/);
 		assert.equal(resumed.details.handle.processState, "alive");
+		assert.equal(resumed.details.handle.cwd, directory);
+		assert.equal(resumed.details.handle.requestedModel, "other/latest");
+		assert.equal(resumed.details.handle.requestedThinking, "high");
 		assert.equal(resumed.details.handle.runId, 3);
 		assert.equal(resumed.details.handle.settlement.status, "settled");
 		await requireTool(afterKillReload.tools, "subagent_kill").execute("kill-again", { id: childId });
@@ -870,12 +879,30 @@ test("RPC child lifecycle supports settlement wakes, output collisions, transcri
 	}
 });
 
-test("resume does not spawn when registry persistence fails", async () => {
-	const directory = await mkdtemp(join(tmpdir(), "pi-rpc-resume-persist-"));
+test("startup ignores stale controller files", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "pi-rpc-stale-controller-files-"));
 	const agentDirectory = join(directory, "agent");
 	const parentSession = join(directory, "parent.jsonl");
 	const logPath = join(directory, "invocations.jsonl");
 	await writeFile(parentSession, "parent\n");
+	const ownerSessionFile = await realpath(parentSession);
+	const ownerKey = createHash("sha1").update(ownerSessionFile).digest("hex").slice(0, 24);
+	const legacyDirectory = join(agentDirectory, "sessions", "subagents", "controllers", ownerKey);
+	await mkdir(legacyDirectory, { recursive: true });
+	const now = Date.now();
+	await writeFile(
+		join(legacyDirectory, "lease.json"),
+		`${JSON.stringify({
+			ownerSessionFile,
+			ownerSessionId: "stale-controller-owner",
+			controllerInstanceId: "foreign-controller",
+			acquiredAt: now,
+			expiresAt: now + 60 * 60 * 1_000,
+			pid: process.pid,
+			renewedAt: now,
+		})}\n`,
+	);
+	await writeFile(join(legacyDirectory, "registry.json"), "[]\n");
 	const binary = await fakePi(directory, logPath);
 	const old = {
 		agentDirectory: process.env.PI_CODING_AGENT_DIR,
@@ -887,7 +914,7 @@ test("resume does not spawn when registry persistence fails", async () => {
 	delete process.env.PI_SUBAGENT_DEPTH;
 	const handlers = new Map<string, TestHandler>();
 	const { tools } = setup(handlers);
-	const ctx = context(parentSession, "resume-persist-parent", directory);
+	const ctx = context(parentSession, "stale-controller-owner", directory);
 	try {
 		await handlers.get("session_start")?.({ reason: "startup" }, ctx);
 		const started = await requireTool(tools, "subagent_start").execute(
@@ -897,26 +924,9 @@ test("resume does not spawn when registry persistence fails", async () => {
 			undefined,
 			ctx,
 		);
-		const childId = String(started.details.handle.id);
-		await requireTool(tools, "subagent_kill").execute("kill", { id: childId });
-		const registry = ownerRegistryPath(agentDirectory, {
-			ownerSessionFile: parentSession,
-			ownerSessionId: "resume-persist-parent",
-		});
-		await rm(registry, { force: true });
-		await mkdir(registry);
-		const resumed = await requireTool(tools, "subagent_resume").execute("resume", {
-			id: childId,
-			task: "must not spawn",
-		});
-		assert.match(resumed.content[0]?.text || "", /Could not persist/);
-		assert.equal(resumed.details.handle.processState, "stopped");
-		assert.equal(resumed.details.handle.incarnation, started.details.handle.incarnation);
-		const invocations = (await readFile(logPath, "utf8"))
-			.trim()
-			.split("\n")
-			.map((line) => JSON.parse(line) as string[]);
-		assert.equal(invocations.length, 1);
+		assert.equal(started.details.handle.processState, "alive");
+		assert.equal((await requireTool(tools, "subagent_list").execute("list", {})).details.handles.length, 1);
+		await requireTool(tools, "subagent_kill").execute("kill", { id: started.details.handle.id });
 	} finally {
 		await handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
 		if (old.agentDirectory === undefined) delete process.env.PI_CODING_AGENT_DIR;
@@ -1164,75 +1174,6 @@ test("process close before settlement records terminal evidence without a succes
 	}
 });
 
-test("lease loss stops local children without rewriting the registry", async () => {
-	const directory = await mkdtemp(join(tmpdir(), "pi-rpc-lease-loss-"));
-	const agentDirectory = join(directory, "agent");
-	const parentSession = join(directory, "parent.jsonl");
-	const logPath = join(directory, "invocations.jsonl");
-	await writeFile(parentSession, "parent\n");
-	const binary = await fakePi(directory, logPath);
-	const old = {
-		agentDirectory: process.env.PI_CODING_AGENT_DIR,
-		pi: process.env.PI_SUBAGENT_PI_BIN,
-		depth: process.env.PI_SUBAGENT_DEPTH,
-	};
-	process.env.PI_CODING_AGENT_DIR = agentDirectory;
-	process.env.PI_SUBAGENT_PI_BIN = binary;
-	delete process.env.PI_SUBAGENT_DEPTH;
-	const handlers = new Map<string, TestHandler>();
-	const { tools } = setup(handlers);
-	const ctx = context(parentSession, "lease-parent", directory);
-	try {
-		await handlers.get("session_start")?.({ reason: "startup" }, ctx);
-		const started = await requireTool(tools, "subagent_start").execute(
-			"start-request",
-			{ task: "initial", model: "provider/model", thinking: "off" },
-			undefined,
-			undefined,
-			ctx,
-		);
-		const childId = String(started.details.handle.id);
-		const owner = {
-			ownerSessionFile: parentSession,
-			ownerSessionId: "lease-parent",
-		};
-		const path = leasePath(agentDirectory, owner);
-		const originalLease = JSON.parse(await readFile(path, "utf8")) as Record<string, unknown>;
-		const registryPath = ownerRegistryPath(agentDirectory, owner);
-		const originalRegistry = await readFile(registryPath, "utf8");
-		await writeFile(
-			path,
-			`${JSON.stringify({ ...originalLease, controllerInstanceId: "replacement-controller" })}\n`,
-			{ mode: 0o600 },
-		);
-		const denied = await requireTool(tools, "subagent_steer").execute("steer", {
-			id: childId,
-			message: "unsafe",
-		});
-		assert.match(denied.content[0]?.text || "", /lease is not held/i);
-		await waitFor(async () => {
-			const status = await requireTool(tools, "subagent_status").execute("status", { id: childId });
-			return status.details.processState === "stopped";
-		});
-		const registryInvariants = (raw: string) =>
-			(JSON.parse(raw) as Record<string, unknown>[]).map(
-				({ lastActivityAt: _lastActivityAt, ...entry }) => entry,
-			);
-		assert.deepEqual(
-			registryInvariants(await readFile(registryPath, "utf8")),
-			registryInvariants(originalRegistry),
-		);
-	} finally {
-		await handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
-		if (old.agentDirectory === undefined) delete process.env.PI_CODING_AGENT_DIR;
-		else process.env.PI_CODING_AGENT_DIR = old.agentDirectory;
-		if (old.pi === undefined) delete process.env.PI_SUBAGENT_PI_BIN;
-		else process.env.PI_SUBAGENT_PI_BIN = old.pi;
-		if (old.depth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
-		else process.env.PI_SUBAGENT_DEPTH = old.depth;
-	}
-});
-
 test("unknown handles return stable errors without contacting a child", async () => {
 	const { tools } = setup();
 	for (const name of [
@@ -1248,6 +1189,7 @@ test("unknown handles return stable errors without contacting a child", async ()
 				? { id: "missing", message: "x" }
 				: { id: "missing" };
 		const result = await requireTool(tools, name).execute("unknown", params);
-		assert.match(result.content[0]?.text || "", /Unknown/);
+		if (name === "subagent_resume") assert.match(result.content[0]?.text || "", /No usable/);
+		else assert.match(result.content[0]?.text || "", /Unknown/);
 	}
 });

@@ -4,16 +4,8 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
 const delegatedPrompt = process.env.PI_SUBAGENT_SYSTEM_PROMPT || "";
 const promptPath = process.env.PI_SUBAGENT_PROMPT_PATH;
-const leaseFilePath = process.env.PI_SUBAGENT_LEASE_PATH;
-const leaseOwnerSessionFile = process.env.PI_SUBAGENT_OWNER_SESSION_FILE;
-const leaseOwnerSessionId = process.env.PI_SUBAGENT_OWNER_SESSION_ID;
-const leaseControllerInstanceId = process.env.PI_SUBAGENT_CONTROLLER_INSTANCE_ID;
 const childSessionDir = process.env.PI_SUBAGENT_SESSION_DIR;
 const childIncarnation = process.env.PI_SUBAGENT_INCARNATION;
-const configuredHealthPath = process.env.PI_SUBAGENT_HEALTH_PATH;
-const CHILD_LEASE_CHECK_INTERVAL_MS = 5_000;
-const MAX_LEASE_RECORD_BYTES = 4 * 1024;
-const MAX_CONSECUTIVE_LEASE_READ_ERRORS = 3;
 const DEFAULT_HEALTH_WAIT_TIMEOUT_MS = 5_000;
 const DEFAULT_HEALTH_POLL_INTERVAL_MS = 25;
 const DEFAULT_CHILD_FILE_OPERATION_TIMEOUT_MS = 5_000;
@@ -26,32 +18,6 @@ const subagentDepth = Math.max(
 export const CHILD_EXTENSION_HEALTH_SIGNAL =
 	"pi-subagent-child-extension-ready/v1\n";
 export const CHILD_EXTENSION_HEALTH_MAX_BYTES = 128;
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-export interface ChildLeaseIdentity {
-	ownerSessionFile: string;
-	ownerSessionId: string;
-	controllerInstanceId: string;
-}
-
-export function isValidChildLeaseRecord(
-	value: unknown,
-	identity: ChildLeaseIdentity,
-	at = Date.now(),
-): boolean {
-	if (!isRecord(value)) return false;
-	return (
-		value.ownerSessionFile === identity.ownerSessionFile &&
-		value.ownerSessionId === identity.ownerSessionId &&
-		value.controllerInstanceId === identity.controllerInstanceId &&
-		typeof value.expiresAt === "number" &&
-		Number.isFinite(value.expiresAt) &&
-		at <= value.expiresAt
-	);
-}
 
 /** Build the unique marker path that belongs to one child incarnation. */
 export function childExtensionHealthPath(
@@ -358,200 +324,11 @@ export async function waitForChildExtensionHealth(
 	}
 }
 
-async function readChildLeaseRecord(
-	path: string,
-	signal?: AbortSignal,
-	operationTimeoutMs?: number,
-): Promise<unknown> {
-	const content = await readBoundedFile(
-		path,
-		MAX_LEASE_RECORD_BYTES,
-		signal,
-		positiveTimeout(operationTimeoutMs),
-	);
-	if (!content) return undefined;
-	try {
-		return JSON.parse(content.toString("utf8"));
-	} catch {
-		return undefined;
-	}
-}
-
-export interface ChildLeaseMonitorOptions {
-	leasePath: string;
-	identity: ChildLeaseIdentity;
-	intervalMs?: number;
-	maxReadErrors?: number;
-	operationTimeoutMs?: number;
-	readLease?: (path: string, signal?: AbortSignal) => Promise<unknown>;
-	now?: () => number;
-	onDiagnostic?: (message: string) => void;
-	terminate?: () => void;
-}
-
-export interface ChildLeaseMonitor {
-	start(): void;
-	stop(): void;
-	checkNow(): Promise<void>;
-}
-
-/**
- * Monitor one lease with serialized, generation-fenced checks.
- *
- * A bounded read that returns invalid data fences the child immediately.
- * Temporary read errors get three consecutive retries, which tolerates an
- * atomic lease rename without allowing a permanent storage failure to linger.
- */
-export function createChildLeaseMonitor(
-	options: ChildLeaseMonitorOptions,
-): ChildLeaseMonitor {
-	const intervalMs = Math.max(
-		1,
-		Math.floor(options.intervalMs ?? CHILD_LEASE_CHECK_INTERVAL_MS),
-	);
-	const maxReadErrors = Math.max(
-		1,
-		Math.floor(options.maxReadErrors ?? MAX_CONSECUTIVE_LEASE_READ_ERRORS),
-	);
-	const operationTimeoutMs = positiveTimeout(options.operationTimeoutMs);
-	const readLease = options.readLease || readChildLeaseRecord;
-	const now = options.now || (() => Date.now());
-	const diagnostic = (message: string) => {
-		try {
-			options.onDiagnostic?.(message);
-		} catch {
-			// Diagnostics must not break the lease fence.
-		}
-	};
-	let timer: NodeJS.Timeout | undefined;
-	let generation = 0;
-	let active = false;
-	let inFlight: Promise<void> | undefined;
-	let queued = false;
-	let consecutiveReadErrors = 0;
-	let generationController: AbortController | undefined;
-
-	const current = (candidate: number) => active && candidate === generation;
-	const stop = () => {
-		active = false;
-		generation++;
-		queued = false;
-		consecutiveReadErrors = 0;
-		generationController?.abort();
-		generationController = undefined;
-		if (timer) {
-			clearInterval(timer);
-			timer = undefined;
-		}
-	};
-	const fence = (candidate: number, reason: string) => {
-		if (!current(candidate)) return;
-		stop();
-		diagnostic(reason);
-		try {
-			(options.terminate || (() => process.kill(process.pid, "SIGTERM")))();
-		} catch {
-			// The process can exit between validation and the self-fence signal.
-		}
-	};
-	const check = async (candidate: number): Promise<void> => {
-		if (!current(candidate)) return;
-		const controller = generationController;
-		const readController = new AbortController();
-		const abortRead = () => readController.abort();
-		controller?.signal.addEventListener("abort", abortRead, { once: true });
-		let record: unknown;
-		try {
-			record = await boundedChildFileOperation(
-				() => readLease(options.leasePath, readController.signal),
-				readController.signal,
-				operationTimeoutMs,
-				"lease read",
-			);
-		} catch (error) {
-			if (!current(candidate)) return;
-			consecutiveReadErrors++;
-			diagnostic(
-				`Child lease read failed (${consecutiveReadErrors}/${maxReadErrors}); retrying: ${error instanceof Error ? error.message : String(error)}`,
-			);
-			if (consecutiveReadErrors >= maxReadErrors)
-				fence(candidate, "Child lease read failed repeatedly; terminating.");
-			return;
-		} finally {
-			controller?.signal.removeEventListener("abort", abortRead);
-			readController.abort();
-		}
-		const readCompletedAt = now();
-		if (!current(candidate)) return;
-		consecutiveReadErrors = 0;
-		if (isValidChildLeaseRecord(record, options.identity, readCompletedAt)) return;
-		fence(
-			candidate,
-			"Child lease record is missing, invalid, expired, or replaced.",
-		);
-	};
-	const checkNow = (): Promise<void> => {
-		if (!active) return Promise.resolve();
-		if (inFlight) {
-			queued = true;
-			return inFlight;
-		}
-		const candidate = generation;
-		const promise = check(candidate).finally(() => {
-			if (inFlight !== promise) return;
-			inFlight = undefined;
-			if (active && queued) {
-				queued = false;
-				void checkNow();
-			}
-		});
-		inFlight = promise;
-		return promise;
-	};
-	const start = () => {
-		stop();
-		active = true;
-		generationController = new AbortController();
-		void checkNow();
-		timer = setInterval(() => void checkNow(), intervalMs);
-		timer.unref?.();
-	};
-
-	return { start, stop, checkNow };
-}
-
-const childLeaseIdentity =
-	leaseFilePath &&
-	leaseOwnerSessionFile &&
-	leaseOwnerSessionId &&
-	leaseControllerInstanceId
-		? {
-				ownerSessionFile: leaseOwnerSessionFile,
-				ownerSessionId: leaseOwnerSessionId,
-				controllerInstanceId: leaseControllerInstanceId,
-			}
-		: undefined;
 const childHealthPath =
-	configuredHealthPath ||
-	(childSessionDir && childIncarnation
+	childSessionDir && childIncarnation
 		? childExtensionHealthPath(childSessionDir, childIncarnation)
-		: undefined);
-const childLeaseMonitor =
-	leaseFilePath && childLeaseIdentity
-		? createChildLeaseMonitor({
-				leasePath: leaseFilePath,
-				identity: childLeaseIdentity,
-			})
 		: undefined;
 let childFileController = new AbortController();
-
-function startLeaseMonitor(): void {
-	childLeaseMonitor?.start();
-}
-
-function stopLeaseMonitor(): void {
-	childLeaseMonitor?.stop();
-}
 
 async function publishHealthSignal(signal = childFileController.signal): Promise<void> {
 	if (!childHealthPath) return;
@@ -636,12 +413,10 @@ export default function childSubagentExtension(pi: ExtensionAPI) {
 		childFileController.abort();
 		childFileController = new AbortController();
 		await publishHealthSignal(childFileController.signal);
-		startLeaseMonitor();
 		await captureEffectivePrompt(ctx.getSystemPrompt(), childFileController.signal);
 	});
 
 	pi.on("session_shutdown", async () => {
-		stopLeaseMonitor();
 		childFileController.abort();
 	});
 

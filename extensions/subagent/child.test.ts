@@ -6,27 +6,10 @@ import test from "node:test";
 import childSubagentExtension, {
 	CHILD_EXTENSION_HEALTH_SIGNAL,
 	childExtensionHealthPath,
-	createChildLeaseMonitor,
-	isValidChildLeaseRecord,
 	verifyChildExtensionHealth,
 	waitForChildExtensionHealth,
 	writeChildExtensionHealthSignal,
 } from "./child.ts";
-
-const identity = {
-	ownerSessionFile: "/tmp/parent.jsonl",
-	ownerSessionId: "parent-session",
-	controllerInstanceId: "controller-a",
-};
-
-function record(expiresAt: number): Record<string, unknown> {
-	return {
-		ownerSessionFile: identity.ownerSessionFile,
-		ownerSessionId: identity.ownerSessionId,
-		controllerInstanceId: identity.controllerInstanceId,
-		expiresAt,
-	};
-}
 
 test("child extension leaves native run settlement with the RPC host", () => {
 	const registered: string[] = [];
@@ -42,23 +25,6 @@ test("child extension leaves native run settlement with the RPC host", () => {
 		"agent_start",
 		"before_agent_start",
 	]);
-});
-
-test("child lease validation requires exact identity and an unexpired finite expiry", () => {
-	assert.equal(isValidChildLeaseRecord(record(1_001), identity, 1_000), true);
-	assert.equal(isValidChildLeaseRecord(record(1_000), identity, 1_000), true);
-	assert.equal(isValidChildLeaseRecord(record(999), identity, 1_000), false);
-	assert.equal(
-		isValidChildLeaseRecord(
-			{ ...record(1_001), controllerInstanceId: "controller-b" },
-			identity,
-			1_000,
-		),
-		false,
-	);
-	assert.equal(isValidChildLeaseRecord({ ...record(Number.NaN) }, identity, 1_000), false);
-	assert.equal(isValidChildLeaseRecord({ ...record(Number.POSITIVE_INFINITY) }, identity, 1_000), false);
-	assert.equal(isValidChildLeaseRecord("not-json", identity, 1_000), false);
 });
 
 test("child extension health uses an exact bounded marker and rejects missing or bad signals", async () => {
@@ -85,108 +51,42 @@ test("child extension health uses an exact bounded marker and rejects missing or
 	}
 });
 
-test("child lease checks do not overlap and stale generations cannot fence a healthy child", async () => {
-	let releaseFirst!: () => void;
-	let firstStarted!: () => void;
-	let secondStarted!: () => void;
-	const first = new Promise<void>((resolve) => {
-		firstStarted = resolve;
-	});
-	const release = new Promise<void>((resolve) => {
-		releaseFirst = resolve;
-	});
-	const second = new Promise<void>((resolve) => {
-		secondStarted = resolve;
-	});
-	let reads = 0;
-	let activeReads = 0;
-	let maximumActiveReads = 0;
-	let terminations = 0;
-	const valid = record(Date.now() + 60_000);
-	const monitor = createChildLeaseMonitor({
-		leasePath: "/tmp/lease.json",
-		identity,
-		intervalMs: 60_000,
-		readLease: async () => {
-			reads++;
-			activeReads++;
-			maximumActiveReads = Math.max(maximumActiveReads, activeReads);
-			try {
-				if (reads === 1) {
-					firstStarted();
-					await release;
-					return { ...valid, expiresAt: 0 };
-				}
-				secondStarted();
-				return valid;
-			} finally {
-				activeReads--;
-			}
-		},
-		terminate: () => terminations++,
-	});
-	monitor.start();
-	await first;
-	monitor.checkNow();
-	monitor.stop();
-	monitor.start();
-	releaseFirst();
-	await second;
-	await new Promise<void>((resolve) => setImmediate(resolve));
-	assert.equal(maximumActiveReads, 1);
-	assert.equal(terminations, 0);
-	monitor.stop();
-});
-
-test("lease expiry is compared with the time after the read completes", async () => {
-	let currentTime = 0;
-	let terminations = 0;
-	const monitor = createChildLeaseMonitor({
-		leasePath: "/tmp/lease.json",
-		identity,
-		intervalMs: 60_000,
-		now: () => currentTime,
-		readLease: async () => {
-			currentTime = 101;
-			return record(100);
-		},
-		terminate: () => terminations++,
-	});
-	monitor.start();
-	await monitor.checkNow();
-	assert.equal(terminations, 1);
-	monitor.stop();
-});
-
-test("stopping a child lease check during a read does not self-terminate", async () => {
-	let releaseRead!: () => void;
-	let readStarted!: () => void;
-	const started = new Promise<void>((resolve) => {
-		readStarted = resolve;
-	});
-	const read = new Promise<unknown>((resolve) => {
-		releaseRead = () => resolve(record(Date.now() + 60_000));
-	});
-	let terminations = 0;
-	const monitor = createChildLeaseMonitor({
-		leasePath: "/tmp/lease.json",
-		identity,
-		intervalMs: 60_000,
-		operationTimeoutMs: 10,
-		readLease: async () => {
-			readStarted();
-			return read;
-		},
-		terminate: () => terminations++,
-	});
-	monitor.start();
-	await started;
-	monitor.stop();
-	await new Promise<void>((resolve) => setImmediate(resolve));
-	assert.equal(terminations, 0);
-	releaseRead();
-	await new Promise<void>((resolve) => setImmediate(resolve));
-	assert.equal(terminations, 0);
+test("child health ignores an inherited override path", async () => {
+	const directory = await fs.mkdtemp(join(tmpdir(), "pi-child-health-override-"));
+	const overridePath = join(directory, "override.marker");
+	const environment = {
+		sessionDir: process.env.PI_SUBAGENT_SESSION_DIR,
+		incarnation: process.env.PI_SUBAGENT_INCARNATION,
+		healthPath: process.env.PI_SUBAGENT_HEALTH_PATH,
+	};
+	try {
+		process.env.PI_SUBAGENT_SESSION_DIR = directory;
+		process.env.PI_SUBAGENT_INCARNATION = "incarnation-b";
+		process.env.PI_SUBAGENT_HEALTH_PATH = overridePath;
+		const module = await import(`./child.ts?health-path-test=${Math.random()}`);
+		const handlers = new Map<string, (...args: any[]) => unknown>();
+		module.default({
+			on(name: string, handler: (...args: any[]) => unknown) {
+				handlers.set(name, handler);
+				return undefined;
+			},
+		} as never);
+		await handlers.get("session_start")?.({}, { getSystemPrompt: () => "" });
+		assert.equal(
+			await verifyChildExtensionHealth(childExtensionHealthPath(directory, "incarnation-b")),
+			true,
+		);
+		assert.equal(await verifyChildExtensionHealth(overridePath), false);
+		await handlers.get("session_shutdown")?.();
+	} finally {
+		if (environment.sessionDir === undefined) delete process.env.PI_SUBAGENT_SESSION_DIR;
+		else process.env.PI_SUBAGENT_SESSION_DIR = environment.sessionDir;
+		if (environment.incarnation === undefined) delete process.env.PI_SUBAGENT_INCARNATION;
+		else process.env.PI_SUBAGENT_INCARNATION = environment.incarnation;
+		if (environment.healthPath === undefined) delete process.env.PI_SUBAGENT_HEALTH_PATH;
+		else process.env.PI_SUBAGENT_HEALTH_PATH = environment.healthPath;
+		await fs.rm(directory, { recursive: true, force: true });
+	}
 });
 
 test("aborted child health checks preserve cancellation", async () => {
@@ -210,42 +110,4 @@ test("aborted child health checks preserve cancellation", async () => {
 		),
 		(error: unknown) => error instanceof Error && error.name === "AbortError",
 	);
-});
-
-test("temporary lease read errors retry before self-termination", async () => {
-	let releaseFirst!: () => void;
-	let firstStarted!: () => void;
-	const first = new Promise<void>((resolve) => {
-		firstStarted = resolve;
-	});
-	const release = new Promise<void>((resolve) => {
-		releaseFirst = resolve;
-	});
-	let reads = 0;
-	let terminations = 0;
-	const monitor = createChildLeaseMonitor({
-		leasePath: "/tmp/lease.json",
-		identity,
-		intervalMs: 60_000,
-		maxReadErrors: 2,
-		readLease: async () => {
-			reads++;
-			if (reads === 1) {
-				firstStarted();
-				await release;
-				throw new Error("temporary read failure");
-			}
-			return record(Date.now() + 60_000);
-		},
-		terminate: () => terminations++,
-	});
-	monitor.start();
-	await first;
-	monitor.checkNow();
-	releaseFirst();
-	await new Promise<void>((resolve) => setImmediate(resolve));
-	await new Promise<void>((resolve) => setImmediate(resolve));
-	assert.equal(reads, 2);
-	assert.equal(terminations, 0);
-	monitor.stop();
 });

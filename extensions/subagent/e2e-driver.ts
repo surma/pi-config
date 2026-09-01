@@ -1,24 +1,21 @@
 import assert from "node:assert/strict";
-import { watch } from "node:fs";
 import {
 	chmod,
 	mkdir,
 	mkdtemp,
 	readFile,
-	stat,
 	rm,
 	writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import type {
 	ExtensionAPI,
 	ExtensionContext,
 } from "@mariozechner/pi-coding-agent";
 import subagentExtension from "./index.ts";
 import { RpcChildTransport } from "./rpc.ts";
-import { ownerRegistryPath } from "./owner.ts";
 
 type TestResult = {
 	content: { type?: string; text: string }[];
@@ -368,22 +365,6 @@ async function loggedPids(runtime: DriverRuntime): Promise<number[]> {
 		.map((record) => Number(record.pid));
 }
 
-async function registryEntry(runtime: DriverRuntime, childId: string): Promise<Record<string, any> | undefined> {
-	if (!runtime.parentSession) return undefined;
-	const path = ownerRegistryPath(runtime.agentDirectory, {
-		ownerSessionFile: runtime.parentSession,
-		ownerSessionId: "e2e-parent",
-	});
-	try {
-		const entries = JSON.parse(await readFile(path, "utf8")) as unknown;
-		return Array.isArray(entries)
-			? (entries.find((entry) => entry && entry.childId === childId) as Record<string, any> | undefined)
-			: undefined;
-	} catch {
-		return undefined;
-	}
-}
-
 async function killLoggedProcesses(runtime: DriverRuntime): Promise<number[]> {
 	const pids = await loggedPids(runtime);
 	for (const pid of pids) {
@@ -573,18 +554,8 @@ async function scenarioLargeAgentEnd(): Promise<Record<string, unknown>> {
 
 async function scenarioStreamFlood(): Promise<Record<string, unknown>> {
 	let runtime: DriverRuntime | undefined;
-	let watcher: ReturnType<typeof watch> | undefined;
-	let registryEvents = 0;
 	try {
 		runtime = await createRuntime({ mode: "stream-flood", floodCount: 600 });
-		const owner = {
-			ownerSessionFile: runtime.parentSession!,
-			ownerSessionId: "e2e-parent",
-		};
-		const registryDirectory = dirname(ownerRegistryPath(runtime.agentDirectory, owner));
-		watcher = watch(registryDirectory, { persistent: false }, (event, filename) => {
-			if (event === "rename" && filename?.toString() === "registry.json") registryEvents++;
-		});
 		const child = await startChild(runtime);
 		await waitForMarker(runtime, "flood-done", 5_000);
 		await waitFor(
@@ -592,67 +563,41 @@ async function scenarioStreamFlood(): Promise<Record<string, unknown>> {
 			5_000,
 			"stream flood settlement",
 		);
-		await waitFor(
-			async () => {
-				const entry = await registryEntry(runtime!, child.id);
-				return entry?.runOutcome === "succeeded" && entry.settlementStatus === "settled";
-			},
-			5_000,
-			"latest stream state persistence",
-		);
-		await delay(250);
-		watcher.close();
-		watcher = undefined;
-		assert.ok(registryEvents > 0, "stream flood produced no registry save event");
-		assert.ok(
-			registryEvents < 100,
-			`stream updates caused ${registryEvents} registry saves`,
-		);
-		const saved = await registryEntry(runtime, child.id);
-		assert.equal(saved?.runOutcome, "succeeded");
-		assert.equal(saved?.settlementStatus, "settled");
-		return { floodCount: 600, registryEvents, registrySaves: registryEvents, latestState: saved };
+		const current = await status(runtime, child.id);
+		assert.equal(current.details.runOutcome, "succeeded");
+		assert.equal(current.details.settlement.status, "settled");
+		return { floodCount: 600, runOutcome: current.details.runOutcome };
 	} finally {
-		watcher?.close();
 		await cleanup(runtime);
 	}
 }
 
-async function scenarioPersistenceFlood(): Promise<Record<string, unknown>> {
+async function scenarioCompletionFlood(): Promise<Record<string, unknown>> {
 	let runtime: DriverRuntime | undefined;
-	let watcher: ReturnType<typeof watch> | undefined;
-	let registrySaves = 0;
 	try {
-		runtime = await createRuntime({ mode: "persist-flood", floodCount: 16_000 });
-		const owner = {
-			ownerSessionFile: runtime.parentSession!,
-			ownerSessionId: "e2e-parent",
-		};
-		watcher = watch(dirname(ownerRegistryPath(runtime.agentDirectory, owner)), { persistent: false }, (event, filename) => {
-			if (event === "rename" && filename?.toString() === "registry.json") registrySaves++;
-		});
+		runtime = await createRuntime({ mode: "completion-flood", floodCount: 16_000 });
 		const child = await startChild(runtime);
 		await waitForMarker(runtime, "flood-done", 5_000);
 		await waitFor(
 			async () => (await status(runtime!, child.id)).details.settlement.status === "settled",
 			5_000,
-			"persistence flood settlement",
+			"completion flood settlement",
 		);
 		const startedAt = Date.now();
 		await withTimeout(
 			Promise.resolve(runtime.handlers.get("session_shutdown")?.({ reason: "quit" }, runtime.ctx)),
 			1_000,
-			"persistence flood shutdown",
+			"completion flood shutdown",
 		);
-		watcher?.close();
-		watcher = undefined;
-		const saved = await registryEntry(runtime, child.id);
-		assert.ok(registrySaves > 0, "persistence flood produced no registry saves");
-		assert.equal(saved?.runOutcome, "succeeded", "the latest state was not persisted");
-		assert.equal(saved?.settlementStatus, "settled", "the latest settlement was not persisted");
-		return { shutdownMs: Date.now() - startedAt, registrySaves, latestState: saved };
+		const current = await status(runtime, child.id);
+		assert.equal(current.details.runOutcome, "succeeded");
+		assert.equal(current.details.settlement.status, "settled");
+		return {
+			shutdownMs: Date.now() - startedAt,
+			runOutcome: current.details.runOutcome,
+			settlementStatus: current.details.settlement.status,
+		};
 	} finally {
-		watcher?.close();
 		await cleanup(runtime);
 	}
 }
@@ -1024,30 +969,21 @@ async function scenarioLargeTranscript(): Promise<Record<string, unknown>> {
 	}
 }
 
-async function scenarioLaunchPersistence(): Promise<Record<string, unknown>> {
+async function scenarioLaunchAfterStartup(): Promise<Record<string, unknown>> {
 	let runtime: DriverRuntime | undefined;
-	let registryPath: string | undefined;
 	try {
 		runtime = await createRuntime({ mode: "success", deferSessionStart: true });
-		registryPath = ownerRegistryPath(runtime.agentDirectory, {
-			ownerSessionFile: runtime.parentSession!,
-			ownerSessionId: "e2e-parent",
-		});
-		await mkdir(registryPath, { recursive: true });
 		await runtime.handlers.get("session_start")?.({ reason: "startup" }, runtime.ctx);
 		const result = await call(runtime, "subagent_start", {
-			task: "must not start",
+			task: "starts after startup",
 			model: "provider/model",
 			thinking: "off",
 		});
 		const starts = (await logRecords(runtime)).filter((record) => record.event === "start");
-		assert.equal(starts.length, 0, "launch started a child after its registry save failed");
-		assert.equal(result.details.handle, undefined);
-		const registryIsFile = await stat(registryPath).then((value) => value.isFile()).catch(() => false);
-		assert.equal(registryIsFile, false, "failed launch left a durable registry file");
-		return { childStarted: false, durableCleanup: true };
+		assert.equal(starts.length, 1, "startup blocked a child launch");
+		assert.equal(typeof result.details.handle?.id, "string");
+		return { childStarted: true };
 	} finally {
-		if (registryPath) await rm(registryPath, { recursive: true, force: true }).catch(() => {});
 		await cleanup(runtime);
 	}
 }
@@ -1212,8 +1148,8 @@ async function run(): Promise<Record<string, unknown>> {
 			return scenarioLargeAgentEnd();
 		case "stream-flood":
 			return scenarioStreamFlood();
-		case "persistence-flood":
-			return scenarioPersistenceFlood();
+		case "completion-flood":
+			return scenarioCompletionFlood();
 		case "active-child-limit":
 			return scenarioActiveLimit();
 		case "rpc-unterminated-record":
@@ -1235,8 +1171,8 @@ async function run(): Promise<Record<string, unknown>> {
 			return scenarioStaleRunView();
 		case "transcript-large-record":
 			return scenarioLargeTranscript();
-		case "launch-persistence":
-			return scenarioLaunchPersistence();
+		case "launch-after-startup":
+			return scenarioLaunchAfterStartup();
 		case "ephemeral-parent":
 			return scenarioEphemeral();
 		case "notification-parameter":
