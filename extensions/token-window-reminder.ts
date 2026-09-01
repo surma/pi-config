@@ -6,6 +6,7 @@ import { readReserveTokens } from "./lib/compaction-settings.js";
 const ENTRY_CONFIG = "token-window-reminder-config";
 const ENTRY_REMINDER = "token-window-reminder-fired";
 const ENTRY_RESET = "token-window-reminder-reset";
+const ENTRY_HANDOFF_BOUNDARY = "token-window-reminder-handoff-boundary";
 
 const DEFAULT_ENABLED = true;
 const MAX_HANDOFF_OUTPUT_TOKENS = 16_275;
@@ -449,6 +450,14 @@ function assistantResponseSucceeded(message: unknown): boolean {
 	return candidate.role === "assistant" && candidate.stopReason !== "error" && candidate.stopReason !== "aborted";
 }
 
+function matchingHandoffCompaction(value: unknown, toolCallId: string): boolean {
+	if (!value || typeof value !== "object") return false;
+	const details = (value as { details?: unknown }).details;
+	if (!details || typeof details !== "object") return false;
+	const candidate = details as { source?: unknown; toolCallId?: unknown };
+	return candidate.source === "compaction_handoff" && candidate.toolCallId === toolCallId;
+}
+
 // Makes laundering depth visible. An item still tagged `[g1]` inside a `g7` summary
 // has been copied forward six times without anyone re-checking it.
 function renderGenerationSection(generation: number): string {
@@ -576,6 +585,9 @@ export default function tokenWindowReminder(pi: ExtensionAPI) {
 	// Successful handoffs dispatch one continuation at most once. Keep IDs across
 	// branch resets so restoration and duplicate lifecycle events cannot replay them.
 	const processedHandoffCallIds = new Set<string>();
+	let pendingHandoff: HandoffToolCall | undefined;
+	let pendingHandoffCompacted = false;
+	let handoffCompactionRequested = false;
 	let continuationLifecycleActive = true;
 	// Count of hand-off boundaries this session has crossed, so the summary can show
 	// how far its own content is from the source. Native compaction does not reset it:
@@ -600,6 +612,9 @@ export default function tokenWindowReminder(pi: ExtensionAPI) {
 
 	function rebuildFromBranch(ctx: ExtensionContext): void {
 		reserveTokens = effectiveReserveTokens();
+		pendingHandoff = undefined;
+		pendingHandoffCompacted = false;
+		handoffCompactionRequested = false;
 		enabled = DEFAULT_ENABLED;
 		lastWarnedRung = undefined;
 		recoveryPending = false;
@@ -672,6 +687,36 @@ export default function tokenWindowReminder(pi: ExtensionAPI) {
 				}
 			}
 		}
+	}
+
+	function notifyHandoff(ctx: ExtensionContext, message: string): void {
+		try {
+			if (ctx.hasUI) ctx.ui.notify(message, "warning");
+		} catch {
+			// The compaction callback can outlive its extension context during shutdown.
+		}
+	}
+
+	function completeHandoff(handoff: HandoffToolCall, ctx: ExtensionContext): void {
+		if (pendingHandoff?.id !== handoff.id) return;
+		pendingHandoff = undefined;
+		pendingHandoffCompacted = false;
+		handoffCompactionRequested = false;
+		if (!continuationLifecycleActive || !handoff.continue) return;
+		try {
+			pi.sendUserMessage("continue");
+		} catch (error) {
+			const reason = error instanceof Error ? error.message : String(error);
+			notifyHandoff(ctx, `Compaction hand-off continuation failed: ${reason}`);
+		}
+	}
+
+	function failHandoff(handoff: HandoffToolCall, error: Error, ctx: ExtensionContext): void {
+		if (pendingHandoff?.id !== handoff.id) return;
+		pendingHandoff = undefined;
+		pendingHandoffCompacted = false;
+		handoffCompactionRequested = false;
+		notifyHandoff(ctx, `Compaction hand-off failed: ${error.message}`);
 	}
 
 	function deliver(message: string, ctx: ExtensionContext): void {
@@ -852,17 +897,16 @@ export default function tokenWindowReminder(pi: ExtensionAPI) {
 			lastWarnedRung = undefined;
 			handoffAwaitingFreshUsage = true;
 
-			if (assistantResponseSucceeded(event.message) && !processedHandoffCallIds.has(completedHandoff.id)) {
+			if (
+				assistantResponseSucceeded(event.message) &&
+				!ctx.signal?.aborted &&
+				!processedHandoffCallIds.has(completedHandoff.id)
+			) {
 				processedHandoffCallIds.add(completedHandoff.id);
 				handoffGeneration += 1;
-				if (continuationLifecycleActive && completedHandoff.continue && !ctx.signal?.aborted) {
-					try {
-						pi.sendUserMessage("continue", { deliverAs: "followUp" });
-					} catch (error) {
-						const reason = error instanceof Error ? error.message : String(error);
-						if (ctx.hasUI) ctx.ui.notify(`Compaction hand-off continuation failed: ${reason}`, "warning");
-					}
-				}
+				pendingHandoff = completedHandoff;
+				pendingHandoffCompacted = false;
+				handoffCompactionRequested = false;
 			}
 			return;
 		}
@@ -888,13 +932,48 @@ export default function tokenWindowReminder(pi: ExtensionAPI) {
 		};
 	});
 
-	pi.on("session_compact", async (_event, _ctx) => {
+	pi.on("session_compact", async (event, _ctx) => {
+		if (pendingHandoff && matchingHandoffCompaction(event.compactionEntry, pendingHandoff.id)) {
+			pendingHandoffCompacted = true;
+		}
 		// Native compaction drops utilization. If we had warned, queue a recovery
 		// notice and re-arm the ladder. OR in so a second compaction before the next
 		// turn cannot drop a recovery already queued by the first.
 		recoveryPending = recoveryPending || lastWarnedRung !== undefined;
 		lastWarnedRung = undefined;
 		handoffAwaitingFreshUsage = false;
+	});
+
+	pi.on("agent_settled", async (_event, ctx) => {
+		const handoff = pendingHandoff;
+		if (!handoff) return;
+		if (pendingHandoffCompacted) {
+			completeHandoff(handoff, ctx);
+			return;
+		}
+		if (handoffCompactionRequested) return;
+		handoffCompactionRequested = true;
+		// While idle, this message is appended without starting a provider turn. It
+		// gives terminal tool calls a valid cut point for manual compaction.
+		pi.sendMessage(
+			{
+				customType: ENTRY_HANDOFF_BOUNDARY,
+				content: "Resume from the compaction hand-off summary.",
+				display: false,
+				details: { toolCallId: handoff.id },
+			},
+			{ triggerTurn: false },
+		);
+		ctx.compact({
+			onComplete: (result) => {
+				if (matchingHandoffCompaction(result, handoff.id)) {
+					completeHandoff(handoff, ctx);
+					return;
+				}
+				failHandoff(handoff, new Error("Compaction marker did not match the hand-off."), ctx);
+			},
+			onError: (error) => failHandoff(handoff, error, ctx),
+		});
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -909,5 +988,8 @@ export default function tokenWindowReminder(pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async () => {
 		continuationLifecycleActive = false;
+		pendingHandoff = undefined;
+		pendingHandoffCompacted = false;
+		handoffCompactionRequested = false;
 	});
 }
