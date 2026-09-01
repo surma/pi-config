@@ -85,6 +85,7 @@ function harness(branch: any[] = []) {
 	const tools = new Map<string, any>();
 	const entries = branch;
 	const sends: Array<{ content: unknown; options: unknown }> = [];
+	const compactions: any[] = [];
 	const commands = new Map<string, any>();
 	const notifications: Array<{ message: string; level: string }> = [];
 	let signal: AbortSignal | undefined;
@@ -105,6 +106,16 @@ function harness(branch: any[] = []) {
 		appendEntry(customType: string, data: unknown) {
 			entries.push({ type: "custom", customType, data });
 		},
+		sendMessage(message: any) {
+			entries.push({
+				type: "custom_message",
+				id: `entry-${entries.length}`,
+				customType: message.customType,
+				content: message.content,
+				display: message.display,
+				details: message.details,
+			});
+		},
 		sendUserMessage(content: unknown, options: unknown) {
 			sends.push({ content, options });
 		},
@@ -118,6 +129,9 @@ function harness(branch: any[] = []) {
 			return signal;
 		},
 		getContextUsage: () => usage,
+		compact(options: any) {
+			compactions.push(options);
+		},
 		sessionManager: {
 			getBranch: () => entries,
 		},
@@ -145,6 +159,7 @@ function harness(branch: any[] = []) {
 			usage = value;
 		},
 		sends,
+		compactions,
 		notifications,
 		commands,
 		start() {
@@ -467,6 +482,72 @@ test("a replayed handoff does not inflate the generation counter", async () => {
 	assert.match(compactionSummary(nativeResult), /This summary is compaction generation 1\./);
 });
 
+test("a successful handoff compacts after the run settles and then continues", async () => {
+	const h = harness();
+	await h.start();
+
+	await emitHandoff(h, "call-deferred");
+	assert.equal(h.compactions.length, 0);
+	assert.equal(h.entries.length, 0);
+	assert.equal(h.sends.length, 0);
+
+	await h.emit("agent_settled", {});
+	assert.equal(h.compactions.length, 1);
+	assert.deepEqual(h.entries.at(-1), {
+		type: "custom_message",
+		id: "entry-0",
+		customType: "token-window-reminder-handoff-boundary",
+		content: "Resume from the compaction hand-off summary.",
+		display: false,
+		details: { toolCallId: "call-deferred" },
+	});
+	assert.equal(h.sends.length, 0);
+	await h.compactions[0].onComplete?.({
+		details: { source: "compaction_handoff", toolCallId: "call-deferred" },
+	});
+	assert.deepEqual(h.sends, [{ content: "continue", options: undefined }]);
+});
+
+test("failed or mismatched manual compaction does not continue", async (t) => {
+	await t.test("compaction failure", async () => {
+		const h = harness();
+		await h.start();
+		await emitHandoff(h, "call-failed-compaction");
+		await h.emit("agent_settled", {});
+		await h.compactions[0].onError?.(new Error("disk unavailable"));
+		assert.equal(h.sends.length, 0);
+		await h.emit("agent_settled", {});
+		assert.equal(h.compactions.length, 1);
+	});
+
+	await t.test("mismatched marker", async () => {
+		const h = harness();
+		await h.start();
+		await emitHandoff(h, "call-mismatch");
+		await h.emit("agent_settled", {});
+		await h.compactions[0].onComplete?.({
+			details: { source: "compaction_handoff", toolCallId: "another-call" },
+		});
+		assert.equal(h.sends.length, 0);
+	});
+});
+
+test("native compaction completes the handoff without a second compaction request", async () => {
+	const h = harness();
+	await h.start();
+	await emitHandoff(h, "call-native");
+	const nativeResult = await h.emit(
+		"session_before_compact",
+		nativeCompactionEvent(handoffBranch("call-native", {}, [])),
+	);
+
+	await h.emit("session_compact", { compactionEntry: nativeResult.compaction });
+	await h.emit("agent_settled", {});
+
+	assert.equal(h.compactions.length, 0);
+	assert.deepEqual(h.sends, [{ content: "continue", options: undefined }]);
+});
+
 test("the schema keeps continue optional and the runtime default queues exactly one message", async () => {
 	const h = harness();
 	await h.start();
@@ -483,16 +564,27 @@ test("the schema keeps continue optional and the runtime default queues exactly 
 	assert.equal(toolResult.terminate, true);
 
 	await emitHandoff(h, "call-omitted");
-	assert.deepEqual(h.sends, [{ content: "continue", options: { deliverAs: "followUp" } }]);
+	assert.equal(h.sends.length, 0);
+	await h.emit("agent_settled", {});
+	assert.equal(h.compactions.length, 1);
+	await h.compactions[0].onComplete?.({
+		details: { source: "compaction_handoff", toolCallId: "call-omitted" },
+	});
+	assert.deepEqual(h.sends, [{ content: "continue", options: undefined }]);
 	await emitHandoff(h, "call-omitted");
+	assert.equal(h.compactions.length, 1);
 	assert.equal(h.sends.length, 1);
 });
 
-test("continue true queues the same exact message once", async () => {
+test("continue true sends the same exact message after compaction", async () => {
 	const h = harness();
 	await h.start();
 	await emitHandoff(h, "call-true", { continue: true });
-	assert.deepEqual(h.sends, [{ content: "continue", options: { deliverAs: "followUp" } }]);
+	await h.emit("agent_settled", {});
+	await h.compactions[0].onComplete?.({
+		details: { source: "compaction_handoff", toolCallId: "call-true" },
+	});
+	assert.deepEqual(h.sends, [{ content: "continue", options: undefined }]);
 });
 
 test("continue false leaves Pi idle while native compaction keeps the handoff", async () => {
@@ -508,6 +600,10 @@ test("continue false leaves Pi idle while native compaction keeps the handoff", 
 	assert.equal(toolResult.terminate, true);
 
 	await emitHandoff(h, "call-false", { continue: false });
+	await h.emit("agent_settled", {});
+	await h.compactions[0].onComplete?.({
+		details: { source: "compaction_handoff", toolCallId: "call-false" },
+	});
 	assert.equal(h.sends.length, 0);
 
 	const nativeResult = await h.emit(
@@ -554,11 +650,16 @@ test("failure and abort never queue continuation", async (t) => {
 	});
 });
 
-test("duplicate lifecycle events do not replay a processed handoff", async () => {
+test("duplicate lifecycle events request one compaction and one continuation", async () => {
 	const h = harness();
 	await h.start();
 	await emitHandoff(h, "call-duplicate");
 	await emitHandoff(h, "call-duplicate");
+	await h.emit("agent_settled", {});
+	assert.equal(h.compactions.length, 1);
+	await h.compactions[0].onComplete?.({
+		details: { source: "compaction_handoff", toolCallId: "call-duplicate" },
+	});
 	assert.equal(h.sends.length, 1);
 });
 
@@ -579,10 +680,18 @@ test("session restoration and lifecycle reset do not replay history", async () =
 	h.entries.length = 0;
 	await h.emit("session_tree", {});
 	await emitHandoff(h, "call-new-lifecycle");
+	await h.emit("agent_settled", {});
+	await h.compactions[0].onComplete?.({
+		details: { source: "compaction_handoff", toolCallId: "call-new-lifecycle" },
+	});
 	assert.equal(h.sends.length, 1);
 
 	await h.emit("session_shutdown", {});
 	await emitHandoff(h, "call-after-shutdown");
+	await h.emit("agent_settled", {});
+	await h.compactions[1].onComplete?.({
+		details: { source: "compaction_handoff", toolCallId: "call-after-shutdown" },
+	});
 	assert.equal(h.sends.length, 1);
 });
 
