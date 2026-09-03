@@ -9,8 +9,9 @@
  * The hard part is deciding what "done" means. Two things can keep the agent
  * active near an `agent_end` event, and neither should trigger a notification:
  *
- *   1. A successful `compaction_handoff` can queue one follow-up user message
- *      before settlement. So `agent_end` alone does not always mean "done".
+ *   1. A compaction can queue one follow-up user message before settlement, so
+ *      `agent_end` alone does not always mean "done". pi-vcc does this through
+ *      its `continueAfterThresholdCompact` option.
  *   2. Auto-compaction runs at a run boundary (after `agent_end`). During
  *      compaction `ctx.isIdle()` returns true — compaction is tracked
  *      separately and does not count as streaming — so a plain idle check would
@@ -19,8 +20,8 @@
  * Strategy: arm a short idle-grace timer on `agent_end`; when it fires, notify
  * only if the agent is genuinely idle with nothing queued.
  *
- *   - Handoff case: the follow-up message queues before the agent settles, so
- *     the agent is busy again and the idle guard suppresses notification.
+ *   - Continuation case: the follow-up message queues before the agent settles,
+ *     so the agent is busy again and the idle guard suppresses notification.
  *   - Compaction case: pause the timer when compaction starts and re-arm it
  *     when compaction finishes. After compaction the agent is either busy or
  *     genuinely done.
