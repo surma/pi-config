@@ -129,7 +129,7 @@ test("a fallback identity can upgrade to a documented provider responseId", () =
 	);
 	assert.equal(live.finalizedAssistantResponseId, "response-late");
 	assert.deepEqual(live.finalizedAssistantIdentities[0], {
-		fallbackKey: JSON.stringify([6, "test-api", "p", "m"]),
+		fallbackKey: JSON.stringify([6]),
 		timestamp: 6,
 		responseId: "response-late",
 	});
@@ -146,6 +146,24 @@ test("a fallback identity can upgrade to a documented provider responseId", () =
 		startAssistantMessage(live, message(6, "", "response-late")),
 		false,
 	);
+});
+
+test("a responseId upgrade tolerates provider model canonicalization", () => {
+	const live = state();
+	const started = {
+		...message(7, ""),
+		model: "fireworks:accounts/fireworks/models/glm-5p3-flash",
+	};
+	const finalized = {
+		...message(7, "done", "response-canonical"),
+		model: "accounts/fireworks/models/glm-5p3-flash",
+	};
+
+	assert.equal(startAssistantMessage(live, started), true);
+	assert.equal(finalizeAssistantMessage(live, finalized, 1024), true);
+	assert.equal(live.finalizedAssistantMessageGeneration, 1);
+	assert.equal(live.finalizedAssistantResponseId, "response-canonical");
+	assert.equal(live.resultText, "done");
 });
 
 test("retained older finalized identities reject start, update, and end records", () => {

@@ -624,6 +624,12 @@ export function dispatchSubagentEvent(
 				outcome === "aborted" ||
 				stopReason === "aborted";
 			if (abortFence) abortRun(handle, at);
+			else if (current?.phase === "active" && current.corroborated) {
+				options.diagnostic(
+					`Native agent_settled ended run ${current.id} without an accepted agent_end.`,
+				);
+				if (!endRun(handle, at, false)) return false;
+			}
 			const state = settleRunToIdle(
 				handle,
 				at,
