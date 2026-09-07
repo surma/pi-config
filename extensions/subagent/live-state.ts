@@ -78,7 +78,7 @@ interface AssistantMessageIdentity {
 // FIFO tombstones keep the last 256 finalized identities independent from the active/latest display state.
 export const MAX_FINALIZED_ASSISTANT_IDENTITIES = 256;
 
-/** Pi starts some provider streams before responseId is populated; these public AssistantMessage fields are the stable fallback. */
+/** Each live state belongs to one child session. The timestamp bridges message_start to a later responseId. */
 function assistantMessageFallbackKey(
 	message: Record<string, unknown> | undefined,
 ): string | undefined {
@@ -86,12 +86,7 @@ function assistantMessageFallbackKey(
 	const timestamp = message.timestamp;
 	if (typeof timestamp !== "number" || !Number.isFinite(timestamp))
 		return undefined;
-	return JSON.stringify([
-		timestamp,
-		message.api ?? "",
-		message.provider ?? "",
-		message.model ?? "",
-	]);
+	return JSON.stringify([timestamp]);
 }
 
 function assistantMessageIdentity(

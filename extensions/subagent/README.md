@@ -88,6 +88,8 @@ It uses UTF-8 decoding that supports a character split across stream chunks. Uni
 
 Requests receive generated IDs. The transport resolves responses by ID, so responses can arrive out of order. Events remain asynchronous and pass to the lifecycle dispatcher.
 
+The dispatcher scopes assistant events to the handle's child session, process incarnation, and active run. Within that scope, a local generation identifies each assistant message. Until `responseId` appears, the message timestamp provides a fallback key. The provider, API, and model fields remain metadata.
+
 The parent sends these RPC commands:
 
 - `get_state` captures the child session path and effective model state.
@@ -107,6 +109,8 @@ Production `agent_settled` normally has this bare shape:
 ```
 
 It normally has no run ID or outcome. The parent records the abort request before it sends `abort` and keeps that evidence until the dispatcher accepts native settlement.
+
+If a corroborated run remains active, `agent_settled` closes it and records the missing or rejected `agent_end`.
 
 A late abort response does not clear the pending abort evidence. A native settlement without a final assistant message can still classify the run as aborted.
 

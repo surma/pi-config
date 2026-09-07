@@ -191,6 +191,95 @@ test("native agent_settled infers an aborted outcome from the final assistant me
 	assert.equal(h.settled, 1);
 });
 
+test("provider model canonicalization does not block native settlement", () => {
+	const h = harness();
+	const completed = {
+		...assistant(2, "done", "stop", "response-canonical"),
+		api: "anthropic-messages",
+		provider: "fireworks",
+		model: "accounts/fireworks/models/glm-5p3-flash",
+	};
+	const started = {
+		...completed,
+		content: [],
+		model: "fireworks:accounts/fireworks/models/glm-5p3-flash",
+		responseId: undefined,
+		stopReason: "pending",
+	};
+
+	assert.equal(
+		dispatchSubagentEvent(h.handle, { type: "agent_start" }, h.options),
+		true,
+	);
+	assert.equal(
+		dispatchSubagentEvent(
+			h.handle,
+			{ type: "message_start", message: started },
+			h.options,
+		),
+		true,
+	);
+	assert.equal(
+		dispatchSubagentEvent(
+			h.handle,
+			{ type: "message_end", message: completed },
+			h.options,
+		),
+		true,
+	);
+	assert.equal(
+		dispatchSubagentEvent(
+			h.handle,
+			{ type: "agent_end", messages: [completed], willRetry: false },
+			h.options,
+		),
+		true,
+	);
+	assert.equal(
+		dispatchSubagentEvent(h.handle, { type: "agent_settled" }, h.options),
+		true,
+	);
+	assert.equal(h.handle.processState, "alive");
+	assert.equal(h.handle.runState, "idle");
+	assert.equal(h.handle.settlementStatus, "settled");
+	assert.equal(h.handle.resultText, "done");
+	assert.equal(h.settled, 1);
+	assert.deepEqual(h.diagnostics, []);
+});
+
+test("native settlement closes a corroborated run after an unmatched agent_end", () => {
+	const h = harness();
+	const completed = assistant(3, "done", "stop", "response-final");
+	const mismatched = {
+		...completed,
+		responseId: "response-mismatched",
+	};
+
+	assert.equal(
+		dispatchSubagentEvent(h.handle, { type: "agent_start" }, h.options),
+		true,
+	);
+	emitMessage(h, completed);
+	assert.equal(
+		dispatchSubagentEvent(
+			h.handle,
+			{ type: "agent_end", messages: [mismatched], willRetry: false },
+			h.options,
+		),
+		false,
+	);
+	assert.equal(
+		dispatchSubagentEvent(h.handle, { type: "agent_settled" }, h.options),
+		true,
+	);
+	assert.equal(h.handle.runState, "idle");
+	assert.equal(h.handle.runOutcome, "succeeded");
+	assert.equal(h.handle.resultText, "done");
+	assert.equal(h.settled, 1);
+	assert.match(h.diagnostics.join("\n"), /does not match the active run/);
+	assert.match(h.diagnostics.join("\n"), /without an accepted agent_end/);
+});
+
 test("explicit abort fence settles native settlement without message_end", () => {
 	const h = harness();
 	assert.equal(
