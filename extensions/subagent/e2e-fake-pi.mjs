@@ -290,9 +290,7 @@ function command(command) {
   if (command.type === "get_state") {
     if (
       mode === "hang-get-state" ||
-      (mode === "hang-resume-state" && startsLogged() > 1) ||
-      (mode === "queue-launch" && startsLogged() === 1) ||
-      (mode === "queue-resume" && run > 0 && startsLogged() <= 2)
+      (mode === "queue-launch" && startsLogged() === 1)
     ) return;
     if (mode === "extension-error") {
       output({
@@ -308,8 +306,7 @@ function command(command) {
         model: { provider: "provider", id: "model" },
         thinkingLevel: "off",
       });
-    if (mode === "resume-race" && run > 0) setTimeout(sendState, 100);
-    else sendState();
+    sendState();
     return;
   }
   if (command.type === "prompt") {
@@ -343,7 +340,7 @@ function command(command) {
     }, 20);
     return;
   }
-  if (command.type === "steer" || command.type === "follow_up") {
+  if (command.type === "steer") {
     if (mode === "hang-message" || mode === "hang-abort") return;
     messageCount += 1;
     if (mode === "queue-message" && messageCount === 1) {

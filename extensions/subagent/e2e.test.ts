@@ -187,12 +187,10 @@ async function runScenario(
 const cancellationCases: [string, string, number][] = [
 	["start", "subagent_start", 6_000],
 	["list", "subagent_list", 6_000],
-	["status", "subagent_status", 6_000],
+	["inspect", "subagent_inspect", 6_000],
 	["steer", "subagent_steer", 6_000],
-	["follow-up", "subagent_follow_up", 6_000],
 	["interrupt", "subagent_interrupt", 6_000],
-	["kill", "subagent_kill", 10_000],
-	["resume", "subagent_resume", 7_000],
+	["remove", "subagent_remove", 10_000],
 ];
 
 for (const [suffix, toolName, timeoutMs] of cancellationCases) {
@@ -201,15 +199,6 @@ for (const [suffix, toolName, timeoutMs] of cancellationCases) {
 		assert.equal(result.settled, true);
 	});
 }
-
-e2eTest(
-	"E2E: resume cancellation releases the original indefinite-resume chain",
-	{ timeout: 9_000 },
-	async () => {
-		const result = await runScenario("cancel-resume", 7_000);
-		assert.equal(result.tool, "subagent_resume");
-	},
-);
 
 e2eTest("E2E: production abort responds after native settlement", { timeout: 8_000 }, async () => {
 	const result = await runScenario("abort-order");
@@ -342,15 +331,12 @@ e2eTest("E2E: ephemeral parent sessions can start children", { timeout: 8_000 },
 	assert.equal(result.accepted, true);
 });
 
-e2eTest("E2E: settlement guidance names the status message parameter", { timeout: 8_000 }, async () => {
+e2eTest("E2E: the stop notification names the reason and the inspect tool", { timeout: 8_000 }, async () => {
 	const result = await runScenario("notification-parameter");
-	assert.match(String(result.content), /numMessages=3/);
+	assert.match(String(result.content), /stopped: it finished its turn/);
+	assert.match(String(result.content), /subagent_inspect/);
 });
 
-e2eTest("E2E: concurrent resume creates one child incarnation", { timeout: 12_000 }, async () => {
-	const result = await runScenario("concurrent-resume", 9_000);
-	assert.equal(result.processStarts, 2);
-});
 
 e2eTest("E2E: a canceled queued operation releases its predecessor", { timeout: 12_000 }, async () => {
 	const result = await runScenario("hanging-predecessor", 9_000);

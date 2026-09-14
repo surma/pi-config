@@ -25,7 +25,6 @@ import {
 	lifecycleActivity,
 	markStopped,
 	requestKill,
-	reviveForResume,
 	syncLifecycleCompatibility,
 	type RunOutcome,
 	type SessionLifecycle,
@@ -126,11 +125,10 @@ interface UsageStats {
 }
 interface TaskSpec {
 	name?: string;
-	task: string;
+	prompt: string;
 	cwd?: string;
 	model: string;
 	thinking: ThinkingLevel;
-	systemPrompt?: string;
 }
 interface AssistantAssembly {
 	message: Record<string, unknown>;
@@ -241,7 +239,7 @@ function deadlineTimeout(deadline: number | undefined, fallback: number): number
 }
 
 function emptyTranscriptResult(): TranscriptResult {
-	return { status: "unreadable", messages: [], nextMessageOffset: 0 };
+	return { status: "unreadable", messages: [], totalMessages: 0 };
 }
 
 async function verifyChildExtensionHealth(
@@ -322,6 +320,17 @@ function truncate(value: string | undefined, max = 240) {
 	return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
 
+/** A compact age, so the caller does not have to subtract timestamps. */
+function relativeAge(milliseconds: number): string {
+	const seconds = Math.max(0, Math.round(milliseconds / 1000));
+	if (seconds < 60) return `${seconds}s ago`;
+	const minutes = Math.floor(seconds / 60);
+	if (minutes < 60) return `${minutes}m ago`;
+	const hours = Math.floor(minutes / 60);
+	if (hours < 24) return `${hours}h ${minutes % 60}m ago`;
+	return `${Math.floor(hours / 24)}d ${hours % 24}h ago`;
+}
+
 function tail(
 	value: string | undefined,
 	max = MAX_STDERR_TAIL,
@@ -332,96 +341,6 @@ function tail(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-interface ResumeParameters {
-	sessionFile: string;
-	sessionId: string;
-	cwd: string;
-	requestedModel: string;
-	requestedThinking: ThinkingLevel;
-	task: string;
-	createdAt: number;
-	lastActivityAt: number;
-}
-
-function sessionMessageText(message: Record<string, unknown>): string {
-	if (typeof message.content === "string") return message.content;
-	if (!Array.isArray(message.content)) return "";
-	return message.content
-		.map((part) =>
-			isRecord(part) && typeof part.text === "string" ? part.text : "",
-		)
-		.join("");
-}
-
-function parseResumeSession(
-	sessionFile: string,
-	raw: string,
-	lastActivityAt: number,
-): ResumeParameters | undefined {
-	const records: Record<string, unknown>[] = [];
-	for (const line of raw.split(/\r?\n/)) {
-		if (!line.trim()) continue;
-		try {
-			const value: unknown = JSON.parse(line);
-			if (isRecord(value)) records.push(value);
-		} catch {
-			// Match the session loader and ignore an incomplete trailing record.
-		}
-	}
-	const header = records[0];
-	if (
-		!header ||
-		header.type !== "session" ||
-		typeof header.id !== "string" ||
-		typeof header.cwd !== "string" ||
-		!header.cwd
-	)
-		return undefined;
-	let latestModel: string | undefined;
-	let latestMessageModel: string | undefined;
-	let initialThinking: ThinkingLevel | undefined;
-	let latestThinking: ThinkingLevel | undefined;
-	let task = "";
-	for (const record of records.slice(1)) {
-		if (
-			record.type === "model_change" &&
-			typeof record.provider === "string" &&
-			record.provider &&
-			typeof record.modelId === "string" &&
-			record.modelId
-		)
-			latestModel = `${record.provider}/${record.modelId}`;
-		if (record.type === "thinking_level_change" && isThinking(record.thinkingLevel)) {
-			initialThinking ??= record.thinkingLevel;
-			latestThinking = record.thinkingLevel;
-		}
-		if (record.type !== "message" || !isRecord(record.message)) continue;
-		if (record.message.role === "user" && !task)
-			task = sessionMessageText(record.message);
-		if (
-			typeof record.message.provider === "string" &&
-			record.message.provider &&
-			typeof record.message.model === "string" &&
-			record.message.model
-		)
-			latestMessageModel = `${record.message.provider}/${record.message.model}`;
-	}
-	const requestedModel = latestModel || latestMessageModel;
-	if (!requestedModel) return undefined;
-	const parsedTimestamp =
-		typeof header.timestamp === "string" ? Date.parse(header.timestamp) : NaN;
-	return {
-		sessionFile,
-		sessionId: header.id,
-		cwd: header.cwd,
-		requestedModel,
-		requestedThinking: latestThinking || initialThinking || "off",
-		task: task || "Resumed child session",
-		createdAt: Number.isFinite(parsedTimestamp) ? parsedTimestamp : lastActivityAt,
-		lastActivityAt,
-	};
 }
 
 function copyMessage(message: Record<string, unknown>): Record<string, unknown> {
@@ -780,7 +699,6 @@ interface SubagentHandle extends SubagentDispatchHandle {
 	ownerSessionFile: string;
 	ownerSessionId: string;
 	incarnation: string;
-	resumedFrom?: string;
 	assistantAssembly?: AssistantAssembly;
 }
 
@@ -814,24 +732,36 @@ const ThinkingSchema = StringEnum([
 ] as const);
 const TaskSpecSchema = Type.Object(
 	{
-		name: Type.Optional(Type.String()),
-		task: Type.String({ minLength: 1, maxLength: MAX_CALLER_TASK_LENGTH }),
-		cwd: Type.Optional(Type.String()),
+		prompt: Type.String({
+			minLength: 1,
+			maxLength: MAX_CALLER_TASK_LENGTH,
+			description: "The initial instruction for the subagent.",
+		}),
 		model: Type.String({ minLength: 1 }),
 		thinking: ThinkingSchema,
-		systemPrompt: Type.Optional(Type.String()),
+		name: Type.Optional(
+			Type.String({ description: "A short label for lists and notifications." }),
+		),
+		cwd: Type.Optional(
+			Type.String({
+				description:
+					"The working directory for the subagent. It defaults to your own.",
+			}),
+		),
 	},
 	{ additionalProperties: false },
 );
-const ListSchema = Type.Object({
-	includeFinished: Type.Optional(Type.Boolean({ default: true })),
-});
-const StatusSchema = Type.Object(
+const ListSchema = Type.Object({}, { additionalProperties: false });
+const InspectSchema = Type.Object(
 	{
 		id: Type.String(),
-		messageOffset: Type.Optional(Type.Integer({ minimum: 0, default: 0 })),
-		numMessages: Type.Optional(
-			Type.Integer({ minimum: 0, maximum: 20, default: 3 }),
+		n: Type.Optional(
+			Type.Integer({
+				minimum: 0,
+				maximum: 50,
+				default: 1,
+				description: "How many of the most recent messages to return.",
+			}),
 		),
 	},
 	{ additionalProperties: false },
@@ -841,17 +771,6 @@ const MessageSchema = Type.Object({
 	message: Type.String({ minLength: 1 }),
 });
 const IdSchema = Type.Object({ id: Type.String() });
-const ResumeSchema = Type.Object({
-	id: Type.String({ description: "Logical child id to resume." }),
-	task: Type.Optional(
-		Type.String({
-			minLength: 1,
-			maxLength: MAX_CALLER_TASK_LENGTH,
-			description:
-				"Initial message after the resumed session loads. If omitted, the child starts idle.",
-		}),
-	),
-});
 
 function updateAssistantAssembly(
 	handle: SubagentHandle,
@@ -1120,24 +1039,31 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		}
 	};
 
+	/** Wake the owner once for any stop the owner did not ask for. */
+	function announceStop(
+		handle: SubagentHandle,
+		record: Omit<
+			SettlementNotificationRecord,
+			"ownerSessionFile" | "ownerSessionId" | "childId" | "incarnation" | "name"
+		>,
+	): void {
+		if (sessionShuttingDown || handle.killRequestedAt !== undefined) return;
+		settlementNotifications.queue({
+			ownerSessionFile: handle.ownerSessionFile,
+			ownerSessionId: handle.ownerSessionId,
+			childId: handle.id,
+			incarnation: handle.incarnation,
+			name: handle.name,
+			...record,
+		});
+	}
+
 	function acceptSettlement(
 		handle: SubagentHandle,
 		runId: number,
 		outcome: Exclude<RunOutcome, "pending">,
 	): void {
-		const notification: SettlementNotificationRecord = {
-			ownerSessionFile: handle.ownerSessionFile,
-			ownerSessionId: handle.ownerSessionId,
-			childId: handle.id,
-			incarnation: handle.incarnation,
-			runId,
-			eventKind: "run_settled",
-			outcome,
-		};
-
-		// The wake is non-durable.
-		if (!sessionShuttingDown && handle.killRequestedAt === undefined)
-			settlementNotifications.queue(notification);
+		announceStop(handle, { runId, eventKind: "run_settled", outcome });
 	}
 
 	async function serialize(
@@ -1189,7 +1115,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			transcript: {
 				status: transcript.status,
 				messages: transcript.messages,
-				nextMessageOffset: transcript.nextMessageOffset,
+				totalMessages: transcript.totalMessages,
 			},
 			error: handle.error || handle.finalError || undefined,
 			stderrTail: tail(handle.stderr),
@@ -1232,14 +1158,90 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				: undefined,
 		};
 	}
+	/** A short cause for the stop notification. */
+	function closeDetail(handle: SubagentHandle, close: RpcProcessClose): string {
+		const parts = [
+			close.signal
+				? `signal ${close.signal}`
+				: close.code === null || close.code === undefined
+					? "exit unknown"
+					: `exit ${close.code}`,
+		];
+		if (close.error?.message) parts.push(close.error.message);
+		const stderr = tail(handle.stderr, 200)?.trim();
+		if (stderr) parts.push(`stderr: ${stderr}`);
+		return `(${parts.join("; ")}).`;
+	}
+
+	/** The single state word that the calling agent acts on. */
+	function agentState(handle: SubagentHandle): "running" | "idle" | "stopped" {
+		if (handle.processState === "stopped") return "stopped";
+		return handle.runState === "idle" ? "idle" : "running";
+	}
+
+	function stampText(at: number | undefined, reference: number): string {
+		if (!at) return "unknown";
+		return `${new Date(at).toISOString()} (${relativeAge(reference - at)})`;
+	}
+
+	function headline(handle: SubagentHandle): string {
+		const label = handle.name ? `${handle.id} (${handle.name})` : handle.id;
+		const state = agentState(handle);
+		if (state !== "stopped") return `Subagent ${label}: ${state}`;
+		const exit =
+			handle.exitSignal
+				? `signal ${handle.exitSignal}`
+				: handle.exitCode === undefined
+					? "exit unknown"
+					: `exit ${handle.exitCode}`;
+		return `Subagent ${label}: stopped (${exit})`;
+	}
+
+	/** One line per child, for lists and for the inspect header. */
 	async function summary(
 		handle: SubagentHandle,
 		serial?: Awaited<ReturnType<typeof serialize>>,
 	) {
 		const details = serial || (await serialize(handle));
-		return sanitizeTerminalText(
-			`#${handle.id}${handle.name ? ` ${handle.name}` : ""} ${handle.processState}/${handle.runState} · run:${handle.runSequence || 0}\n  actual ${formatModel(details.actualModel)} · thinking:${details.actualThinking}\n  process ${handle.pid ?? "?"}${handle.exitCode !== undefined ? ` · exit ${handle.exitCode}` : ""}${handle.rpcReady ? " · RPC ready" : ""}\n  session ${details.sessionPath} (transcript ${details.transcript.status})${details.error ? `\n  error ${truncate(details.error, 180)}` : ""}`,
+		const at = now();
+		const lines = [
+			headline(handle),
+			`  model ${formatModel(details.actualModel)} · thinking ${details.actualThinking}`,
+			`  last run ${handle.runSequence || 0}: ${details.runOutcome}`,
+			`  started ${stampText(handle.createdAt, at)} · last activity ${stampText(handle.lastActivityAt, at)}`,
+			`  log ${details.sessionPath || "(none)"}`,
+		];
+		if (details.error) lines.push(`  error ${details.error}`);
+		return sanitizeTerminalText(lines.join("\n"));
+	}
+
+	/** The full inspect report: one header plus the most recent messages. */
+	async function inspectReport(
+		handle: SubagentHandle,
+		serial: Awaited<ReturnType<typeof serialize>>,
+		numMessages: number,
+	): Promise<string> {
+		const at = now();
+		const sections = [await summary(handle, serial)];
+		const transcript = serial.transcript;
+		if (transcript.status !== "available") {
+			sections.push(`Messages unavailable: the log is ${transcript.status}.`);
+			return sections.join("\n\n");
+		}
+		if (numMessages === 0) return sections.join("\n\n");
+		if (!transcript.messages.length) {
+			sections.push("No messages yet.");
+			return sections.join("\n\n");
+		}
+		const hidden = transcript.totalMessages - transcript.messages.length;
+		sections.push(
+			`Last ${transcript.messages.length} of ${transcript.totalMessages} messages${hidden > 0 ? ` (${hidden} earlier omitted)` : ""}:`,
 		);
+		for (const message of transcript.messages)
+			sections.push(
+				`[${stampText(message.timestamp, at)}] ${message.role}\n${sanitizeTerminalText(message.text)}`,
+			);
+		return sections.join("\n\n");
 	}
 
 	function createHandle(entry: HandleSeed): SubagentHandle {
@@ -1391,6 +1393,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		);
 		if (close.error)
 			addDiagnostic(handle, `RPC child process close error: ${close.error.message}`);
+		const settledBeforeClose = handle.settlementStatus === "settled";
 		if (handle.processState !== "stopped") {
 			markStopped(handle, now(), {
 				code: close.code,
@@ -1398,6 +1401,14 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				error: close.error?.message,
 			});
 		}
+		// A process that closes mid-run never settles, so nothing else wakes the owner.
+		if (!settledBeforeClose)
+			announceStop(handle, {
+				runId: 0,
+				eventKind: "process_died",
+				outcome: "died",
+				detail: closeDetail(handle, close),
+			});
 		notifyWaiters(handle);
 		update(handle);
 		if (
@@ -1786,12 +1797,11 @@ export default function subagentExtension(pi: ExtensionAPI) {
 
 	async function deliverMessage(
 		handle: SubagentHandle,
-		requestedCommand: "steer" | "follow_up",
 		message: string,
 		signal?: AbortSignal,
-	): Promise<"prompt" | "steer" | "follow_up"> {
+	): Promise<"prompt" | "steer"> {
 		throwIfAborted(signal);
-		const command = handle.runState === "idle" ? "prompt" : requestedCommand;
+		const command = handle.runState === "idle" ? "prompt" : "steer";
 		const before = handle.runSequence;
 		await sendRpc(handle, { type: command, message }, REQUEST_TIMEOUT_MS, signal);
 		if (command === "prompt")
@@ -1831,7 +1841,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		requestedThinking: ThinkingLevel,
 		signal?: AbortSignal,
 	): Promise<SubagentHandle> {
-		assertCallerTask(spec.task);
+		assertCallerTask(spec.prompt);
 		if (activeCount() + pendingLaunches >= MAX_ACTIVE_CHILDREN)
 			throw new Error(`The active subagent limit of ${MAX_ACTIVE_CHILDREN} has been reached.`);
 		pendingLaunches++;
@@ -1891,7 +1901,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		const handle = createHandle({
 			childId: id,
 			name: spec.name?.trim() || undefined,
-			task: spec.task,
+			task: spec.prompt,
 			cwd,
 			sessionDir,
 			requestedModel,
@@ -1930,7 +1940,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			await sendRpc(handle, { type: "get_state" }, STARTUP_TIMEOUT_MS, signal);
 			await awaitExtensionHealth(handle, signal);
 			const before = handle.runSequence;
-			await sendRpc(handle, { type: "prompt", message: spec.task }, REQUEST_TIMEOUT_MS, signal);
+			await sendRpc(handle, { type: "prompt", message: spec.prompt }, REQUEST_TIMEOUT_MS, signal);
 			await waitUntil(
 				() => handle.runSequence > before || handle.processState === "stopped",
 				1_000,
@@ -1948,161 +1958,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			throw error;
 		}
 		});
-	}
-
-	async function readResumeParameters(
-		id: string,
-		signal?: AbortSignal,
-	): Promise<ResumeParameters> {
-		const sessionDir = join(getAgentDir(), "sessions", "subagents", id);
-		let entries: Awaited<ReturnType<typeof fs.readdir>>;
-		try {
-			entries = await bounded(
-				fs.readdir(sessionDir, { withFileTypes: true }),
-				FILE_OPERATION_TIMEOUT_MS,
-				signal,
-				`Timed out finding the child session file for #${id}.`,
-			);
-		} catch (error) {
-			if (isAbortError(error)) throw error;
-			throw new Error(`No usable child session file exists for #${id}; resume is not possible.`);
-		}
-		const candidates = entries
-			.filter((entry) => entry.isFile() && entry.name.endsWith(".jsonl"))
-			.map((entry) => join(sessionDir, entry.name));
-		for (const sessionFile of candidates) {
-			try {
-				const stat = await bounded(
-					fs.stat(sessionFile),
-					FILE_OPERATION_TIMEOUT_MS,
-					signal,
-					`Timed out checking the child session file for #${id}.`,
-				);
-				if (!stat.isFile() || stat.size <= 0) continue;
-				const raw = await bounded(
-					fs.readFile(sessionFile, "utf8"),
-					FILE_OPERATION_TIMEOUT_MS,
-					signal,
-					`Timed out reading the child session file for #${id}.`,
-				);
-				const parameters = parseResumeSession(
-					sessionFile,
-					raw,
-					Number.isFinite(stat.mtimeMs) ? stat.mtimeMs : now(),
-				);
-				if (parameters) return parameters;
-			} catch (error) {
-				if (isAbortError(error)) throw error;
-			}
-		}
-		throw new Error(`No usable child session file exists for #${id}; resume is not possible.`);
-	}
-
-	async function loadStoppedHandle(
-		id: string,
-		signal?: AbortSignal,
-	): Promise<SubagentHandle> {
-		const parameters = await readResumeParameters(id, signal);
-		const currentOwner = owner || {
-			ownerSessionFile: `memory:${processControllerInstanceId}`,
-			ownerSessionId: `ephemeral-${processControllerInstanceId}`,
-		};
-		const sessionDir = join(getAgentDir(), "sessions", "subagents", id);
-		const handle = createHandle({
-			childId: id,
-			task: parameters.task,
-			cwd: parameters.cwd,
-			sessionDir,
-			sessionFile: parameters.sessionFile,
-			promptPath: join(sessionDir, "pi-effective-system-prompt.txt"),
-			requestedModel: parameters.requestedModel,
-			requestedThinking: parameters.requestedThinking,
-			processState: "stopped",
-			runState: "idle",
-			createdAt: parameters.createdAt,
-			lastActivityAt: parameters.lastActivityAt,
-			ownerSessionFile: currentOwner.ownerSessionFile,
-			ownerSessionId: currentOwner.ownerSessionId,
-			incarnation: createId(),
-		});
-		handle.sessionId = parameters.sessionId;
-		return handle;
-	}
-
-	async function resumeChild(
-		handle: SubagentHandle,
-		task?: string,
-		signal?: AbortSignal,
-	): Promise<void> {
-		throwIfAborted(signal);
-		if (task !== undefined) assertCallerTask(task);
-		const parameters = await readResumeParameters(handle.id, signal);
-		handle.sessionPath = parameters.sessionFile;
-		handle.sessionId = parameters.sessionId;
-		handle.cwd = parameters.cwd;
-		handle.requestedModel = parameters.requestedModel;
-		handle.requestedThinking = parameters.requestedThinking;
-		if (!handle.task) handle.task = parameters.task;
-		const runIdBase = Math.max(handle.runSequence, handle.lastSettledRunId);
-		const oldIncarnation = handle.incarnation;
-		const incarnation = createId();
-		handle.runSequence = runIdBase;
-		handle.incarnation = incarnation;
-		handle.resumedFrom = oldIncarnation;
-		reviveForResume(handle);
-		resetHandleForRun(handle);
-		handle.terminationPromise = undefined;
-		handle.rpcReady = false;
-		handle.extensionReady = false;
-		handle.rpcReadyAt = undefined;
-		handle.rpc = undefined;
-		handle.runtime = undefined;
-		handle.rpcOperationPromise = undefined;
-		handle.processCloseHandled = false;
-		handle.exitCode = undefined;
-		handle.exitSignal = undefined;
-		try {
-			const invocation = buildRpcChildInvocation({
-				sessionFile: parameters.sessionFile,
-				sessionDir: handle.sessionDir,
-				model: parameters.requestedModel,
-				thinking: parameters.requestedThinking,
-			});
-			await startRuntime(
-				handle,
-				invocation,
-				childEnvironment({
-					childId: handle.id,
-					incarnation,
-					depth: getDepth() + 1,
-					systemPrompt: "",
-					promptPath: handle.promptPath,
-					sessionDir: handle.sessionDir,
-					healthPath: childExtensionHealthPath(handle.sessionDir, incarnation),
-				}),
-				signal,
-			);
-			await awaitReady(handle, signal);
-			await sendRpc(handle, { type: "get_state" }, STARTUP_TIMEOUT_MS, signal);
-			await awaitExtensionHealth(handle, signal);
-			if (task) {
-				const before = handle.runSequence;
-				await sendRpc(handle, { type: "prompt", message: task }, REQUEST_TIMEOUT_MS, signal);
-				await waitUntil(
-					() => handle.runSequence > before || handle.processState === "stopped",
-					1_000,
-					signal,
-				);
-			}
-			throwIfAborted(signal);
-		} catch (error) {
-			addDiagnostic(
-				handle,
-				`Child resume failed: ${error instanceof Error ? error.message : String(error)}`,
-			);
-			await terminate(handle).catch(() => {});
-			throw error;
-		}
 	}
 
 	function waitUntil(
@@ -2364,14 +2219,21 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	pi.on("before_agent_start", async (event) => ({
 		systemPrompt:
 			event.systemPrompt +
-			`\n\nSubagent extension is available. Use it only for explicit delegation. subagent_start requires an explicit provider/model and thinking level; use list_models when needed instead of guessing. Children are persistent Pi RPC processes. Native agent_end is intermediate. Native agent_settled is the only run completion edge, and the child remains alive and idle after settlement. Prompt, follow-up, steer, and abort responses confirm acceptance or queueing only. The start command observes run acceptance for at most one second and does not wait for the model response. Settlement wakes are best effort, non-durable steering messages for success, failure, and abort. Do not poll subagent_status or use sleep commands to wait for completion. Use subagent_status for bounded run diagnosis, transcript pages, process-close evidence, and stale or missing evidence. Transcript pages read bounded JSONL projections with available, missing, incomplete, or unreadable status, and transcript text never proves completion. A process close before agent_settled is terminal closed_without_settlement evidence with exit code, signal, stderr, and diagnostics, and it never emits a settlement wake. Transcript pages bound each message to 8 KiB, so instruct the child to write a long deliverable to a file and then read that file. Child session files provide resume parameters, and retained live runtimes rebind across reload without durable controller state. A cooperative abort is acknowledged when accepted; agent_settled with outcome aborted is the completion edge. There is no watchdog. Use subagent_follow_up for another turn, subagent_steer during a run, subagent_interrupt to abort while keeping the child alive, and subagent_kill for bounded termination.`,
+			`\n\nSubagent extension: you can delegate work to subagents.
+
+- subagent_start returns a handle at once. It does not wait for the subagent.
+- Never poll. You are notified automatically when a subagent stops, whether it finished, errored, was interrupted, or died.
+- subagent_inspect shows the state and the most recent messages. The last message is usually the result.
+- subagent_steer sends a message. A running subagent gets it at its next step. An idle one starts a new turn, so use it for follow-up work.
+- subagent_interrupt stops the current turn. subagent_remove ends the process and keeps every file.
+- A subagent cannot start subagents.`,
 	}));
 
 	pi.registerTool<typeof TaskSpecSchema, unknown>({
 		name: "subagent_start",
 		label: "Subagent Start",
 		description:
-			"Start a persistent Pi RPC child with an explicit model and thinking level. The response confirms acceptance only. A best-effort settlement wake reports success, failure, or abort. Diagnose runs with subagent_status instead of polling for completion. Call subagent_kill when the child is no longer useful.",
+			"Start a subagent and return its handle at once. You are notified when it stops. Do not poll.",
 		parameters: TaskSpecSchema,
 		async execute(_id, params, signal, _update, ctx) {
 			throwIfAborted(signal);
@@ -2410,7 +2272,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 					content: [
 						{
 							type: "text" as const,
-							text: `Started persistent subagent #${handle.id} as a Pi RPC child process.`,
+							text: `Started subagent ${handle.id}. You will be notified when it stops.`,
 						},
 					],
 					details: { handle: await serialize(handle, {}, signal) },
@@ -2436,13 +2298,11 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	pi.registerTool<typeof ListSchema, unknown>({
 		name: "subagent_list",
 		label: "Subagent List",
-		description: "List current and retained persistent subagents.",
+		description: "List every tracked subagent with its state.",
 		parameters: ListSchema,
-		async execute(_id, params, signal) {
+		async execute(_id, _params, signal) {
 			throwIfAborted(signal);
-			const chosen = sorted().filter(
-				(handle) => (params.includeFinished ?? true) || active(handle),
-			);
+			const chosen = sorted();
 			const details = await Promise.all(
 				chosen.map(async (handle) => {
 					const serial = await serialize(handle, {}, signal);
@@ -2462,12 +2322,12 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			};
 		},
 	});
-	pi.registerTool<typeof StatusSchema, unknown>({
-		name: "subagent_status",
-		label: "Subagent Status",
+	pi.registerTool<typeof InspectSchema, unknown>({
+		name: "subagent_inspect",
+		label: "Subagent Inspect",
 		description:
-			"Return bounded process/run diagnostics, settlement evidence, and transcript text. Use this tool for diagnosis only. Do not infer completion from polling, silence, or transcript text.",
-		parameters: StatusSchema,
+			"Return a subagent state, its most recent messages with timestamps, and the path to its full log. Thinking and tool calls are excluded.",
+		parameters: InspectSchema,
 		async execute(_id, params, signal) {
 			throwIfAborted(signal);
 			const handle = handles.get(params.id);
@@ -2476,16 +2336,15 @@ export default function subagentExtension(pi: ExtensionAPI) {
 					content: [{ type: "text" as const, text: `Unknown subagent id: ${params.id}` }],
 					details: {},
 				};
-			const serial = await serialize(
-				handle,
-				{
-					messageOffset: params.messageOffset,
-					numMessages: params.numMessages,
-				},
-				signal,
-			);
+			const numMessages = params.n ?? 1;
+			const serial = await serialize(handle, { numMessages }, signal);
 			return {
-				content: [{ type: "text" as const, text: await summary(handle, serial) }],
+				content: [
+					{
+						type: "text" as const,
+						text: await inspectReport(handle, serial, numMessages),
+					},
+				],
 				details: {
 					...serial,
 					timestamps: {
@@ -2507,7 +2366,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	pi.registerTool<typeof MessageSchema, unknown>({
 		name: "subagent_steer",
 		label: "Subagent Steer",
-		description: "Accept or queue guidance during a child turn over RPC. The response does not mean completion.",
+		description: "Send a message to a subagent. A running subagent receives it at its next step. An idle subagent starts a new turn.",
 		parameters: MessageSchema,
 		async execute(_id, params, signal) {
 			throwIfAborted(signal);
@@ -2519,52 +2378,18 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				};
 			try {
 				const command = await withChildOperation(handle, signal, () =>
-					deliverMessage(
-						handle,
-						"steer",
-						params.message.trim(),
-						signal,
-					),
+					deliverMessage(handle, params.message.trim(), signal),
 				);
 				return {
-					content: [{ type: "text" as const, text: `Steering accepted by #${handle.id}.` }],
-					details: {
-						handle: await serialize(handle, {}, signal),
-						accepted: true,
-						queued: command !== "prompt",
-						command,
-					},
-				};
-			} catch (error) {
-				if (isAbortError(error)) throw error;
-				return { content: [{ type: "text" as const, text: String(error) }], details: { accepted: false } };
-			}
-		},
-	});
-	pi.registerTool<typeof MessageSchema, unknown>({
-		name: "subagent_follow_up",
-		label: "Subagent Follow Up",
-		description: "Accept or queue another user turn for a live persistent child. The response does not mean completion.",
-		parameters: MessageSchema,
-		async execute(_id, params, signal) {
-			throwIfAborted(signal);
-			const handle = handles.get(params.id);
-			if (!handle)
-				return {
-					content: [{ type: "text" as const, text: `Unknown subagent id: ${params.id}` }],
-					details: {},
-				};
-			try {
-				const command = await withChildOperation(handle, signal, () =>
-					deliverMessage(
-						handle,
-						"follow_up",
-						params.message.trim(),
-						signal,
-					),
-				);
-				return {
-					content: [{ type: "text" as const, text: `Follow-up accepted by #${handle.id}.` }],
+					content: [
+						{
+							type: "text" as const,
+							text:
+								command === "prompt"
+									? `Subagent ${handle.id} started a new turn.`
+									: `Subagent ${handle.id} will receive your message at its next step.`,
+						},
+					],
 					details: {
 						handle: await serialize(handle, {}, signal),
 						accepted: true,
@@ -2581,7 +2406,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	pi.registerTool<typeof IdSchema, unknown>({
 		name: "subagent_interrupt",
 		label: "Subagent Interrupt",
-		description: "Accept a cooperative abort while keeping the child process alive. Native settlement reports the eventual aborted outcome.",
+		description: "Stop a subagent turn now, as if you pressed escape. The subagent stays alive and idle.",
 		parameters: IdSchema,
 		async execute(_id, params, signal) {
 			throwIfAborted(signal);
@@ -2600,8 +2425,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 						{
 							type: "text" as const,
 							text: interrupted
-								? `Abort accepted by #${handle.id}; the child remains alive until native settlement.`
-								: `Abort was not accepted by #${handle.id}.`,
+								? `Stopping subagent ${handle.id}. You will be notified when it reaches idle.`
+								: `Subagent ${handle.id} did not accept the stop request.`,
 						},
 					],
 					details: {
@@ -2618,9 +2443,9 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		},
 	});
 	pi.registerTool<typeof IdSchema, unknown>({
-		name: "subagent_kill",
-		label: "Subagent Kill",
-		description: "Terminate the child process after cooperative abort and bounded escalation. Use this cleanup action for completed or abandoned children.",
+		name: "subagent_remove",
+		label: "Subagent Remove",
+		description: "End a subagent process and stop tracking it. Every file it wrote remains on disk.",
 		parameters: IdSchema,
 		async execute(_id, params, signal) {
 			throwIfAborted(signal);
@@ -2640,8 +2465,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 					{
 						type: "text" as const,
 						text: stopped
-							? `Terminated subagent #${handle.id}; artifacts were retained.`
-							: `Could not confirm termination of subagent #${handle.id}; the tracked process still appears live.`,
+							? `Removed subagent ${handle.id}. Its files remain on disk.`
+							: `Could not confirm that subagent ${handle.id} stopped. Its process still appears live.`,
 					},
 				],
 				details: {
@@ -2651,51 +2476,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			};
 		},
 	});
-	pi.registerTool<typeof ResumeSchema, unknown>({
-		name: "subagent_resume",
-		label: "Subagent Resume",
-		description: "Resume a stopped child from its saved Pi session file in a new RPC process incarnation.",
-		parameters: ResumeSchema,
-		async execute(_id, params, signal) {
-			throwIfAborted(signal);
-			let handle = handles.get(params.id);
-			if (!handle) {
-				try {
-					handle = await loadStoppedHandle(params.id, signal);
-					handles.set(handle.id, handle);
-				} catch (error) {
-					if (isAbortError(error)) throw error;
-					return {
-						content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }],
-						details: {},
-					};
-				}
-			}
-			try {
-				const action = await withChildOperation(handle, signal, async () => {
-					if (active(handle)) return { kind: "active" as const };
-					await resumeChild(handle, params.task, signal);
-					return { kind: "resumed" as const };
-				});
-				if (action.kind === "active")
-					return {
-						content: [{ type: "text" as const, text: `Subagent #${handle.id} is still alive; resume is for stopped children.` }],
-						details: { handle: await serialize(handle, {}, signal) },
-					};
-				return {
-					content: [{ type: "text" as const, text: `Resumed subagent #${handle.id} from ${handle.sessionPath} in a new RPC process incarnation.` }],
-					details: { handle: await serialize(handle, {}, signal) },
-				};
-			} catch (error) {
-				if (isAbortError(error)) throw error;
-				return {
-					content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }],
-					details: { handle: await serialize(handle, {}, signal) },
-				};
-			}
-		},
-	});
-
 	pi.registerCommand("subagents", {
 		description: "Inspect persistent subagents",
 		handler: async (_args, ctx) => {
@@ -2714,7 +2494,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 							const handle = handles.get(id);
 							if (!handle) return "Subagent no longer exists.";
 							const command = await withChildOperation(handle, undefined, () =>
-								deliverMessage(handle, "steer", message),
+								deliverMessage(handle, message),
 							);
 							return `Accepted via ${command}.`;
 						},

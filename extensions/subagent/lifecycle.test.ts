@@ -12,7 +12,6 @@ import {
 	recordAssistantEnd,
 	requestKill,
 	resetRunViewForSession,
-	reviveForResume,
 	settleRunToIdle,
 	startRun,
 } from "./lifecycle.ts";
@@ -105,36 +104,6 @@ test("failed and aborted outcomes classify the run without stopping process", ()
 	assert.equal(aborted.lifecycle, "idle");
 	assert.equal(aborted.runOutcome, "aborted");
 	assert.equal(aborted.processState, "alive");
-});
-
-test("a kill fence blocks a new run until resume revival clears it", () => {
-	const state = createLifecycleState();
-	requestKill(state, 1);
-	assert.equal(startRun(state, 2), undefined);
-	markStopped(state, 3);
-	assert.equal(startRun(state, 4), undefined);
-	reviveForResume(state);
-	assert.equal(startRun(state, 5)?.id, 1);
-});
-
-test("resume revival clears the kill fence and preserves monotonic cursors", () => {
-	const state = createLifecycleState();
-	startRun(state, 1, 2);
-	recordAssistantEnd(state, { stopReason: "stop" });
-	endRun(state, 2, false);
-	settleRunToIdle(state, 3);
-	requestKill(state, 4);
-	markStopped(state, 5);
-	reviveForResume(state);
-	assert.equal(state.processState, "alive");
-	assert.equal(state.lifecycle, "idle");
-	assert.equal(state.killRequestedAt, undefined);
-	assert.equal(state.runSequence, 2);
-	assert.equal(state.lastSettledRunId, 2);
-	assert.equal(state.settledAt, undefined);
-	assert.equal(state.settlementStatus, "pending");
-	assert.equal(startRun(state, 6, 3)?.id, 3);
-	assert.equal(state.lifecycle, "running");
 });
 
 test("markStopped is the terminal transition", () => {

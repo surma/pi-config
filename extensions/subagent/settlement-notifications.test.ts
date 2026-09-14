@@ -44,12 +44,12 @@ test("one accepted settlement sends one exact steering wake", async () => {
 	});
 	assert.equal(
 		sent[0]?.message.content,
-		"Subagent a reached idle after run 1. Check subagent_status with numMessages=3.",
+		"Subagent a stopped: it finished its turn. Read its last message with subagent_inspect.",
 	);
 	assert.deepEqual(sent[0]?.message, {
 		customType: "subagent-settlement",
 		content:
-			"Subagent a reached idle after run 1. Check subagent_status with numMessages=3.",
+			"Subagent a stopped: it finished its turn. Read its last message with subagent_inspect.",
 		display: true,
 		details: {
 			...settlement,
@@ -78,15 +78,15 @@ test("nearby settlements each send one wake with complete details", async () => 
 		]),
 		[
 			[
-				"Subagent a reached idle after run 1. Check subagent_status with numMessages=3.",
+				"Subagent a stopped: it errored. Read its last message with subagent_inspect.",
 				record("a", 1, "failed"),
 			],
 			[
-				"Subagent b reached idle after run 1. Check subagent_status with numMessages=3.",
+				"Subagent b stopped: you interrupted it. Read its last message with subagent_inspect.",
 				record("b", 1, "aborted"),
 			],
 			[
-				"Subagent a reached idle after run 2. Check subagent_status with numMessages=3.",
+				"Subagent a stopped: it finished its turn. Read its last message with subagent_inspect.",
 				record("a", 2, "succeeded"),
 			],
 		],

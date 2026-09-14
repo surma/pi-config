@@ -2,7 +2,6 @@ import * as fs from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
-const delegatedPrompt = process.env.PI_SUBAGENT_SYSTEM_PROMPT || "";
 const promptPath = process.env.PI_SUBAGENT_PROMPT_PATH;
 const childSessionDir = process.env.PI_SUBAGENT_SESSION_DIR;
 const childIncarnation = process.env.PI_SUBAGENT_INCARNATION;
@@ -395,8 +394,6 @@ async function captureEffectivePrompt(
 
 function delegatedSystemPrompt(systemPrompt: string): string {
 	const sections = [systemPrompt];
-	if (delegatedPrompt.trim())
-		sections.push(`Direct delegated guidance:\n${delegatedPrompt.trim()}`);
 	sections.push(`Subagent execution rules:
 - You are handling a delegated subtask for a parent agent.
 - You are a subagent, not the top-level agent.
