@@ -24,7 +24,7 @@ import subagentExtension, {
 	routeRuntimeRecord,
 } from "./index.ts";
 import { MAX_SUBAGENT_EVENT_QUEUE_RECORDS } from "./dispatch-event.ts";
-import { RpcChildTransport } from "./rpc.js";
+import { RpcChildTransport, type RpcProcessClose } from "./rpc.js";
 
 // The test process can inherit the delegated-child marker from the parent harness.
 delete process.env.PI_SUBAGENT_DEPTH;
@@ -173,6 +173,12 @@ function turn(message) {
     activeAbortRun = runId;
     return;
   }
+  // Settle with no outcome and no stop reason, then die while nominally idle.
+  if (mode === "settle-pending-then-die") {
+    output({ type: "agent_settled", runId });
+    setTimeout(() => process.exit(11), 20);
+    return;
+  }
   const failure = mode === "failure";
   const text = (failure ? "failed-" : "result-") + run + " " + String(message || "");
   const assistant = {
@@ -196,6 +202,8 @@ function turn(message) {
   output({ type: "message_end", message: assistant });
   output({ type: "agent_end", runId, messages: [assistant], willRetry: false });
   output({ type: "agent_settled", runId, runOutcome: failure ? "failed" : "succeeded" });
+  // The child settles, reaches idle, then dies without the parent asking.
+  if (mode === "settle-then-die") setTimeout(() => process.exit(9), 20);
 }
 function command(command) {
   if (command.type === "get_state") {
@@ -274,12 +282,10 @@ async function waitFor(
 const toolNames = [
 	"subagent_start",
 	"subagent_list",
-	"subagent_status",
+	"subagent_inspect",
 	"subagent_steer",
-	"subagent_follow_up",
 	"subagent_interrupt",
-	"subagent_kill",
-	"subagent_resume",
+	"subagent_remove",
 ];
 
 function testRuntime(records: Record<string, unknown>[] = []): any {
@@ -299,7 +305,7 @@ function testRuntime(records: Record<string, unknown>[] = []): any {
 		forceClose(close: Record<string, unknown>) {
 			this.isClosed = true;
 			runtime.forceCloseCalls++;
-			noteRuntimeClose(runtime, close);
+			noteRuntimeClose(runtime, close as unknown as RpcProcessClose);
 		},
 	};
 	return runtime;
@@ -393,27 +399,28 @@ test("runtime close waits for the queued lifecycle drain", async () => {
 	assert.equal(runtime.queuedRecords.length, 0);
 });
 
-test("the extension registers all eight tools and three commands", () => {
+test("the extension registers all six tools and three commands", () => {
 	const commands: string[] = [];
 	const { tools } = setup(new Map(), [], commands);
 	assert.deepEqual([...tools.keys()], toolNames);
 	assert.deepEqual(commands, ["subagents", "subagents-toggle", "subagents-kill-all"]);
 	const start = requireTool(tools, "subagent_start").parameters as {
 		properties: {
-			task: { minLength?: number; maxLength?: number };
+			prompt: { minLength?: number; maxLength?: number };
 			model: { minLength?: number };
 			thinking: unknown;
 		};
 		required?: string[];
 	};
-	assert.equal(start.properties.task.minLength, 1);
-	assert.equal(start.properties.task.maxLength, MAX_CALLER_TASK_LENGTH);
+	assert.equal(start.properties.prompt.minLength, 1);
+	assert.equal(start.properties.prompt.maxLength, MAX_CALLER_TASK_LENGTH);
 	assert.equal(start.properties.model.minLength, 1);
-	assert.deepEqual(new Set(start.required), new Set(["task", "model", "thinking"]));
-	const resume = requireTool(tools, "subagent_resume").parameters as {
-		properties: { task?: { maxLength?: number } };
+	assert.deepEqual(new Set(start.required), new Set(["prompt", "model", "thinking"]));
+	const inspect = requireTool(tools, "subagent_inspect").parameters as {
+		properties: { n?: { maximum?: number; default?: number } };
 	};
-	assert.equal(resume.properties.task?.maxLength, MAX_CALLER_TASK_LENGTH);
+	assert.equal(inspect.properties.n?.default, 1);
+	assert.equal(inspect.properties.n?.maximum, 50);
 });
 
 test("tool schemas accept valid values and reject invalid values", () => {
@@ -421,16 +428,14 @@ test("tool schemas accept valid values and reject invalid values", () => {
 	const cases: [string, unknown, unknown][] = [
 		[
 			"subagent_start",
-			{ task: "work", model: "provider/model", thinking: "high" },
-			{ task: "", model: "provider/model", thinking: "high" },
+			{ prompt: "work", model: "provider/model", thinking: "high" },
+			{ prompt: "", model: "provider/model", thinking: "high" },
 		],
-		["subagent_list", {}, { includeFinished: "yes" }],
-		["subagent_status", { id: "child", messageOffset: 0, numMessages: 20 }, { id: "child", numMessages: 21 }],
+		["subagent_list", {}, { includeFinished: true }],
+		["subagent_inspect", { id: "child", n: 20 }, { id: "child", n: 51 }],
 		["subagent_steer", { id: "child", message: "guidance" }, { id: "child", message: "" }],
-		["subagent_follow_up", { id: "child", message: "next" }, { id: "child", message: "" }],
 		["subagent_interrupt", { id: "child" }, {}],
-		["subagent_kill", { id: "child" }, {}],
-		["subagent_resume", { id: "child" }, {}],
+		["subagent_remove", { id: "child" }, {}],
 	];
 	for (const [name, valid, invalid] of cases) {
 		const schema = requireTool(tools, name).parameters as TSchema;
@@ -440,16 +445,9 @@ test("tool schemas accept valid values and reject invalid values", () => {
 	const longTask = "x".repeat(MAX_CALLER_TASK_LENGTH + 1);
 	assert.equal(
 		Check(requireTool(tools, "subagent_start").parameters as TSchema, {
-			task: longTask,
+			prompt: longTask,
 			model: "provider/model",
 			thinking: "off",
-		}),
-		false,
-	);
-	assert.equal(
-		Check(requireTool(tools, "subagent_resume").parameters as TSchema, {
-			id: "child",
-			task: longTask,
 		}),
 		false,
 	);
@@ -462,7 +460,7 @@ test("nested children cannot start another delegated child", async () => {
 		const { tools } = setup();
 		const result = await requireTool(tools, "subagent_start").execute(
 			"request",
-			{ task: "work", model: "provider/model", thinking: "high" },
+			{ prompt: "work", model: "provider/model", thinking: "high" },
 			undefined,
 			undefined,
 			context("/tmp/parent.jsonl", "parent"),
@@ -478,7 +476,7 @@ test("aborted tool calls reject without a normal result", async () => {
 	const { tools } = setup();
 	const signal = AbortSignal.abort(new Error("caller canceled"));
 	await assert.rejects(
-		requireTool(tools, "subagent_status").execute(
+		requireTool(tools, "subagent_inspect").execute(
 			"aborted",
 			{ id: "missing" },
 			signal,
@@ -518,13 +516,13 @@ test("parent signals reach RPC transport requests", async () => {
 		await handlers.get("session_start")?.({ reason: "startup" }, ctx);
 		const started = await requireTool(tools, "subagent_start").execute(
 			"start",
-			{ task: "initial", model: "provider/model", thinking: "off" },
+			{ prompt: "initial", model: "provider/model", thinking: "off" },
 			undefined,
 			undefined,
 			ctx,
 		);
 		const signal = new AbortController().signal;
-		await requireTool(tools, "subagent_follow_up").execute(
+		await requireTool(tools, "subagent_steer").execute(
 			"follow-up",
 			{ id: started.details.handle.id, message: "next" },
 			signal,
@@ -587,7 +585,7 @@ test("a canceled queue waiter cannot overlap a live predecessor", async () => {
 		await handlers.get("session_start")?.({ reason: "startup" }, ctx);
 		const started = await requireTool(tools, "subagent_start").execute(
 			"start",
-			{ task: "initial", model: "provider/model", thinking: "off" },
+			{ prompt: "initial", model: "provider/model", thinking: "off" },
 			undefined,
 			undefined,
 			ctx,
@@ -595,18 +593,18 @@ test("a canceled queue waiter cannot overlap a live predecessor", async () => {
 		const childId = started.details.handle.id;
 		promptCalls.length = 0;
 		delayFirstPrompt = true;
-		const first = requireTool(tools, "subagent_follow_up").execute(
+		const first = requireTool(tools, "subagent_steer").execute(
 			"first",
 			{ id: childId, message: "first" },
 		);
 		await new Promise((resolve) => setTimeout(resolve, 10));
 		const controller = new AbortController();
-		const canceled = requireTool(tools, "subagent_follow_up").execute(
+		const canceled = requireTool(tools, "subagent_steer").execute(
 			"canceled",
 			{ id: childId, message: "canceled" },
 			controller.signal,
 		);
-		const successor = requireTool(tools, "subagent_follow_up").execute(
+		const successor = requireTool(tools, "subagent_steer").execute(
 			"successor",
 			{ id: childId, message: "successor" },
 		);
@@ -618,7 +616,7 @@ test("a canceled queue waiter cannot overlap a live predecessor", async () => {
 		assert.equal(promptCalls.length, 1);
 		await Promise.all([first, successor]);
 		assert.equal(promptCalls.length, 2);
-		await requireTool(tools, "subagent_kill").execute("kill", { id: childId });
+		await requireTool(tools, "subagent_remove").execute("kill", { id: childId });
 	} finally {
 		prototype.send = originalSend;
 		await handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
@@ -653,7 +651,7 @@ test("same-child operation queues reject work beyond the finite bound", async ()
 		await handlers.get("session_start")?.({ reason: "startup" }, ctx);
 		const started = await requireTool(tools, "subagent_start").execute(
 			"start",
-			{ task: "initial", model: "provider/model", thinking: "off" },
+			{ prompt: "initial", model: "provider/model", thinking: "off" },
 			undefined,
 			undefined,
 			ctx,
@@ -666,7 +664,7 @@ test("same-child operation queues reject work beyond the finite bound", async ()
 		let settled = 0;
 		let rejectedByLimit = 0;
 		const operations = controllers.map((controller, index) =>
-			requireTool(tools, "subagent_follow_up")
+			requireTool(tools, "subagent_steer")
 				.execute(
 					`operation-${index}`,
 					{ id: childId, message: `operation-${index}` },
@@ -687,7 +685,7 @@ test("same-child operation queues reject work beyond the finite bound", async ()
 		assert.ok(settled < operations.length, "the live predecessor did not hold queued work");
 		for (const controller of controllers) controller.abort(new Error("cancel queued work"));
 		await Promise.all(operations);
-		await requireTool(tools, "subagent_kill").execute("kill", { id: childId });
+		await requireTool(tools, "subagent_remove").execute("kill", { id: childId });
 	} finally {
 		await handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
 		if (old.agentDirectory === undefined) delete process.env.PI_CODING_AGENT_DIR;
@@ -731,7 +729,7 @@ test("RPC child lifecycle supports settlement wakes, transcript paging, runtime-
 		const started = await requireTool(tools, "subagent_start").execute(
 			"start-request",
 			{
-				task: "initial",
+				prompt: "initial",
 				model: "provider/model",
 				thinking: "off",
 				name: "worker",
@@ -741,7 +739,7 @@ test("RPC child lifecycle supports settlement wakes, transcript paging, runtime-
 			ctx,
 		);
 		const childId = String(started.details.handle.id);
-		assert.match(started.content[0]?.text || "", /RPC child process/);
+		assert.match(started.content[0]?.text || "", /You will be notified when it stops/);
 		assert.equal(started.details.handle.processState, "alive");
 		assert.equal(started.details.handle.runId, 1);
 		assert.equal(started.details.handle.runState, "idle");
@@ -749,15 +747,13 @@ test("RPC child lifecycle supports settlement wakes, transcript paging, runtime-
 		assert.equal(started.details.handle.settlement.status, "settled");
 		assert.equal(started.details.handle.rpcReady, true);
 
-		const status = await requireTool(tools, "subagent_status").execute("status", {
+		const status = await requireTool(tools, "subagent_inspect").execute("status", {
 			id: childId,
-			messageOffset: 0,
-			numMessages: 2,
+			n: 2,
 		});
 		assert.equal(status.details.processState, "alive");
 		assert.equal(status.details.rpcReady, true);
 		assert.equal(status.details.transcript.status, "available");
-		assert.equal(status.details.transcript.nextMessageOffset, 0);
 		const sessionPath = String(status.details.sessionPath);
 		await appendFile(
 			sessionPath,
@@ -765,18 +761,20 @@ test("RPC child lifecycle supports settlement wakes, transcript paging, runtime-
 			`${JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "text", text: "world" }] } })}\n` +
 			`${JSON.stringify({ type: "message", message: { role: "toolResult", content: [{ type: "text", text: "hidden" }] } })}\n`,
 		);
-		const page = await requireTool(tools, "subagent_status").execute("page", {
+		const page = await requireTool(tools, "subagent_inspect").execute("page", {
 			id: childId,
-			messageOffset: 0,
-			numMessages: 2,
+			n: 2,
 		});
 		assert.deepEqual(page.details.transcript.messages.map((message: any) => message.text), ["hello", "world"]);
-		assert.equal(page.details.transcript.nextMessageOffset, 2);
+		assert.equal(page.details.transcript.messagesInWindow, 2);
+		assert.match(page.content[0]?.text || "", /Last 2 messages/);
+		assert.match(page.content[0]?.text || "", /\] assistant\nworld/);
+		assert.match(page.content[0]?.text || "", new RegExp(`log ${sessionPath}`));
 
 		await waitFor(() => sent.length >= 1);
 		const firstNotification = sent[0];
 		assert.equal(firstNotification.message.customType, "subagent-settlement");
-		assert.equal(firstNotification.message.content, `Subagent ${childId} reached idle after run 1. Check subagent_status with numMessages=3.`);
+		assert.equal(firstNotification.message.content, `Subagent ${childId} (worker) stopped: it finished its turn. Read its last message with subagent_inspect.`);
 		assert.equal(firstNotification.options.triggerTurn, true);
 		assert.equal(firstNotification.options.deliverAs, "steer");
 		const firstDetails = firstNotification.message.details;
@@ -789,7 +787,7 @@ test("RPC child lifecycle supports settlement wakes, transcript paging, runtime-
 		assert.equal(listed.details.handles.length, 1);
 		assert.match(listed.content[0]?.text || "", new RegExp(childId));
 
-		const follow = await requireTool(tools, "subagent_follow_up").execute("follow", {
+		const follow = await requireTool(tools, "subagent_steer").execute("follow", {
 			id: childId,
 			message: "second",
 		});
@@ -809,7 +807,7 @@ test("RPC child lifecycle supports settlement wakes, transcript paging, runtime-
 		assert.equal(reloadedList.details.handles[0]?.state, "done");
 		assert.equal(reloadedList.details.handles[0]?.lifecycle, "idle");
 
-		await requireTool(reloaded.tools, "subagent_kill").execute("kill", { id: childId });
+		await requireTool(reloaded.tools, "subagent_remove").execute("kill", { id: childId });
 		await reloaded.handlers.get("session_shutdown")?.({ reason: "reload" }, ctx);
 		const afterKillReload = setup(new Map(), sent);
 		shutdownHandlers = afterKillReload.handlers;
@@ -820,31 +818,12 @@ test("RPC child lifecycle supports settlement wakes, transcript paging, runtime-
 			readdir(controllerDirectory),
 			(error: any) => error?.code === "ENOENT",
 		);
-		await appendFile(
-			sessionPath,
-			`${JSON.stringify({ type: "model_change", id: "model-latest", parentId: null, timestamp: new Date().toISOString(), provider: "other", modelId: "latest" })}\n` +
-			`${JSON.stringify({ type: "thinking_level_change", id: "thinking-latest", parentId: null, timestamp: new Date().toISOString(), thinkingLevel: "high" })}\n`,
-		);
-		const resumed = await requireTool(afterKillReload.tools, "subagent_resume").execute("resume", {
-			id: childId,
-			task: "resumed",
-		});
-		assert.match(resumed.content[0]?.text || "", /new RPC process incarnation/);
-		assert.equal(resumed.details.handle.processState, "alive");
-		assert.equal(resumed.details.handle.cwd, directory);
-		assert.equal(resumed.details.handle.requestedModel, "other/latest");
-		assert.equal(resumed.details.handle.requestedThinking, "high");
-		assert.equal(resumed.details.handle.runId, 3);
-		assert.equal(resumed.details.handle.settlement.status, "settled");
-		await requireTool(afterKillReload.tools, "subagent_kill").execute("kill-again", { id: childId });
-
 		const invocations = (await readFile(logPath, "utf8"))
 			.trim()
 			.split("\n")
 			.map((line) => JSON.parse(line) as string[]);
-		assert.equal(invocations.length, 2);
+		assert.equal(invocations.length, 1);
 		assert.equal(invocations[0]?.includes("--session"), false);
-		assert.equal(invocations[1]?.[invocations[1].indexOf("--session") + 1], resumed.details.handle.sessionPath);
 	} finally {
 		try {
 			await (shutdownHandlers.get("session_shutdown")?.({ reason: "quit" }, ctx) as Promise<void> | undefined);
@@ -902,14 +881,14 @@ test("startup ignores stale controller files", async () => {
 		await handlers.get("session_start")?.({ reason: "startup" }, ctx);
 		const started = await requireTool(tools, "subagent_start").execute(
 			"start",
-			{ task: "initial", model: "provider/model", thinking: "off" },
+			{ prompt: "initial", model: "provider/model", thinking: "off" },
 			undefined,
 			undefined,
 			ctx,
 		);
 		assert.equal(started.details.handle.processState, "alive");
 		assert.equal((await requireTool(tools, "subagent_list").execute("list", {})).details.handles.length, 1);
-		await requireTool(tools, "subagent_kill").execute("kill", { id: started.details.handle.id });
+		await requireTool(tools, "subagent_remove").execute("kill", { id: started.details.handle.id });
 	} finally {
 		await handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
 		if (old.agentDirectory === undefined) delete process.env.PI_CODING_AGENT_DIR;
@@ -944,22 +923,22 @@ test("failed settlement reports a failed run", async () => {
 		await handlers.get("session_start")?.({ reason: "startup" }, ctx);
 		const started = await requireTool(tools, "subagent_start").execute(
 			"start",
-			{ task: "fail", model: "provider/model", thinking: "max" },
+			{ prompt: "fail", model: "provider/model", thinking: "max" },
 			undefined,
 			undefined,
 			ctx,
 		);
 		const childId = String(started.details.handle.id);
 		await waitFor(async () => {
-			const status = await requireTool(tools, "subagent_status").execute("status", { id: childId });
+			const status = await requireTool(tools, "subagent_inspect").execute("status", { id: childId });
 			return status.details.settlement.status === "settled";
 		});
-		const status = await requireTool(tools, "subagent_status").execute("status", { id: childId });
+		const status = await requireTool(tools, "subagent_inspect").execute("status", { id: childId });
 		assert.equal(status.details.runOutcome, "failed");
 		assert.equal(status.details.settlement.status, "settled");
 		assert.match(status.details.error, /quota exceeded/);
 		await waitFor(() => sent.some((message) => message.message.details?.outcome === "failed"));
-		await requireTool(tools, "subagent_kill").execute("kill", { id: childId });
+		await requireTool(tools, "subagent_remove").execute("kill", { id: childId });
 	} finally {
 		await handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
 		if (old.agentDirectory === undefined) delete process.env.PI_CODING_AGENT_DIR;
@@ -995,7 +974,7 @@ test("native assistant abort errors settle as one aborted wake", async () => {
 		const started = await requireTool(tools, "subagent_start").execute(
 			"start",
 			{
-				task: "abort",
+				prompt: "abort",
 				model: "provider/model",
 				thinking: "high",
 			},
@@ -1011,13 +990,13 @@ test("native assistant abort errors settle as one aborted wake", async () => {
 		assert.equal(interrupted.details.handle.processState, "alive");
 		assert.equal(interrupted.details.handle.settlement.status, "pending");
 		await waitFor(async () => {
-			const status = await requireTool(tools, "subagent_status").execute("status", { id: childId });
+			const status = await requireTool(tools, "subagent_inspect").execute("status", { id: childId });
 			return (
 				status.details.runOutcome === "aborted" &&
 				status.details.settlement.status === "settled"
 			);
 		});
-		const status = await requireTool(tools, "subagent_status").execute("status", { id: childId });
+		const status = await requireTool(tools, "subagent_inspect").execute("status", { id: childId });
 		assert.equal(status.details.processState, "alive");
 		assert.equal(status.details.runOutcome, "aborted");
 		assert.equal(status.details.settlement.status, "settled");
@@ -1033,11 +1012,11 @@ test("native assistant abort errors settle as one aborted wake", async () => {
 		assert.equal(sent[0]?.message.customType, "subagent-settlement");
 		assert.equal(
 			sent[0]?.message.content,
-			`Subagent ${childId} reached idle after run 1. Check subagent_status with numMessages=3.`,
+			`Subagent ${childId} stopped: you interrupted it. Read its last message with subagent_inspect.`,
 		);
 		assert.equal(sent[0]?.message.details?.settlements?.length, 1);
 		assert.deepEqual(sent[0]?.options, { triggerTurn: true, deliverAs: "steer" });
-		await requireTool(tools, "subagent_kill").execute("kill", { id: childId });
+		await requireTool(tools, "subagent_remove").execute("kill", { id: childId });
 	} finally {
 		await handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
 		if (old.agentDirectory === undefined) delete process.env.PI_CODING_AGENT_DIR;
@@ -1072,7 +1051,7 @@ test("extension health failure rejects promptly on extension_error without a mar
 		const startedAt = Date.now();
 		const result = await requireTool(tools, "subagent_start").execute(
 			"start",
-			{ task: "health", model: "provider/model", thinking: "off" },
+			{ prompt: "health", model: "provider/model", thinking: "off" },
 			undefined,
 			undefined,
 			ctx,
@@ -1098,7 +1077,7 @@ test("extension health failure rejects promptly on extension_error without a mar
 	}
 });
 
-test("process close before settlement records terminal evidence without a success wake", async () => {
+test("process close before settlement records terminal evidence and wakes the owner", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "pi-rpc-close-"));
 	const agentDirectory = join(directory, "agent");
 	const parentSession = join(directory, "parent.jsonl");
@@ -1121,7 +1100,7 @@ test("process close before settlement records terminal evidence without a succes
 		await handlers.get("session_start")?.({ reason: "startup" }, ctx);
 		const started = await requireTool(tools, "subagent_start").execute(
 			"start",
-			{ task: "close", model: "provider/model", thinking: "off" },
+			{ prompt: "close", model: "provider/model", thinking: "off" },
 			undefined,
 			undefined,
 			ctx,
@@ -1133,11 +1112,115 @@ test("process close before settlement records terminal evidence without a succes
 		assert.equal(started.details.handle.exitCode, 17);
 		assert.match(started.details.handle.stderrTail, /fake close diagnostic/);
 		assert.match(started.details.handle.error, /before agent_settled/);
-		await new Promise((resolve) => setTimeout(resolve, 50));
-		assert.equal(sent.length, 0);
-		const status = await requireTool(tools, "subagent_status").execute("status", { id: childId });
+		await waitFor(() => sent.length >= 1);
+		assert.equal(sent.length, 1);
+		assert.equal(sent[0]?.message.details?.eventKind, "process_died");
+		assert.equal(sent[0]?.message.details?.outcome, "died");
+		assert.match(sent[0]?.message.content || "", /stopped: its process died/);
+		assert.match(sent[0]?.message.content || "", /exit 17/);
+		assert.match(sent[0]?.message.content || "", /fake close diagnostic/);
+		assert.deepEqual(sent[0]?.options, { triggerTurn: true, deliverAs: "steer" });
+		const status = await requireTool(tools, "subagent_inspect").execute("status", { id: childId });
 		assert.equal(status.details.settlement.status, "closed_without_settlement");
 		assert.equal(status.details.exitCode, 17);
+	} finally {
+		await handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
+		if (old.agentDirectory === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = old.agentDirectory;
+		if (old.pi === undefined) delete process.env.PI_SUBAGENT_PI_BIN;
+		else process.env.PI_SUBAGENT_PI_BIN = old.pi;
+		if (old.mode === undefined) delete process.env.FAKE_PI_MODE;
+		else process.env.FAKE_PI_MODE = old.mode;
+	}
+});
+
+test("an idle child that dies later does not wake the owner a second time", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "pi-rpc-settle-die-"));
+	const agentDirectory = join(directory, "agent");
+	const parentSession = join(directory, "parent.jsonl");
+	const logPath = join(directory, "invocations.jsonl");
+	await writeFile(parentSession, "parent\n");
+	const binary = await fakePi(directory, logPath, "settle-then-die");
+	const old = {
+		agentDirectory: process.env.PI_CODING_AGENT_DIR,
+		pi: process.env.PI_SUBAGENT_PI_BIN,
+		mode: process.env.FAKE_PI_MODE,
+	};
+	process.env.PI_CODING_AGENT_DIR = agentDirectory;
+	process.env.PI_SUBAGENT_PI_BIN = binary;
+	process.env.FAKE_PI_MODE = "settle-then-die";
+	const handlers = new Map<string, TestHandler>();
+	const sent: SentMessage[] = [];
+	const { tools } = setup(handlers, sent);
+	const ctx = context(parentSession, "settle-die-parent", directory);
+	try {
+		await handlers.get("session_start")?.({ reason: "startup" }, ctx);
+		const started = await requireTool(tools, "subagent_start").execute(
+			"start",
+			{ prompt: "work", model: "provider/model", thinking: "off", name: "worker" },
+			undefined,
+			undefined,
+			ctx,
+		);
+		const childId = String(started.details.handle.id);
+		await waitFor(async () => {
+			const status = await requireTool(tools, "subagent_inspect").execute("s", { id: childId });
+			return status.details.processState === "stopped";
+		});
+		await waitFor(() => sent.length >= 1);
+		// The settlement already told the owner. The later death adds nothing.
+		await new Promise((resolve) => setTimeout(resolve, 80));
+		assert.equal(sent.length, 1);
+		assert.equal(sent[0]?.message.details?.eventKind, "run_settled");
+		assert.equal(sent[0]?.message.details?.outcome, "succeeded");
+	} finally {
+		await handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
+		if (old.agentDirectory === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = old.agentDirectory;
+		if (old.pi === undefined) delete process.env.PI_SUBAGENT_PI_BIN;
+		else process.env.PI_SUBAGENT_PI_BIN = old.pi;
+		if (old.mode === undefined) delete process.env.FAKE_PI_MODE;
+		else process.env.FAKE_PI_MODE = old.mode;
+	}
+});
+
+test("a child that dies after an uncorroborated settlement still wakes the owner", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "pi-rpc-pending-die-"));
+	const agentDirectory = join(directory, "agent");
+	const parentSession = join(directory, "parent.jsonl");
+	const logPath = join(directory, "invocations.jsonl");
+	await writeFile(parentSession, "parent\n");
+	const binary = await fakePi(directory, logPath, "settle-pending-then-die");
+	const old = {
+		agentDirectory: process.env.PI_CODING_AGENT_DIR,
+		pi: process.env.PI_SUBAGENT_PI_BIN,
+		mode: process.env.FAKE_PI_MODE,
+	};
+	process.env.PI_CODING_AGENT_DIR = agentDirectory;
+	process.env.PI_SUBAGENT_PI_BIN = binary;
+	process.env.FAKE_PI_MODE = "settle-pending-then-die";
+	const handlers = new Map<string, TestHandler>();
+	const sent: SentMessage[] = [];
+	const { tools } = setup(handlers, sent);
+	const ctx = context(parentSession, "pending-die-parent", directory);
+	try {
+		await handlers.get("session_start")?.({ reason: "startup" }, ctx);
+		const started = await requireTool(tools, "subagent_start").execute(
+			"start",
+			{ prompt: "work", model: "provider/model", thinking: "off" },
+			undefined,
+			undefined,
+			ctx,
+		);
+		const childId = String(started.details.handle.id);
+		await waitFor(async () => {
+			const status = await requireTool(tools, "subagent_inspect").execute("s", { id: childId });
+			return status.details.processState === "stopped";
+		});
+		// An uncorroborated agent_settled queues no wake, so the death must not stay silent.
+		await waitFor(() => sent.length >= 1);
+		assert.equal(sent.length, 1);
+		assert.equal(sent[0]?.message.details?.eventKind, "process_died");
 	} finally {
 		await handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
 		if (old.agentDirectory === undefined) delete process.env.PI_CODING_AGENT_DIR;
@@ -1152,19 +1235,14 @@ test("process close before settlement records terminal evidence without a succes
 test("unknown handles return stable errors without contacting a child", async () => {
 	const { tools } = setup();
 	for (const name of [
-		"subagent_status",
+		"subagent_inspect",
 		"subagent_steer",
-		"subagent_follow_up",
 		"subagent_interrupt",
-		"subagent_kill",
-		"subagent_resume",
+		"subagent_remove",
 	]) {
 		const params =
-			name === "subagent_steer" || name === "subagent_follow_up"
-				? { id: "missing", message: "x" }
-				: { id: "missing" };
+			name === "subagent_steer" ? { id: "missing", message: "x" } : { id: "missing" };
 		const result = await requireTool(tools, name).execute("unknown", params);
-		if (name === "subagent_resume") assert.match(result.content[0]?.text || "", /No usable/);
-		else assert.match(result.content[0]?.text || "", /Unknown/);
+		assert.match(result.content[0]?.text || "", /Unknown/);
 	}
 });

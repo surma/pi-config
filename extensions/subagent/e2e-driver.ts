@@ -47,7 +47,7 @@ type DriverRuntime = {
 };
 
 const scenario = process.argv[2] || "";
-const fakePi = process.env.E2E_FAKE_PI;
+const fakePi = process.env.E2E_FAKE_PI ?? "";
 if (!fakePi) throw new Error("E2E_FAKE_PI is not set.");
 
 let uncaughtException: string | undefined;
@@ -252,7 +252,7 @@ function handleId(result: TestResult): string {
 
 async function startChild(runtime: DriverRuntime): Promise<{ id: string; result: TestResult }> {
 	const result = await call(runtime, "subagent_start", {
-		task: "e2e task",
+		prompt: "e2e task",
 		model: "provider/model",
 		thinking: "off",
 	});
@@ -260,11 +260,11 @@ async function startChild(runtime: DriverRuntime): Promise<{ id: string; result:
 }
 
 async function status(runtime: DriverRuntime, id: string, signal?: AbortSignal): Promise<TestResult> {
-	return call(runtime, "subagent_status", { id }, signal);
+	return call(runtime, "subagent_inspect", { id }, signal);
 }
 
 async function killChild(runtime: DriverRuntime, id: string): Promise<void> {
-	await withTimeout(call(runtime, "subagent_kill", { id }), 2_000, "child kill").catch(() => {});
+	await withTimeout(call(runtime, "subagent_remove", { id }), 2_000, "child kill").catch(() => {});
 }
 
 async function pidAlive(pid: number): Promise<boolean> {
@@ -410,12 +410,12 @@ async function scenarioCancellation(toolName: string): Promise<Record<string, un
 			runtime = await createRuntime({ mode: "hang-get-state" });
 			await assertAbortSettles(toolName, (signal) =>
 				call(runtime!, toolName, {
-					task: "blocked start",
+					prompt: "blocked start",
 					model: "provider/model",
 					thinking: "off",
 				}, signal),
 			);
-		} else if (toolName === "subagent_list" || toolName === "subagent_status") {
+		} else if (toolName === "subagent_list" || toolName === "subagent_inspect") {
 			runtime = await createRuntime({ mode: "success" });
 			const child = await startChild(runtime);
 			childId = child.id;
@@ -435,7 +435,7 @@ async function scenarioCancellation(toolName: string): Promise<Record<string, un
 					signal,
 				),
 			);
-		} else if (toolName === "subagent_steer" || toolName === "subagent_follow_up") {
+		} else if (toolName === "subagent_steer") {
 			runtime = await createRuntime({ mode: "hang-message" });
 			const child = await startChild(runtime);
 			childId = child.id;
@@ -449,20 +449,12 @@ async function scenarioCancellation(toolName: string): Promise<Record<string, un
 			await assertAbortSettles(toolName, (signal) =>
 				call(runtime!, toolName, { id: child.id }, signal),
 			);
-		} else if (toolName === "subagent_kill") {
+		} else if (toolName === "subagent_remove") {
 			runtime = await createRuntime({ mode: "queue-kill" });
 			const child = await startChild(runtime);
 			childId = child.id;
 			await assertAbortSettles(toolName, (signal) =>
 				call(runtime!, toolName, { id: child.id }, signal),
-			);
-		} else if (toolName === "subagent_resume") {
-			runtime = await createRuntime({ mode: "hang-resume-state" });
-			const child = await startChild(runtime);
-			childId = child.id;
-			await killChild(runtime, child.id);
-			await assertAbortSettles(toolName, (signal) =>
-				call(runtime!, toolName, { id: child.id, task: "blocked resume" }, signal),
 			);
 		} else {
 			throw new Error(`Unknown cancellation tool ${toolName}.`);
@@ -507,7 +499,7 @@ async function scenarioLargeAgentEnd(): Promise<Record<string, unknown>> {
 	try {
 		runtime = await createRuntime({ mode: "large-agent-end" });
 		const started = await call(runtime, "subagent_start", {
-			task: "large agent end",
+			prompt: "large agent end",
 			model: "provider/model",
 			thinking: "off",
 		});
@@ -603,7 +595,7 @@ async function scenarioActiveLimit(): Promise<Record<string, unknown>> {
 		const results = await Promise.all(
 			Array.from({ length: 20 }, (_, index) =>
 				call(runtime!, "subagent_start", {
-					task: `child ${index}`,
+					prompt: `child ${index}`,
 					model: "provider/model",
 					thinking: "off",
 				}),
@@ -853,7 +845,7 @@ async function scenarioStartupHealth(): Promise<Record<string, unknown>> {
 
 		runtime = await createRuntime({ mode: "extension-error" });
 		const result = await call(runtime, "subagent_start", {
-			task: "extension health",
+			prompt: "extension health",
 			model: "provider/model",
 			thinking: "off",
 		});
@@ -929,7 +921,7 @@ async function scenarioStaleRunView(): Promise<Record<string, unknown>> {
 	try {
 		runtime = await createRuntime({ mode: "two-runs" });
 		const child = await startChild(runtime);
-		await call(runtime, "subagent_follow_up", { id: child.id, message: "second run" });
+		await call(runtime, "subagent_steer", { id: child.id, message: "second run" });
 		await waitForMarker(runtime, "second-run-active");
 		let current: TestResult | undefined;
 		await waitFor(
@@ -969,7 +961,7 @@ async function scenarioLaunchAfterStartup(): Promise<Record<string, unknown>> {
 		runtime = await createRuntime({ mode: "success", deferSessionStart: true });
 		await runtime.handlers.get("session_start")?.({ reason: "startup" }, runtime.ctx);
 		const result = await call(runtime, "subagent_start", {
-			task: "starts after startup",
+			prompt: "starts after startup",
 			model: "provider/model",
 			thinking: "off",
 		});
@@ -987,7 +979,7 @@ async function scenarioEphemeral(): Promise<Record<string, unknown>> {
 	try {
 		runtime = await createRuntime({ mode: "success", persistent: false });
 		const result = await call(runtime, "subagent_start", {
-			task: "ephemeral parent",
+			prompt: "ephemeral parent",
 			model: "provider/model",
 			thinking: "off",
 		});
@@ -1005,8 +997,8 @@ async function scenarioNotification(): Promise<Record<string, unknown>> {
 		await startChild(runtime);
 		await waitFor(() => runtime!.sent.length > 0, 2_000, "settlement notification");
 		const content = String(runtime.sent[0]?.message?.content || "");
-		assert.match(content, /numMessages=3/);
-		assert.doesNotMatch(content, /messages=3/);
+		assert.match(content, /stopped: it finished its turn/);
+		assert.match(content, /subagent_inspect/);
 		return { content };
 	} finally {
 		await cleanup(runtime);
@@ -1043,7 +1035,7 @@ async function scenarioHangingPredecessor(): Promise<Record<string, unknown>> {
 		let secondError: unknown;
 		const second = call(
 			runtime,
-			"subagent_follow_up",
+			"subagent_steer",
 			{ id: child.id, message: "queued successor" },
 			secondController.signal,
 		).then(
@@ -1064,7 +1056,7 @@ async function scenarioHangingPredecessor(): Promise<Record<string, unknown>> {
 		firstController.abort();
 		await withTimeout(first, 800, "predecessor cancellation");
 		assert.equal((firstError as Error)?.name, "AbortError");
-		const released = await call(runtime, "subagent_follow_up", {
+		const released = await call(runtime, "subagent_steer", {
 			id: child.id,
 			message: "released successor",
 		});
@@ -1077,36 +1069,14 @@ async function scenarioHangingPredecessor(): Promise<Record<string, unknown>> {
 	}
 }
 
-async function scenarioConcurrentResume(): Promise<Record<string, unknown>> {
-	let runtime: DriverRuntime | undefined;
-	try {
-		runtime = await createRuntime({ mode: "resume-race" });
-		const child = await startChild(runtime);
-		await killChild(runtime, child.id);
-		const results = await Promise.all([
-			call(runtime, "subagent_resume", { id: child.id, task: "resume A" }),
-			call(runtime, "subagent_resume", { id: child.id, task: "resume B" }),
-		]);
-		const starts = (await logRecords(runtime)).filter((record) => record.event === "start");
-		assert.equal(starts.length, 2, `concurrent resume started ${starts.length - 1} replacement processes`);
-		assert.equal(
-			results.filter((result) => String(result.content[0]?.text || "").startsWith("Resumed subagent")).length,
-			1,
-		);
-		return { processStarts: starts.length };
-	} finally {
-		await cleanup(runtime);
-	}
-}
-
 async function scenarioConcurrentMessages(): Promise<Record<string, unknown>> {
 	let runtime: DriverRuntime | undefined;
 	try {
 		runtime = await createRuntime({ mode: "message-race" });
 		const child = await startChild(runtime);
 		await Promise.all([
-			call(runtime, "subagent_steer", { id: child.id, message: "steer" }),
-			call(runtime, "subagent_follow_up", { id: child.id, message: "follow" }),
+			call(runtime, "subagent_steer", { id: child.id, message: "steer one" }),
+			call(runtime, "subagent_steer", { id: child.id, message: "steer two" }),
 		]);
 		const overlap = (await logRecords(runtime)).filter((record) => record.event === "message-overlap");
 		assert.equal(overlap.length, 0, `same-child message operations overlapped ${overlap.length} times`);
@@ -1121,12 +1091,10 @@ async function run(): Promise<Record<string, unknown>> {
 		const cancellationTool: Record<string, string> = {
 			start: "subagent_start",
 			list: "subagent_list",
-			status: "subagent_status",
+			inspect: "subagent_inspect",
 			steer: "subagent_steer",
-			"follow-up": "subagent_follow_up",
 			interrupt: "subagent_interrupt",
-			kill: "subagent_kill",
-			resume: "subagent_resume",
+			remove: "subagent_remove",
 		};
 		const suffix = scenario.slice("cancel-".length);
 		const toolName = cancellationTool[suffix];
@@ -1171,8 +1139,6 @@ async function run(): Promise<Record<string, unknown>> {
 			return scenarioEphemeral();
 		case "notification-parameter":
 			return scenarioNotification();
-		case "concurrent-resume":
-			return scenarioConcurrentResume();
 		case "hanging-predecessor":
 			return scenarioHangingPredecessor();
 		case "concurrent-messages":
@@ -1197,5 +1163,7 @@ const result = {
 	...(uncaughtException ? { uncaughtException } : {}),
 	...(unhandledRejection ? { unhandledRejection } : {}),
 };
-await new Promise<void>((resolve) => process.stdout.write(`${JSON.stringify(result)}\n`, resolve));
+await new Promise<void>((resolve) => {
+	process.stdout.write(`${JSON.stringify(result)}\n`, () => resolve());
+});
 process.exit(result.ok ? 0 : 1);

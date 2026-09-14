@@ -17,7 +17,6 @@ export interface FinalizedAssistantIdentity {
 }
 
 export interface AssistantLiveState {
-	resultText: string;
 	currentAssistantText: string;
 	latestAssistantText: string;
 	assistantMessageGeneration: number;
@@ -263,11 +262,8 @@ export function finalizeAssistantMessage(
 	max: number,
 ): boolean {
 	if (!updateAssistantMessage(state, message, max)) return false;
-	const fullText = extractText(message?.content);
-	if (fullText) {
+	if (extractText(message?.content))
 		state.latestAssistantText = state.currentAssistantText;
-		state.resultText = fullText;
-	}
 	state.assistantMessageActive = false;
 	state.finalizedAssistantMessageGeneration = state.assistantMessageGeneration;
 	state.finalizedAssistantMessageKey = state.assistantMessageKey;

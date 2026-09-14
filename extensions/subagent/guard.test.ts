@@ -34,13 +34,13 @@ test("controller registers nothing under PI_SUBAGENT_CHILD=1", () => {
 	}
 });
 
-test("controller registers eight tools and commands without marker", () => {
+test("controller registers six tools and commands without marker", () => {
 	const previous = process.env.PI_SUBAGENT_CHILD;
 	delete process.env.PI_SUBAGENT_CHILD;
 	try {
 		const { api, calls } = stubApi();
 		subagentExtension(api as unknown as ExtensionAPI);
-		assert.deepEqual(calls, { on: 3, registerTool: 8, registerCommand: 3 });
+		assert.deepEqual(calls, { on: 3, registerTool: 6, registerCommand: 3 });
 	} finally {
 		if (previous === undefined) delete process.env.PI_SUBAGENT_CHILD;
 		else process.env.PI_SUBAGENT_CHILD = previous;

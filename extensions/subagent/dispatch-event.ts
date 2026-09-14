@@ -380,7 +380,6 @@ export function dispatchSubagentEvent(
 			handle.abortRequestedAt = undefined;
 			handle.agentStartedAt ||= at;
 			handle.agentEndedAt = undefined;
-			handle.resultText = "";
 			handle.activeTools.clear();
 			updateCurrentTool(handle);
 			options.update();

@@ -8,7 +8,7 @@ This extension gives a parent Pi persistent child Pi processes through the nativ
 
 The child starts with `--offline` and `--approve`. Set `PI_SUBAGENT_PI_BIN` when tests or development need a specific Pi executable.
 
-The child process stays alive after a run settles. The parent can send another prompt, steer a current run, interrupt a run, or terminate the process.
+The child process stays alive after a run settles. The parent can send another message, interrupt a run, or remove the process.
 
 A child cannot start another delegated child.
 
@@ -60,7 +60,7 @@ A child ID identifies one logical child. A random incarnation identifies one chi
 
 A process-wide runtime map preserves live RPC transports and memory ownership while Pi reloads the extension. Reload rebinds only retained live runtimes with the same owner and incarnation.
 
-A fresh Pi process does not list or status children from another process. It can resume a stopped child when its child session file still exists.
+A fresh Pi process does not list or inspect children from another process.
 
 ## Storage and durable state
 
@@ -72,11 +72,11 @@ Each logical child uses this private directory:
   child-session.jsonl
 ```
 
-The child captures the effective system prompt. The Pi session file provides the transcript, working directory, model, thinking level, and resume parameters.
+The child captures the effective system prompt. The Pi session file provides the transcript, working directory, model, and thinking level.
 
 The extension keeps process state, run cursors, settlement status, and diagnostics in memory. It does not write a second durable controller state file.
 
-The child session file remains after the controller process exits. Resume reads its session header and records, then starts a new process incarnation.
+The child session file remains after the controller process exits. Nothing deletes it.
 
 ## RPC protocol
 
@@ -152,13 +152,15 @@ The caller must schedule another drain turn after each batch. It must not drain 
 
 ## Transcript inspection
 
-`subagent_status` reads the child Pi session JSONL file. The transcript reader accepts complete LF-framed records only.
+`subagent_inspect` reads the child Pi session JSONL file. The transcript reader accepts complete LF-framed records only.
 
-It filters the transcript to user messages, assistant messages, and normalized error messages.
+It filters the transcript to user messages, assistant messages, and normalized error messages. It drops thinking blocks, tool calls, and tool results.
 
-Each page uses a zero-based `messageOffset`. The default page size is three messages. The maximum page size is twenty messages.
+A read returns the last `n` messages, oldest first. The default is one message. The maximum is fifty.
 
-Each message is limited to 8 KiB. Each page is limited to 32 KiB of text.
+A message has no size cap. The reader returns its complete text.
+
+The reader seeks to the last 8 MiB of the file and scans forward from the first record boundary after that point. File size never rejects a read. It discards the partial record at the window start, so a truncated leading record never becomes a message.
 
 The reader reports one of these statuses:
 
@@ -167,7 +169,7 @@ The reader reports one of these statuses:
 - `incomplete`: the file has a non-empty trailing fragment without LF.
 - `unreadable`: one or more complete records are malformed, or the file cannot be read.
 
-The inspector reads at most the most recent 512 KiB of transcript data. It keeps recent records and reports when earlier records fall outside that bound.
+The TUI inspector reads at most the most recent 512 KiB of transcript data. It keeps recent records and reports when earlier records fall outside that bound. That bound belongs to the inspector, not to `subagent_inspect`.
 
 The inspector reads at most the first 64 KiB of the captured effective prompt. It reports prompt truncation instead of reading the complete file before display bounds apply.
 
@@ -175,7 +177,9 @@ Each inspector file operation has a deadline and an AbortSignal. Selection chang
 
 The inspector sanitizes all untrusted text before terminal rendering. These bounds do not weaken terminal sanitization.
 
-The reader preserves a requested offset when the current page has no messages. A later append can then make that offset visible.
+The result reports `messagesInWindow` and `windowed`. The count covers the read window, not the whole file, because a large file is read from its end.
+
+A damaged snapshot still returns every valid record before the damage. The tool prints those messages with a warning instead of hiding them.
 
 Transcript text and file presence do not prove that a run settled.
 
@@ -183,27 +187,36 @@ Transcript text and file presence do not prove that a run settled.
 
 The parent writes no output file. A child run reports its result through the transcript only.
 
-Transcript pages bound each message to 8 KiB. A longer deliverable does not survive that bound.
-
 To collect a long deliverable, instruct the child to write it to a file. The child owns the path, the content, and any retry. The parent then reads that file with its own tools.
 
-## Settlement wakes
+## Stop notifications
 
-For each accepted `agent_settled` run, the parent queues one non-durable steering wake.
+A subagent stops in four ways. Each one queues exactly one non-durable steering wake:
 
-The queue accepts only `run_settled` records with outcome `succeeded`, `failed`, or `aborted`. It suppresses duplicate records by owner, child, incarnation, and run ID.
+- It finished its turn. The run settled with outcome `succeeded`.
+- It errored. The run settled with outcome `failed`.
+- You interrupted it. The run settled with outcome `aborted`.
+- Its process died while the owner was still waiting. The record uses `eventKind: "process_died"` and outcome `died`.
+
+A child that already reported a stop does not report a second one when its process later closes. The owner is not waiting on an idle child, and a dead child reports itself through the next `subagent_steer` failure.
+
+The queue suppresses duplicate records by owner, child, incarnation, run ID, and event kind.
 
 It retries one failed send and limits each flush to a bounded batch. A later batch runs in another event-loop turn.
 
-Each wake uses `triggerTurn: true` and `deliverAs: "steer"`. Its content is exactly:
+Each wake uses `triggerTurn: true` and `deliverAs: "steer"`. Its content follows this shape:
 
 ```text
-Subagent <id> reached idle after run <runId>. Check subagent_status with numMessages=3.
+Subagent <id> (<name>) stopped: <reason>. Read its last message with subagent_inspect.
 ```
+
+A `process_died` wake adds the exit code or signal, the close error, and a bounded stderr tail.
 
 The custom message details include the direct owner session file, owner session ID, child ID, incarnation, run ID, event kind, outcome, and a `settlements` array containing that record.
 
-Shutdown and explicit child termination suppress unsent wakes.
+Shutdown and explicit removal suppress unsent wakes. The caller asked for those stops, so no wake is needed. A reload keeps queued wakes, because the process and its children survive it.
+
+The wake text carries child-controlled strings. The extension sanitizes and bounds the child name, the close error, and the stderr tail before it builds the message.
 
 Reload queues accept at most 512 records. Overflow retains accepted records, emits one terminal diagnostic, and fences the runtime against later updates. Bounded critical lifecycle records remain accepted so `agent_start`, `agent_end`, and `agent_settled` remain deliverable after an update flood.
 
@@ -211,20 +224,20 @@ The queue sends records separately. It does not promise durability, recovery aft
 
 ## Tools
 
-The extension registers eight tools:
+The extension registers six tools:
 
-- `subagent_start {task, model, thinking, name?, cwd?, systemPrompt?}` starts a persistent child. The caller task accepts at most 64 KiB. The response confirms acceptance only.
-- `subagent_list {includeFinished?}` lists current and retained children.
-- `subagent_status {id, messageOffset?, numMessages?}` returns bounded process and run diagnostics, settlement evidence, and transcript pages.
-- `subagent_steer {id, message}` accepts or queues guidance. The response does not mean completion.
-- `subagent_follow_up {id, message}` accepts or queues another child run. The response does not mean completion.
-- `subagent_interrupt {id}` accepts a cooperative abort while keeping the process alive.
-- `subagent_kill {id}` terminates a child with bounded escalation.
-- `subagent_resume {id, task?}` starts a new RPC incarnation from the saved child session. The optional resume task accepts at most 64 KiB.
+- `subagent_start {prompt, model, thinking, name?, cwd?}` starts a child and returns its handle at once. The prompt accepts at most 64 KiB. A missing `cwd` inherits the caller working directory.
+- `subagent_list {}` lists every tracked child, one block per child.
+- `subagent_inspect {id, n?}` returns the child state, its last `n` messages with timestamps, and the path to its full log. The default `n` is one.
+- `subagent_steer {id, message}` sends a message. A running child receives it at its next step. An idle child starts a new turn.
+- `subagent_interrupt {id}` stops the current turn and keeps the process alive.
+- `subagent_remove {id}` ends the process with bounded escalation and keeps every file.
 
-The model and thinking fields are mandatory for `subagent_start`. Nested delegated children cannot call `subagent_start`. The inspector displays at most 32 KiB of the original task text.
+The model and thinking fields are mandatory for `subagent_start`. Nested delegated children cannot call `subagent_start`. The inspector displays at most 32 KiB of the original prompt text.
 
-The status details include `processState`, `runState`, `runOutcome`, `settlement.status`, `lastSettledRunId`, `exitCode`, `exitSignal`, `error`, `stderrTail`, `diagnostics`, and transcript status and pages.
+The calling agent never polls. A stop notification arrives on its own.
+
+`subagent_inspect` reports one of three states: `running`, `idle`, or `stopped`. A stopped child reports its exit code or signal. The tool text also carries the model, the thinking level, the last run outcome, the start and last-activity timestamps, and any error.
 
 ## Commands and inspector
 
@@ -236,20 +249,6 @@ The inspector shows lifecycle state, RPC readiness, live assistant text, tool ac
 
 It sanitizes untrusted text before rendering it.
 
-## Resume
-
-`subagent_resume` applies to a stopped child with a nonempty saved session file. It keeps the logical child ID and creates a new incarnation.
-
-The extension locates the child session below `<agent-dir>/sessions/subagents/<child-id>/`. It reads the session header for the working directory. It uses the latest model and thinking-level records, with message and initial-level fallbacks.
-
-The new process starts its run counter from the in-memory logical cursor when the handle remains local. A resume task starts the next run. Without a task, the resumed child starts idle.
-
-A stopped child can resume from its session file after a fresh Pi process starts. The fresh process does not list that child until the resume operation loads it.
-
-The previous incarnation cannot mutate the resumed handle. The new process receives a new transport and process ID.
-
-Resuming a child that is live in another controller is undefined. The shared child session transcript can be corrupted, like any session file shared by two Pi processes.
-
 ## Verification
 
 Run the deterministic suite from this directory:
@@ -258,4 +257,12 @@ Run the deterministic suite from this directory:
 PI_TEST_PACKAGE_DIR=/path/to/pi-0.84.1 ./test.sh
 ```
 
-The suite covers lifecycle dispatch, transcript projection and pagination, settlement notifications, strict RPC framing, correlated responses, bounded termination, launch arguments, all eight tools, reload, resume, process-close evidence, abort acceptance, child-extension health helpers, and the inspector.
+Type-check every source and test file:
+
+```sh
+PI_TEST_PACKAGE_DIR=/path/to/pi-0.84.1 ./typecheck.sh
+```
+
+The test runner strips types instead of checking them, so a green suite proves nothing about type correctness. Run both.
+
+The suite covers lifecycle dispatch, transcript projection and tail reads, stop notifications, strict RPC framing, correlated responses, bounded termination, launch arguments, all six tools, reload, process-close evidence, abort acceptance, child-extension health helpers, and the inspector.

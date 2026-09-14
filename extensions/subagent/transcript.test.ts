@@ -11,9 +11,6 @@ import {
 	type TranscriptMessage,
 } from "./transcript.ts";
 
-const MAX_MESSAGE_BYTES = 8 * 1024;
-const MAX_PAGE_BYTES = 32 * 1024;
-
 function assertWellFormedUtf16(value: string): void {
 	for (let index = 0; index < value.length; index++) {
 		const code = value.charCodeAt(index);
@@ -70,7 +67,8 @@ test("missing paths and read errors have explicit statuses", async () => {
 	assert.deepEqual(missing, {
 		status: "missing",
 		messages: [],
-		nextMessageOffset: 0,
+		messagesInWindow: 0,
+		windowed: false,
 	});
 
 	const directory = await mkdtemp(join(tmpdir(), "pi-transcript-directory-"));
@@ -117,55 +115,38 @@ test("projection keeps user text, assistant text, and normalized errors only", (
 		},
 		{ role: "error", text: "provider disconnected", timestamp: 104 },
 	] satisfies TranscriptMessage[]);
-	assert.equal(result.nextMessageOffset, 5);
+	assert.equal(result.messagesInWindow, 5);
 });
 
-test("offsets count filtered messages and remain stable when lines append", () => {
-	const initial = [
+test("a tail read returns the most recent messages, oldest first", () => {
+	const content = [
 		line({ type: "session", id: "session" }),
 		line(message("user", "one")),
 		line(message("toolResult", [{ type: "text", text: "ignored" }])),
 		line(message("assistant", [{ type: "text", text: "two" }])),
+		line(message("user", "three")),
 	].join("");
-	const first = parseTranscript(initial, { messageOffset: 0, numMessages: 2 });
-	assert.deepEqual(first.messages.map(({ role, text }) => ({ role, text })), [
-		{ role: "user", text: "one" },
+	const tail = parseTranscript(content, { numMessages: 2 });
+	assert.deepEqual(tail.messages.map(({ role, text }) => ({ role, text })), [
 		{ role: "assistant", text: "two" },
-	]);
-	assert.equal(first.nextMessageOffset, 2);
-
-	const appended = `${initial}${line(message("user", "three"))}`;
-	const second = parseTranscript(appended, {
-		messageOffset: first.nextMessageOffset,
-		numMessages: 3,
-	});
-	assert.deepEqual(second.messages.map(({ role, text }) => ({ role, text })), [
 		{ role: "user", text: "three" },
 	]);
-	assert.equal(second.nextMessageOffset, 3);
+	assert.equal(tail.messagesInWindow, 3);
 });
 
-test("an offset beyond the current end stays unchanged until appends catch up", () => {
-	const initial = line(message("user", "first"));
-	const requestedOffset = 5;
-	const beforeAppend = parseTranscript(initial, {
-		messageOffset: requestedOffset,
-		numMessages: 3,
-	});
-	assert.deepEqual(beforeAppend.messages, []);
-	assert.equal(beforeAppend.nextMessageOffset, requestedOffset);
+test("the default returns only the last message", () => {
+	const content = Array.from({ length: 5 }, (_, index) =>
+		line(message("user", `message-${index}`)),
+	).join("");
+	const result = parseTranscript(content);
+	assert.deepEqual(result.messages.map(({ text }) => text), ["message-4"]);
+	assert.equal(result.messagesInWindow, 5);
+});
 
-	const appended = `${initial}${Array.from({ length: 5 }, (_, index) =>
-		line(message("user", `appended-${index}`)),
-	).join("")}`;
-	const afterAppend = parseTranscript(appended, {
-		messageOffset: beforeAppend.nextMessageOffset,
-		numMessages: 3,
-	});
-	assert.deepEqual(afterAppend.messages.map(({ role, text }) => ({ role, text })), [
-		{ role: "user", text: "appended-4" },
-	]);
-	assert.equal(afterAppend.nextMessageOffset, 6);
+test("a tail wider than the transcript returns every message", () => {
+	const result = parseTranscript(line(message("user", "first")), { numMessages: 20 });
+	assert.deepEqual(result.messages.map(({ text }) => text), ["first"]);
+	assert.equal(result.messagesInWindow, 1);
 });
 
 test("a final record without LF remains incomplete and never appears", () => {
@@ -182,7 +163,7 @@ test("a final record without LF remains incomplete and never appears", () => {
 			timestamp: Date.parse("2026-01-01T00:00:00.000Z"),
 		},
 	]);
-	assert.equal(result.nextMessageOffset, 1);
+	assert.equal(result.messagesInWindow, 1);
 });
 
 test("an incomplete trailing record becomes visible when its LF arrives", () => {
@@ -190,18 +171,12 @@ test("an incomplete trailing record becomes visible when its LF arrives", () => 
 	const trailing = JSON.stringify(message("assistant", [
 		{ type: "text", text: "finished later" },
 	]));
-	const incomplete = parseTranscript(`${prefix}${trailing}`, {
-		messageOffset: 1,
-		numMessages: 3,
-	});
+	const incomplete = parseTranscript(`${prefix}${trailing}`, { numMessages: 3 });
 	assert.equal(incomplete.status, "incomplete");
-	assert.deepEqual(incomplete.messages, []);
-	assert.equal(incomplete.nextMessageOffset, 1);
+	assert.deepEqual(incomplete.messages.map(({ text }) => text), ["saved"]);
+	assert.equal(incomplete.messagesInWindow, 1);
 
-	const complete = parseTranscript(`${prefix}${trailing}\n`, {
-		messageOffset: incomplete.nextMessageOffset,
-		numMessages: 3,
-	});
+	const complete = parseTranscript(`${prefix}${trailing}\n`, { numMessages: 1 });
 	assert.equal(complete.status, "available");
 	assert.deepEqual(complete.messages, [
 		{
@@ -210,7 +185,7 @@ test("an incomplete trailing record becomes visible when its LF arrives", () => 
 			timestamp: Date.parse("2026-01-01T00:00:00.000Z"),
 		},
 	]);
-	assert.equal(complete.nextMessageOffset, 2);
+	assert.equal(complete.messagesInWindow, 2);
 });
 
 test("LF framing accepts CRLF but does not treat CR as a record separator", () => {
@@ -238,47 +213,34 @@ test("malformed complete records report unreadable while valid records stay insp
 		{ role: "user", text: "before" },
 		{ role: "assistant", text: "after" },
 	]);
-	assert.equal(result.nextMessageOffset, 2);
+	assert.equal(result.messagesInWindow, 2);
 });
 
-test("limits page size and bounds individual and total text", () => {
+test("a tail read returns long messages in full", () => {
 	const huge = "x".repeat(100_000);
 	const content = Array.from({ length: 25 }, (_, index) =>
-		line(message("assistant", [{ type: "text", text: index === 0 ? huge : `message-${index}` }])),
+		line(message("assistant", [{ type: "text", text: index === 24 ? huge : `message-${index}` }])),
 	).join("");
-	const result = parseTranscript(content, { numMessages: 100 });
+	const result = parseTranscript(content, { numMessages: 2 });
 	assert.equal(result.status, "available");
-	assert.equal(result.messages.length, 20);
-	assert.ok(
-		result.messages.every(
-			(item) => Buffer.byteLength(item.text, "utf8") <= MAX_MESSAGE_BYTES,
-		),
-	);
-	assert.ok(
-		result.messages.reduce(
-			(total, item) => total + Buffer.byteLength(item.text, "utf8"),
-			0,
-		) <= MAX_PAGE_BYTES,
-	);
-	assert.equal(result.nextMessageOffset, result.messages.length);
+	assert.equal(result.messagesInWindow, 25);
+	assert.deepEqual(result.messages.map(({ text }) => text), ["message-23", huge]);
 });
 
-test("multibyte text uses hard UTF-8 budgets without splitting a surrogate pair", () => {
-	const text = "prefix-😀".repeat(4_000);
+test("multibyte text survives a tail read without splitting a surrogate pair", () => {
+	const text = "prefix-\u{1F600}".repeat(4_000);
 	const result = parseTranscript(
 		line(message("assistant", [{ type: "text", text }])),
 		{ numMessages: 1 },
 	);
 	assert.equal(result.status, "available");
-	assert.equal(result.messages.length, 1);
 	const projected = result.messages[0];
 	assert.ok(projected);
-	assert.ok(Buffer.byteLength(projected.text, "utf8") <= MAX_MESSAGE_BYTES);
+	assert.equal(projected.text, text);
 	assertWellFormedUtf16(projected.text);
-	assert.match(projected.text, /transcript text truncated/);
 });
 
-test("an oversized complete record stays bounded and does not change filtered offsets", async () => {
+test("an oversized complete record stays bounded and keeps later records readable", async () => {
 	const fixture = await temporaryFile(
 		JSON.stringify({
 			type: "custom",
@@ -293,7 +255,7 @@ test("an oversized complete record stays bounded and does not change filtered of
 		assert.deepEqual(result.messages.map(({ role, text }) => ({ role, text })), [
 			{ role: "user", text: "after oversized input" },
 		]);
-		assert.equal(result.nextMessageOffset, 1);
+		assert.equal(result.messagesInWindow, 1);
 	} finally {
 		await removeTemporary(fixture.directory);
 	}
@@ -311,14 +273,14 @@ test("an oversized unterminated record is unreadable", () => {
 	assert.deepEqual(result.messages, []);
 });
 
-test("numeric arguments and defaults normalize the pagination contract", () => {
+test("the tail count normalizes out-of-range values", () => {
 	const content = Array.from({ length: 5 }, (_, index) =>
 		line(message("user", `message-${index}`)),
 	).join("");
-	assert.equal(parseTranscript(content).messages.length, 3);
-	assert.equal(parseTranscript(content, 1, 2).nextMessageOffset, 3);
-	assert.equal(parseTranscript(content, { messageOffset: -4, numMessages: 99 }).messages.length, 5);
-	assert.equal(parseTranscript(content, { messageOffset: 2, numMessages: 0 }).nextMessageOffset, 2);
+	assert.equal(parseTranscript(content).messages.length, 1);
+	assert.equal(parseTranscript(content, { numMessages: -4 }).messages.length, 0);
+	assert.equal(parseTranscript(content, { numMessages: 99 }).messages.length, 5);
+	assert.equal(parseTranscript(content, { numMessages: 0 }).messagesInWindow, 5);
 });
 
 test("the file reader parses one snapshot and does not expose a partial append", async () => {
@@ -345,15 +307,16 @@ test("the file reader parses one snapshot and does not expose a partial append",
 	}
 });
 
-test("valid records above the old 256 KiB limit remain readable", () => {
+test("valid records above the old 256 KiB limit remain readable in full", () => {
+	const text = "x".repeat(300_000);
 	const result = parseTranscript(
-		line(message("assistant", [{ type: "text", text: "x".repeat(300_000) }])),
+		line(message("assistant", [{ type: "text", text }])),
 		{ numMessages: 1 },
 	);
 	assert.equal(result.status, "available");
 	assert.equal(result.messages.length, 1);
 	assert.ok(result.messages[0]);
-	assert.match(result.messages[0].text, /transcript text truncated/);
+	assert.equal(result.messages[0].text, text);
 });
 
 test("transcript reads use the initial file size while the source grows", async () => {
@@ -435,13 +398,52 @@ test("transcript reads preserve AbortError cancellation", async () => {
 	assert.equal(closeCount, 1);
 });
 
-test("a snapshot above the total byte bound is rejected", async () => {
+test("a window smaller than one record yields a windowed read, not a rejection", async () => {
 	const fixture = await temporaryFile(line(message("user", "bounded")));
 	try {
+		const result = await readTranscript(fixture.path, { maxSnapshotBytes: 1 });
+		assert.equal(result.status, "available");
+		assert.deepEqual(result.messages, []);
+		assert.equal(result.windowed, true);
+	} finally {
+		await removeTemporary(fixture.directory);
+	}
+});
+
+test("a file far above the window bound stays readable from its end", async () => {
+	const filler = Array.from({ length: 400 }, (_, index) =>
+		line(message("assistant", [{ type: "text", text: `filler-${index}`.padEnd(600, "x") }])),
+	).join("");
+	const fixture = await temporaryFile(
+		`${filler}${line(message("assistant", [{ type: "text", text: "the final answer" }]))}`,
+	);
+	try {
 		const result = await readTranscript(fixture.path, {
-			maxSnapshotBytes: 1,
+			maxSnapshotBytes: 4096,
+			numMessages: 1,
 		});
-		assert.equal(result.status, "unreadable");
+		assert.equal(result.status, "available");
+		assert.equal(result.windowed, true);
+		assert.deepEqual(result.messages.map(({ text }) => text), ["the final answer"]);
+		// The window holds only its own records, so the count is not the file total.
+		assert.ok(result.messagesInWindow > 0);
+		assert.ok(result.messagesInWindow < 401);
+	} finally {
+		await removeTemporary(fixture.directory);
+	}
+});
+
+test("a partial leading record inside the window never becomes a message", async () => {
+	const first = line(message("assistant", [{ type: "text", text: "x".repeat(2_000) }]));
+	const second = line(message("assistant", [{ type: "text", text: "second" }]));
+	const fixture = await temporaryFile(`${first}${second}`);
+	try {
+		const result = await readTranscript(fixture.path, {
+			maxSnapshotBytes: second.length + 40,
+			numMessages: 10,
+		});
+		assert.equal(result.status, "available");
+		assert.deepEqual(result.messages.map(({ text }) => text), ["second"]);
 	} finally {
 		await removeTemporary(fixture.directory);
 	}

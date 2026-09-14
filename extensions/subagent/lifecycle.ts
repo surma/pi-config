@@ -235,15 +235,6 @@ export function requestKill(state: LifecycleState, at: number): void {
 	syncLifecycleCompatibility(state);
 }
 
-/** Revive a stopped logical child for a new process incarnation. */
-export function reviveForResume(state: LifecycleState): void {
-	state.processState = "alive";
-	state.killRequestedAt = undefined;
-	state.settledAt = undefined;
-	state.settlementStatus = "pending";
-	resetRunViewForSession(state);
-}
-
 /** Clear session-specific live state without resetting the process-wide settlement cursor. */
 export function resetRunViewForSession(state: LifecycleState): void {
 	if (isLifecycleTerminal(state)) return;

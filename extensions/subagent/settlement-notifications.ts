@@ -8,14 +8,21 @@ const MAX_SEND_RETRIES = 1;
 const MAX_ACCEPTED_KEYS = 4096;
 const MAX_SENDS_PER_FLUSH = 32;
 
+/** Why a subagent stopped. `died` means the process closed without settling. */
+export type StopReason = SettledRunOutcome | "died";
+
 export interface SettlementNotificationRecord {
 	ownerSessionFile: string;
 	ownerSessionId: string;
 	childId: string;
 	incarnation: string;
+	/** The run that settled, or 0 when the process died outside a run. */
 	runId: number;
-	eventKind: "run_settled";
-	outcome: SettledRunOutcome;
+	eventKind: "run_settled" | "process_died";
+	outcome: StopReason;
+	/** A short human-readable label, such as the child name or the exit code. */
+	name?: string;
+	detail?: string;
 }
 
 export interface SettlementCustomMessage {
@@ -27,8 +34,13 @@ export interface SettlementCustomMessage {
 	};
 }
 
-function isSettledRunOutcome(value: unknown): value is SettledRunOutcome {
-	return value === "succeeded" || value === "failed" || value === "aborted";
+function isStopReason(value: unknown): value is StopReason {
+	return (
+		value === "succeeded" ||
+		value === "failed" ||
+		value === "aborted" ||
+		value === "died"
+	);
 }
 
 function isRealSettlement(record: SettlementNotificationRecord): boolean {
@@ -42,9 +54,11 @@ function isRealSettlement(record: SettlementNotificationRecord): boolean {
 		typeof record.incarnation === "string" &&
 		record.incarnation.length > 0 &&
 		Number.isSafeInteger(record.runId) &&
-		record.runId > 0 &&
-		record.eventKind === "run_settled" &&
-		isSettledRunOutcome(record.outcome)
+		record.runId >= 0 &&
+		(record.eventKind === "run_settled"
+			? record.runId > 0 && record.outcome !== "died"
+			: record.eventKind === "process_died") &&
+		isStopReason(record.outcome)
 	);
 }
 
@@ -59,10 +73,19 @@ function key(record: SettlementNotificationRecord): string {
 	]);
 }
 
+const REASON_TEXT: Record<StopReason, string> = {
+	succeeded: "it finished its turn",
+	failed: "it errored",
+	aborted: "you interrupted it",
+	died: "its process died",
+};
+
 function messageFor(record: SettlementNotificationRecord): SettlementCustomMessage {
+	const label = record.name ? `${record.childId} (${record.name})` : record.childId;
+	const detail = record.detail ? ` ${record.detail}` : "";
 	return {
 		customType: "subagent-settlement",
-		content: `Subagent ${record.childId} reached idle after run ${record.runId}. Check subagent_status with numMessages=3.`,
+		content: `Subagent ${label} stopped: ${REASON_TEXT[record.outcome]}.${detail} Read its last message with subagent_inspect.`,
 		display: true,
 		details: {
 			...record,
@@ -72,9 +95,9 @@ function messageFor(record: SettlementNotificationRecord): SettlementCustomMessa
 }
 
 /**
- * Delivers one non-durable wake for each accepted run settlement.
+ * Delivers one non-durable wake for each accepted subagent stop.
  *
- * The queue accepts only succeeded, failed, and aborted `run_settled` records.
+ * A stop is a settled run or a process that closed without settling.
  * It sends each record in its own steering message and retries one failure.
  * It does not persist records, recover records after process loss, or report stalls.
  */
