@@ -32,11 +32,6 @@ import {
 	type SubagentRun,
 } from "./lifecycle.js";
 import {
-	boundOutputError,
-	writeCallerOutput,
-	type OutputStatus,
-} from "./output-store.js";
-import {
 	deactivateAssistantMessage,
 } from "./live-state.js";
 import {
@@ -68,7 +63,6 @@ const STARTUP_TIMEOUT_MS = 10_000;
 const REQUEST_TIMEOUT_MS = 30_000;
 const ABORT_TIMEOUT_MS = 2_000;
 const FILE_OPERATION_TIMEOUT_MS = 5_000;
-const OUTPUT_WRITE_TIMEOUT_MS = 5_000;
 const TRANSCRIPT_TIMEOUT_MS = 5_000;
 const SHUTDOWN_TIMEOUT_MS = 5_000;
 const CHILD_OPERATION_TIMEOUT_MS = 5_000;
@@ -137,7 +131,6 @@ interface TaskSpec {
 	model: string;
 	thinking: ThinkingLevel;
 	systemPrompt?: string;
-	outputPath?: string;
 }
 interface AssistantAssembly {
 	message: Record<string, unknown>;
@@ -774,12 +767,8 @@ interface SubagentHandle extends SubagentDispatchHandle {
 	rpcReadyAt?: number;
 	lastActivityAt: number;
 	completedAt?: number;
-	outputPath?: string;
-	outputStatus: OutputStatus;
-	outputError?: string;
 	extensionError?: string;
 	transcriptStatus: TranscriptStatus;
-	outputWriteChain: Promise<void>;
 	stderr: string;
 	diagnostics: string[];
 	waiters: Set<() => void>;
@@ -809,7 +798,6 @@ interface HandleSeed {
 	runState: SubagentHandle["runState"];
 	createdAt: number;
 	lastActivityAt: number;
-	outputPath?: string;
 	ownerSessionFile: string;
 	ownerSessionId: string;
 	incarnation: string;
@@ -832,12 +820,6 @@ const TaskSpecSchema = Type.Object(
 		model: Type.String({ minLength: 1 }),
 		thinking: ThinkingSchema,
 		systemPrompt: Type.Optional(Type.String()),
-		outputPath: Type.Optional(
-			Type.String({
-				minLength: 1,
-				description: "Optional caller-owned output path. Relative paths use the caller cwd.",
-			}),
-		),
 	},
 	{ additionalProperties: false },
 );
@@ -1142,8 +1124,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		handle: SubagentHandle,
 		runId: number,
 		outcome: Exclude<RunOutcome, "pending">,
-		result: string,
-		settledAt: number,
 	): void {
 		const notification: SettlementNotificationRecord = {
 			ownerSessionFile: handle.ownerSessionFile,
@@ -1155,45 +1135,9 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			outcome,
 		};
 
-		// Queue the non-durable wake before caller output work.
+		// The wake is non-durable.
 		if (!sessionShuttingDown && handle.killRequestedAt === undefined)
 			settlementNotifications.queue(notification);
-
-		handle.outputStatus = handle.outputPath ? "pending" : "not_requested";
-		handle.outputError = undefined;
-		if (!handle.outputPath) return;
-
-		const outputPath = handle.outputPath;
-		const outputContent = result;
-		const write = handle.outputWriteChain.then(async () => {
-			const written = await bounded(
-				writeCallerOutput({
-					path: outputPath,
-					content: outputContent,
-				}),
-				OUTPUT_WRITE_TIMEOUT_MS,
-				undefined,
-				`Timed out writing caller output for subagent #${handle.id}.`,
-			);
-			handle.outputStatus = written.status;
-			if (written.status === "failed") {
-				handle.outputError = written.error;
-				addDiagnostic(
-					handle,
-					`Run ${runId} caller output failed: ${written.error}`,
-				);
-			} else {
-				handle.outputError = undefined;
-			}
-			update(handle);
-		});
-		handle.outputWriteChain = write.catch((error) => {
-			handle.outputStatus = "failed";
-			handle.outputError = boundOutputError(error);
-			addDiagnostic(handle, `Run ${runId} caller output failed: ${handle.outputError}`);
-			update(handle);
-		});
-		void handle.outputWriteChain;
 	}
 
 	async function serialize(
@@ -1249,13 +1193,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			},
 			error: handle.error || handle.finalError || undefined,
 			stderrTail: tail(handle.stderr),
-			output: {
-				path: handle.outputPath,
-				status: handle.outputStatus,
-				...(handle.outputError
-					? { error: boundOutputError(handle.outputError) }
-					: {}),
-			},
 			extensionError: handle.extensionError,
 			task: handle.task,
 			cwd: handle.cwd,
@@ -1307,8 +1244,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 
 	function createHandle(entry: HandleSeed): SubagentHandle {
 		const stopped = entry.processState === "stopped";
-		const outputPath = entry.outputPath;
-		const outputStatus = outputPath ? "pending" : "not_requested";
 		const restoredState = stopped ? "done" : "starting";
 		const handle = {
 			...createLifecycleState(),
@@ -1344,12 +1279,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			usage: createUsage(),
 			createdAt: entry.createdAt,
 			lastActivityAt: entry.lastActivityAt,
-			outputPath,
-			outputStatus,
-			outputError: undefined,
 			extensionError: undefined,
 			transcriptStatus: "missing",
-			outputWriteChain: Promise.resolve(),
 			stderr: "",
 			diagnostics: [],
 			waiters: new Set(),
@@ -1396,8 +1327,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		handle.finalizedAssistantTimestamp = undefined;
 		handle.assistantTextTruncated = false;
 		handle.usage = createUsage();
-		handle.outputStatus = handle.outputPath ? "pending" : "not_requested";
-		handle.outputError = undefined;
 		deactivateAssistantMessage(handle);
 		handle.assistantAssembly = undefined;
 	}
@@ -1414,15 +1343,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			onSettled: (run: SubagentRun) => {
 				handle.completedAt = handle.settledAt;
 				handle.error = handle.finalError;
-				if (run.outcome !== "pending") {
-					acceptSettlement(
-						handle,
-						run.id,
-						run.outcome,
-						handle.resultText,
-						handle.settledAt || run.endedAt || now(),
-					);
-				}
+				if (run.outcome !== "pending")
+					acceptSettlement(handle, run.id, run.outcome);
 				notifyWaiters(handle);
 				update(handle);
 			},
@@ -1907,7 +1829,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		cwd: string,
 		requestedModel: string,
 		requestedThinking: ThinkingLevel,
-		outputPath?: string,
 		signal?: AbortSignal,
 	): Promise<SubagentHandle> {
 		assertCallerTask(spec.task);
@@ -1920,7 +1841,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				cwd,
 				requestedModel,
 				requestedThinking,
-				outputPath,
 				signal,
 			);
 		} finally {
@@ -1933,7 +1853,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		cwd: string,
 		requestedModel: string,
 		requestedThinking: ThinkingLevel,
-		outputPath?: string,
 		signal?: AbortSignal,
 	): Promise<SubagentHandle> {
 		throwIfAborted(signal);
@@ -1977,7 +1896,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			sessionDir,
 			requestedModel,
 			requestedThinking,
-			outputPath,
 			processState: "alive",
 			runState: "idle",
 			createdAt: now(),
@@ -2125,12 +2043,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		handle.requestedModel = parameters.requestedModel;
 		handle.requestedThinking = parameters.requestedThinking;
 		if (!handle.task) handle.task = parameters.task;
-		await bounded(
-			handle.outputWriteChain,
-			OUTPUT_WRITE_TIMEOUT_MS,
-			signal,
-			`Timed out waiting for prior caller output for #${handle.id}.`,
-		);
 		const runIdBase = Math.max(handle.runSequence, handle.lastSettledRunId);
 		const oldIncarnation = handle.incarnation;
 		const incarnation = createId();
@@ -2316,8 +2228,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			actualThinking: handle.actualThinking || handle.requestedThinking,
 			sessionPath: handle.sessionPath || "",
 			promptPath: handle.promptPath,
-			outputPath: handle.outputPath,
-			outputStatus: handle.outputStatus,
 			transcriptStatus: handle.transcriptStatus,
 			createdAt: handle.createdAt,
 			rpcReadyAt: handle.rpcReadyAt,
@@ -2385,26 +2295,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		setControllerStatus(ctx, "ready");
 	}
 
-	async function waitForOutputWrites(deadline?: number): Promise<boolean> {
-		let complete = true;
-		await Promise.all(
-			[...handles.values()].map(async (handle) => {
-				try {
-					await bounded(
-						handle.outputWriteChain,
-						deadlineTimeout(deadline, OUTPUT_WRITE_TIMEOUT_MS),
-						undefined,
-						`Timed out waiting for caller output for #${handle.id}.`,
-					);
-				} catch (error) {
-					complete = false;
-					addDiagnostic(handle, `Caller output cleanup failed: ${String(error)}`);
-				}
-			}),
-		);
-		return complete;
-	}
-
 	async function stopAllChildren(
 		deadline = now() + SHUTDOWN_TIMEOUT_MS,
 	): Promise<void> {
@@ -2434,7 +2324,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				}),
 			);
 		}
-		await waitForOutputWrites(deadline);
 		await forceCleanupRuntimes(deadline);
 	}
 
@@ -2458,7 +2347,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				handle.runtime.handle = handle;
 				detachRuntime(handle.runtime);
 			}
-			await waitForOutputWrites(deadline);
 			if (ctx.mode === "tui") ctx.ui.setWidget("subagent", undefined);
 			latestCtx = null;
 			return;
@@ -2476,14 +2364,14 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	pi.on("before_agent_start", async (event) => ({
 		systemPrompt:
 			event.systemPrompt +
-			`\n\nSubagent extension is available. Use it only for explicit delegation. subagent_start requires an explicit provider/model and thinking level; use list_models when needed instead of guessing. Children are persistent Pi RPC processes. Native agent_end is intermediate. Native agent_settled is the only run completion edge, and the child remains alive and idle after settlement. Prompt, follow-up, steer, and abort responses confirm acceptance or queueing only. The start command observes run acceptance for at most one second and does not wait for the model response. Settlement wakes are best effort, non-durable steering messages for success, failure, and abort. Do not poll subagent_status or use sleep commands to wait for completion. Use subagent_status for bounded run diagnosis, transcript pages, output status, process-close evidence, and stale or missing evidence. Transcript pages read bounded JSONL projections with available, missing, incomplete, or unreadable status, and transcript text never proves completion. A process close before agent_settled is terminal closed_without_settlement evidence with exit code, signal, stderr, and diagnostics, and it never emits a settlement wake. Set outputPath when the caller needs one atomic, non-overwriting output file; output status is independent of run outcome. Child session files provide resume parameters, and retained live runtimes rebind across reload without durable controller state. A cooperative abort is acknowledged when accepted; agent_settled with outcome aborted is the completion edge. There is no watchdog. Use subagent_follow_up for another turn, subagent_steer during a run, subagent_interrupt to abort while keeping the child alive, and subagent_kill for bounded termination.`,
+			`\n\nSubagent extension is available. Use it only for explicit delegation. subagent_start requires an explicit provider/model and thinking level; use list_models when needed instead of guessing. Children are persistent Pi RPC processes. Native agent_end is intermediate. Native agent_settled is the only run completion edge, and the child remains alive and idle after settlement. Prompt, follow-up, steer, and abort responses confirm acceptance or queueing only. The start command observes run acceptance for at most one second and does not wait for the model response. Settlement wakes are best effort, non-durable steering messages for success, failure, and abort. Do not poll subagent_status or use sleep commands to wait for completion. Use subagent_status for bounded run diagnosis, transcript pages, process-close evidence, and stale or missing evidence. Transcript pages read bounded JSONL projections with available, missing, incomplete, or unreadable status, and transcript text never proves completion. A process close before agent_settled is terminal closed_without_settlement evidence with exit code, signal, stderr, and diagnostics, and it never emits a settlement wake. Transcript pages bound each message to 8 KiB, so instruct the child to write a long deliverable to a file and then read that file. Child session files provide resume parameters, and retained live runtimes rebind across reload without durable controller state. A cooperative abort is acknowledged when accepted; agent_settled with outcome aborted is the completion edge. There is no watchdog. Use subagent_follow_up for another turn, subagent_steer during a run, subagent_interrupt to abort while keeping the child alive, and subagent_kill for bounded termination.`,
 	}));
 
 	pi.registerTool<typeof TaskSpecSchema, unknown>({
 		name: "subagent_start",
 		label: "Subagent Start",
 		description:
-			"Start a persistent Pi RPC child with an explicit model and thinking level. The response confirms acceptance only. Use outputPath for optional caller-owned atomic output. A best-effort settlement wake reports success, failure, or abort. Diagnose runs with subagent_status instead of polling for completion. Call subagent_kill when the child is no longer useful.",
+			"Start a persistent Pi RPC child with an explicit model and thinking level. The response confirms acceptance only. A best-effort settlement wake reports success, failure, or abort. Diagnose runs with subagent_status instead of polling for completion. Call subagent_kill when the child is no longer useful.",
 		parameters: TaskSpecSchema,
 		async execute(_id, params, signal, _update, ctx) {
 			throwIfAborted(signal);
@@ -2514,18 +2402,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			try {
 				const callerCwd = ctx.cwd;
 				const childCwd = spec.cwd ? resolve(callerCwd, spec.cwd) : callerCwd;
-				const outputPath = spec.outputPath
-					? resolve(callerCwd, spec.outputPath)
-					: undefined;
 				const handle = await withLaunchReservation(signal, () =>
-					launch(
-						spec,
-						childCwd,
-						choice.model,
-						choice.thinking,
-						outputPath,
-						signal,
-					),
+					launch(spec, childCwd, choice.model, choice.thinking, signal),
 				);
 				startedHandle = handle;
 				return {
@@ -2588,7 +2466,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		name: "subagent_status",
 		label: "Subagent Status",
 		description:
-			"Return bounded process/run diagnostics, settlement evidence, transcript text, and caller output status. Use this tool for diagnosis only. Do not infer completion from polling, silence, transcript text, or output files.",
+			"Return bounded process/run diagnostics, settlement evidence, and transcript text. Use this tool for diagnosis only. Do not infer completion from polling, silence, or transcript text.",
 		parameters: StatusSchema,
 		async execute(_id, params, signal) {
 			throwIfAborted(signal);

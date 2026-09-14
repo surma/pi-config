@@ -239,11 +239,10 @@ e2eTest("E2E: active child count stays bounded", { timeout: 35_000 }, async () =
 	assert.ok(Number(result.accepted) <= 8);
 });
 
-e2eTest("E2E: a large valid agent_end settles, wakes, and publishes output", { timeout: 10_000 }, async () => {
+e2eTest("E2E: a large valid agent_end settles and wakes", { timeout: 10_000 }, async () => {
 	const result = await runScenario("large-agent-end", 7_000);
 	assert.equal(result.settled, true);
 	assert.equal(result.wakeCount, 1);
-	assert.equal(result.output, "written");
 });
 
 e2eTest("E2E: unterminated RPC records are discarded with a diagnostic", { timeout: 6_000 }, async () => {

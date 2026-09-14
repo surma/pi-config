@@ -47,8 +47,6 @@ export interface InspectorHandle {
 	actualThinking: string;
 	sessionPath: string;
 	promptPath: string;
-	outputPath?: string;
-	outputStatus: "not_requested" | "pending" | "written" | "collision" | "failed";
 	transcriptStatus: "available" | "missing" | "incomplete" | "unreadable";
 	createdAt: number;
 	rpcReadyAt?: number;
@@ -821,8 +819,6 @@ export class SubagentInspector implements Focusable {
 		this.pushField(lines, "Session", handle.sessionPath, width);
 		this.pushField(lines, "Transcript", handle.transcriptStatus, width);
 		this.pushField(lines, "Prompt", handle.promptPath, width);
-		this.pushField(lines, "Output", handle.outputPath || "(not requested)", width);
-		this.pushField(lines, "Output status", handle.outputStatus, width);
 		if (width >= 80) this.pushField(lines, "Cwd", handle.cwd, width);
 		return lines;
 	}

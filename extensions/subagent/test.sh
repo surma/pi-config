@@ -14,8 +14,8 @@ tmp="$(mktemp -d)"
 cleanup() { rm -rf "$tmp"; }
 trap cleanup EXIT
 
-sources=(child.ts dispatch-event.ts index.ts lifecycle.ts live-state.ts output-store.ts settlement-notifications.ts transcript.ts ui.ts rpc.ts)
-tests=(guard.test.ts child.test.ts lifecycle.test.ts live-state.test.ts dispatch-event.test.ts launch.test.ts output-store.test.ts settlement-notifications.test.ts transcript.test.ts tools.test.ts ui.test.ts rpc.test.ts)
+sources=(child.ts dispatch-event.ts index.ts lifecycle.ts live-state.ts settlement-notifications.ts transcript.ts ui.ts rpc.ts)
+tests=(guard.test.ts child.test.ts lifecycle.test.ts live-state.test.ts dispatch-event.test.ts launch.test.ts settlement-notifications.test.ts transcript.test.ts tools.test.ts ui.test.ts rpc.test.ts)
 support=()
 if [[ "${PI_SUBAGENT_E2E_ONLY:-0}" == "1" ]]; then
 	tests=(e2e.test.ts)

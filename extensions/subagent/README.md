@@ -74,7 +74,7 @@ Each logical child uses this private directory:
 
 The child captures the effective system prompt. The Pi session file provides the transcript, working directory, model, thinking level, and resume parameters.
 
-The extension keeps process state, run cursors, settlement status, diagnostics, and output status in memory. It does not write a second durable controller state file.
+The extension keeps process state, run cursors, settlement status, and diagnostics in memory. It does not write a second durable controller state file.
 
 The child session file remains after the controller process exits. Resume reads its session header and records, then starts a new process incarnation.
 
@@ -179,25 +179,13 @@ The reader preserves a requested offset when the current page has no messages. A
 
 Transcript text and file presence do not prove that a run settled.
 
-## Caller output
+## Long deliverables
 
-`subagent_start` accepts an optional `outputPath`. A relative path resolves against the caller session current working directory.
+The parent writes no output file. A child run reports its result through the transcript only.
 
-The publisher accepts the complete captured text without a content-size limit.
+Transcript pages bound each message to 8 KiB. A longer deliverable does not survive that bound.
 
-On settlement, the parent writes the final captured assistant text to that path without delaying event handling or wake queueing:
-
-- Missing parent directories are created with mode `0700`.
-- The output file uses mode `0600`.
-- Empty text creates a valid empty file.
-- An existing path returns `collision` and remains unchanged.
-- A concurrent publisher returns `collision` and never overwrites the first file.
-- Other filesystem errors return `failed` with a bounded error message.
-- A same-directory temporary file is written and synced before exclusive hard-link publication.
-
-The output status is independent of `runOutcome`. A failed or aborted run can still write caller output.
-
-Reusing a path for another settled run returns `collision`.
+To collect a long deliverable, instruct the child to write it to a file. The child owns the path, the content, and any retry. The parent then reads that file with its own tools.
 
 ## Settlement wakes
 
@@ -215,7 +203,7 @@ Subagent <id> reached idle after run <runId>. Check subagent_status with numMess
 
 The custom message details include the direct owner session file, owner session ID, child ID, incarnation, run ID, event kind, outcome, and a `settlements` array containing that record.
 
-The parent queues each wake before optional caller output work. Shutdown and explicit child termination suppress unsent wakes.
+Shutdown and explicit child termination suppress unsent wakes.
 
 Reload queues accept at most 512 records. Overflow retains accepted records, emits one terminal diagnostic, and fences the runtime against later updates. Bounded critical lifecycle records remain accepted so `agent_start`, `agent_end`, and `agent_settled` remain deliverable after an update flood.
 
@@ -225,9 +213,9 @@ The queue sends records separately. It does not promise durability, recovery aft
 
 The extension registers eight tools:
 
-- `subagent_start {task, model, thinking, name?, cwd?, systemPrompt?, outputPath?}` starts a persistent child. The caller task accepts at most 64 KiB. The response confirms acceptance only.
+- `subagent_start {task, model, thinking, name?, cwd?, systemPrompt?}` starts a persistent child. The caller task accepts at most 64 KiB. The response confirms acceptance only.
 - `subagent_list {includeFinished?}` lists current and retained children.
-- `subagent_status {id, messageOffset?, numMessages?}` returns bounded process and run diagnostics, settlement evidence, transcript pages, and caller output status.
+- `subagent_status {id, messageOffset?, numMessages?}` returns bounded process and run diagnostics, settlement evidence, and transcript pages.
 - `subagent_steer {id, message}` accepts or queues guidance. The response does not mean completion.
 - `subagent_follow_up {id, message}` accepts or queues another child run. The response does not mean completion.
 - `subagent_interrupt {id}` accepts a cooperative abort while keeping the process alive.
@@ -236,7 +224,7 @@ The extension registers eight tools:
 
 The model and thinking fields are mandatory for `subagent_start`. Nested delegated children cannot call `subagent_start`. The inspector displays at most 32 KiB of the original task text.
 
-The status details include `processState`, `runState`, `runOutcome`, `settlement.status`, `lastSettledRunId`, `exitCode`, `exitSignal`, `error`, `stderrTail`, `diagnostics`, transcript status and pages, and output path and status.
+The status details include `processState`, `runState`, `runOutcome`, `settlement.status`, `lastSettledRunId`, `exitCode`, `exitSignal`, `error`, `stderrTail`, `diagnostics`, and transcript status and pages.
 
 ## Commands and inspector
 
@@ -244,7 +232,7 @@ The status details include `processState`, `runState`, `runOutcome`, `settlement
 - `/subagents-toggle` toggles the compact active-child widget.
 - `/subagents-kill-all` terminates all live children owned by the current controller.
 
-The inspector shows lifecycle state, RPC readiness, live assistant text, tool activity, transcript history, settlement evidence, process-close evidence, and caller output state.
+The inspector shows lifecycle state, RPC readiness, live assistant text, tool activity, transcript history, settlement evidence, and process-close evidence.
 
 It sanitizes untrusted text before rendering it.
 
@@ -270,4 +258,4 @@ Run the deterministic suite from this directory:
 PI_TEST_PACKAGE_DIR=/path/to/pi-0.84.1 ./test.sh
 ```
 
-The suite covers lifecycle dispatch, transcript projection and pagination, caller output publication, settlement notifications, strict RPC framing, correlated responses, bounded termination, launch arguments, all eight tools, reload, resume, process-close evidence, abort acceptance, child-extension health helpers, and the inspector.
+The suite covers lifecycle dispatch, transcript projection and pagination, settlement notifications, strict RPC framing, correlated responses, bounded termination, launch arguments, all eight tools, reload, resume, process-close evidence, abort acceptance, child-extension health helpers, and the inspector.
