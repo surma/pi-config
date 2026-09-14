@@ -506,12 +506,10 @@ async function scenarioLargeAgentEnd(): Promise<Record<string, unknown>> {
 	let runtime: DriverRuntime | undefined;
 	try {
 		runtime = await createRuntime({ mode: "large-agent-end" });
-		const outputPath = join(runtime.root, "large-agent-end.md");
 		const started = await call(runtime, "subagent_start", {
 			task: "large agent end",
 			model: "provider/model",
 			thinking: "off",
-			outputPath,
 		});
 		const childId = handleId(started);
 		let current: TestResult | undefined;
@@ -520,7 +518,6 @@ async function scenarioLargeAgentEnd(): Promise<Record<string, unknown>> {
 				current = await status(runtime!, childId);
 				return (
 					current.details.settlement.status === "settled" &&
-					current.details.output.status === "written" &&
 					runtime!.sent.length === 1
 				);
 			},
@@ -533,8 +530,6 @@ async function scenarioLargeAgentEnd(): Promise<Record<string, unknown>> {
 		assert.equal(current.details.runOutcome, "succeeded");
 		assert.equal(current.details.lastSettledRunId, 1);
 		assert.equal(current.details.settlement.status, "settled");
-		assert.equal(current.details.output.status, "written");
-		assert.equal(await readFile(outputPath, "utf8"), "result-1 large agent end");
 		assert.equal(runtime.sent.length, 1);
 		assert.equal(runtime.sent[0]?.message?.details?.runId, 1);
 		assert.ok(
@@ -545,7 +540,6 @@ async function scenarioLargeAgentEnd(): Promise<Record<string, unknown>> {
 		return {
 			settled: true,
 			wakeCount: runtime.sent.length,
-			output: current.details.output.status,
 		};
 	} finally {
 		await cleanup(runtime);

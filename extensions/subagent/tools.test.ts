@@ -403,14 +403,12 @@ test("the extension registers all eight tools and three commands", () => {
 			task: { minLength?: number; maxLength?: number };
 			model: { minLength?: number };
 			thinking: unknown;
-			outputPath: { minLength?: number };
 		};
 		required?: string[];
 	};
 	assert.equal(start.properties.task.minLength, 1);
 	assert.equal(start.properties.task.maxLength, MAX_CALLER_TASK_LENGTH);
 	assert.equal(start.properties.model.minLength, 1);
-	assert.equal(start.properties.outputPath.minLength, 1);
 	assert.deepEqual(new Set(start.required), new Set(["task", "model", "thinking"]));
 	const resume = requireTool(tools, "subagent_resume").parameters as {
 		properties: { task?: { maxLength?: number } };
@@ -423,8 +421,8 @@ test("tool schemas accept valid values and reject invalid values", () => {
 	const cases: [string, unknown, unknown][] = [
 		[
 			"subagent_start",
-			{ task: "work", model: "provider/model", thinking: "high", outputPath: "out.txt" },
-			{ task: "work", model: "provider/model", thinking: "high", outputPath: "" },
+			{ task: "work", model: "provider/model", thinking: "high" },
+			{ task: "", model: "provider/model", thinking: "high" },
 		],
 		["subagent_list", {}, { includeFinished: "yes" }],
 		["subagent_status", { id: "child", messageOffset: 0, numMessages: 20 }, { id: "child", numMessages: 21 }],
@@ -701,12 +699,11 @@ test("same-child operation queues reject work beyond the finite bound", async ()
 	}
 });
 
-test("RPC child lifecycle supports settlement wakes, output collisions, transcript paging, runtime-only reload, and session-only resume", async () => {
+test("RPC child lifecycle supports settlement wakes, transcript paging, runtime-only reload, and session-only resume", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "pi-rpc-tools-"));
 	const agentDirectory = join(directory, "agent");
 	const parentSession = join(directory, "parent.jsonl");
 	const logPath = join(directory, "invocations.jsonl");
-	const outputPath = join(directory, "deliverable.txt");
 	const controllerDirectory = join(agentDirectory, "sessions", "subagents", "controllers");
 	await writeFile(parentSession, "parent\n");
 	const binary = await fakePi(directory, logPath);
@@ -738,7 +735,6 @@ test("RPC child lifecycle supports settlement wakes, output collisions, transcri
 				model: "provider/model",
 				thinking: "off",
 				name: "worker",
-				outputPath: "deliverable.txt",
 			},
 			undefined,
 			undefined,
@@ -751,14 +747,7 @@ test("RPC child lifecycle supports settlement wakes, output collisions, transcri
 		assert.equal(started.details.handle.runState, "idle");
 		assert.equal(started.details.handle.runOutcome, "succeeded");
 		assert.equal(started.details.handle.settlement.status, "settled");
-		assert.equal(started.details.handle.output.path, outputPath);
 		assert.equal(started.details.handle.rpcReady, true);
-
-		await waitFor(async () => {
-			const status = await requireTool(tools, "subagent_status").execute("status", { id: childId });
-			return status.details.output.status === "written";
-		});
-		assert.equal(await readFile(outputPath, "utf8"), "result-1 initial");
 
 		const status = await requireTool(tools, "subagent_status").execute("status", {
 			id: childId,
@@ -808,11 +797,6 @@ test("RPC child lifecycle supports settlement wakes, output collisions, transcri
 		assert.equal(follow.details.command, "prompt");
 		assert.equal(follow.details.handle.runId, 2);
 		await waitFor(() => sent.some((message) => message.message.details?.settlements?.some((record: any) => record.runId === 2)));
-		await waitFor(async () => {
-			const current = await requireTool(tools, "subagent_status").execute("status", { id: childId });
-			return current.details.output.status === "collision";
-		});
-		assert.equal(await readFile(outputPath, "utf8"), "result-1 initial");
 
 		await handlers.get("session_shutdown")?.({ reason: "reload" }, ctx);
 		const reloaded = setup(new Map(), sent);
@@ -821,7 +805,6 @@ test("RPC child lifecycle supports settlement wakes, output collisions, transcri
 		const reloadedList = await requireTool(reloaded.tools, "subagent_list").execute("list-after-reload", {});
 		assert.equal(reloadedList.details.handles.length, 1);
 		assert.equal(reloadedList.details.handles[0]?.runId, 2);
-		assert.equal(reloadedList.details.handles[0]?.output.status, "collision");
 		assert.equal(reloadedList.details.handles[0]?.processState, "alive");
 		assert.equal(reloadedList.details.handles[0]?.state, "done");
 		assert.equal(reloadedList.details.handles[0]?.lifecycle, "idle");
@@ -938,12 +921,11 @@ test("startup ignores stale controller files", async () => {
 	}
 });
 
-test("failed settlement writes caller output and reports a failed run", async () => {
+test("failed settlement reports a failed run", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "pi-rpc-failure-"));
 	const agentDirectory = join(directory, "agent");
 	const parentSession = join(directory, "parent.jsonl");
 	const logPath = join(directory, "invocations.jsonl");
-	const outputPath = join(directory, "failed.txt");
 	await writeFile(parentSession, "parent\n");
 	const binary = await fakePi(directory, logPath, "failure");
 	const old = {
@@ -962,7 +944,7 @@ test("failed settlement writes caller output and reports a failed run", async ()
 		await handlers.get("session_start")?.({ reason: "startup" }, ctx);
 		const started = await requireTool(tools, "subagent_start").execute(
 			"start",
-			{ task: "fail", model: "provider/model", thinking: "max", outputPath },
+			{ task: "fail", model: "provider/model", thinking: "max" },
 			undefined,
 			undefined,
 			ctx,
@@ -970,13 +952,12 @@ test("failed settlement writes caller output and reports a failed run", async ()
 		const childId = String(started.details.handle.id);
 		await waitFor(async () => {
 			const status = await requireTool(tools, "subagent_status").execute("status", { id: childId });
-			return status.details.output.status === "written";
+			return status.details.settlement.status === "settled";
 		});
 		const status = await requireTool(tools, "subagent_status").execute("status", { id: childId });
 		assert.equal(status.details.runOutcome, "failed");
 		assert.equal(status.details.settlement.status, "settled");
 		assert.match(status.details.error, /quota exceeded/);
-		assert.equal(await readFile(outputPath, "utf8"), "failed-1 fail");
 		await waitFor(() => sent.some((message) => message.message.details?.outcome === "failed"));
 		await requireTool(tools, "subagent_kill").execute("kill", { id: childId });
 	} finally {
@@ -990,12 +971,11 @@ test("failed settlement writes caller output and reports a failed run", async ()
 	}
 });
 
-test("native assistant abort errors settle as one aborted wake with empty output", async () => {
+test("native assistant abort errors settle as one aborted wake", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "pi-rpc-abort-error-"));
 	const agentDirectory = join(directory, "agent");
 	const parentSession = join(directory, "parent.jsonl");
 	const logPath = join(directory, "invocations.jsonl");
-	const outputPath = join(directory, "aborted.txt");
 	await writeFile(parentSession, "parent\n");
 	const binary = await fakePi(directory, logPath, "abort-error");
 	const old = {
@@ -1018,7 +998,6 @@ test("native assistant abort errors settle as one aborted wake with empty output
 				task: "abort",
 				model: "provider/model",
 				thinking: "high",
-				outputPath,
 			},
 			undefined,
 			undefined,
@@ -1035,8 +1014,7 @@ test("native assistant abort errors settle as one aborted wake with empty output
 			const status = await requireTool(tools, "subagent_status").execute("status", { id: childId });
 			return (
 				status.details.runOutcome === "aborted" &&
-				status.details.settlement.status === "settled" &&
-				status.details.output.status === "written"
+				status.details.settlement.status === "settled"
 			);
 		});
 		const status = await requireTool(tools, "subagent_status").execute("status", { id: childId });
@@ -1046,9 +1024,6 @@ test("native assistant abort errors settle as one aborted wake with empty output
 		assert.equal(status.details.error, undefined);
 		assert.equal(status.details.finalError, undefined);
 		assert.equal(status.details.tentativeError, undefined);
-		assert.equal(status.details.output.path, outputPath);
-		assert.equal(status.details.output.status, "written");
-		assert.equal(await readFile(outputPath, "utf8"), "");
 		await waitFor(() => sent.length >= 1);
 		assert.equal(sent.length, 1);
 		assert.deepEqual(

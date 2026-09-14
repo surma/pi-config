@@ -35,8 +35,6 @@ function handle(
 		promptPath: `/tmp/${id}.prompt`,
 		runOutcome: "pending",
 		settlementStatus: "pending",
-		outputPath: undefined,
-		outputStatus: "not_requested",
 		transcriptStatus: "available",
 		stderrTail: undefined,
 		createdAt: 1_000,
