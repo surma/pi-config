@@ -47,7 +47,7 @@ type DriverRuntime = {
 };
 
 const scenario = process.argv[2] || "";
-const fakePi = process.env.E2E_FAKE_PI;
+const fakePi = process.env.E2E_FAKE_PI ?? "";
 if (!fakePi) throw new Error("E2E_FAKE_PI is not set.");
 
 let uncaughtException: string | undefined;
@@ -1163,5 +1163,7 @@ const result = {
 	...(uncaughtException ? { uncaughtException } : {}),
 	...(unhandledRejection ? { unhandledRejection } : {}),
 };
-await new Promise<void>((resolve) => process.stdout.write(`${JSON.stringify(result)}\n`, resolve));
+await new Promise<void>((resolve) => {
+	process.stdout.write(`${JSON.stringify(result)}\n`, () => resolve());
+});
 process.exit(result.ok ? 0 : 1);

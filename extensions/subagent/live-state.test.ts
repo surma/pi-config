@@ -12,7 +12,6 @@ import {
 
 function state(): AssistantLiveState {
 	return {
-		resultText: "",
 		currentAssistantText: "",
 		latestAssistantText: "",
 		assistantMessageGeneration: 0,
@@ -52,7 +51,7 @@ test("assistant snapshots replace within a generation and a shorter new turn rep
 	finalizeAssistantMessage(live, message(2, "short"), 1024);
 	assert.equal(live.currentAssistantText, "short");
 	assert.equal(live.latestAssistantText, "short");
-	assert.equal(live.resultText, "short");
+	assert.equal(live.latestAssistantText, "short");
 });
 
 test("finalization tombstones reject delayed same-message events and duplicate finalization", () => {
@@ -75,7 +74,7 @@ test("finalization tombstones reject delayed same-message events and duplicate f
 	assert.equal(live.finalizedAssistantIdentities.length, 1);
 	assert.equal(live.currentAssistantText, "final");
 	assert.equal(live.latestAssistantText, "final");
-	assert.equal(live.resultText, "final");
+	assert.equal(live.latestAssistantText, "final");
 });
 
 test("an out-of-order start cannot replace an active message", () => {
@@ -105,7 +104,7 @@ test("unseen responseIds distinguish legitimate same-timestamp messages", () => 
 		true,
 	);
 	assert.equal(live.currentAssistantText, "new");
-	assert.equal(live.resultText, "new");
+	assert.equal(live.latestAssistantText, "new");
 });
 
 test("ambiguous fallback collisions are rejected rather than overwriting finalized output", () => {
@@ -163,7 +162,7 @@ test("a responseId upgrade tolerates provider model canonicalization", () => {
 	assert.equal(finalizeAssistantMessage(live, finalized, 1024), true);
 	assert.equal(live.finalizedAssistantMessageGeneration, 1);
 	assert.equal(live.finalizedAssistantResponseId, "response-canonical");
-	assert.equal(live.resultText, "done");
+	assert.equal(live.latestAssistantText, "done");
 });
 
 test("retained older finalized identities reject start, update, and end records", () => {
@@ -188,7 +187,7 @@ test("retained older finalized identities reject start, update, and end records"
 	assert.equal(updateAssistantMessage(live, first, 1024), false);
 	assert.equal(finalizeAssistantMessage(live, first, 1024), false);
 	assert.equal(live.assistantMessageActive, true);
-	assert.equal(live.resultText, "new");
+	assert.equal(live.latestAssistantText, "new");
 	assert.equal(
 		finalizeAssistantMessage(
 			live,
@@ -198,7 +197,7 @@ test("retained older finalized identities reject start, update, and end records"
 		true,
 	);
 	assert.equal(live.currentAssistantText, "current");
-	assert.equal(live.resultText, "current");
+	assert.equal(live.latestAssistantText, "current");
 	assert.equal(live.finalizedAssistantIdentities.length, 3);
 });
 

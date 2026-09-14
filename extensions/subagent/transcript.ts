@@ -40,7 +40,7 @@ export interface TranscriptOptions {
 	signal?: AbortSignal;
 	/** Optional dependency injection for deterministic bounded-read tests. */
 	io?: TranscriptFileSystem;
-	/** Maximum file snapshot size. Values above the safe default are capped. */
+	/** Maximum tail window size. Values above the safe default are capped. */
 	maxSnapshotBytes?: number;
 	/** Maximum one JSONL record size. Values above the safe default are capped. */
 	maxRecordBytes?: number;
@@ -50,15 +50,20 @@ export interface TranscriptResult {
 	status: TranscriptStatus;
 	/** The most recent messages, oldest first. */
 	messages: TranscriptMessage[];
-	/** How many messages the snapshot held before the tail window applied. */
-	totalMessages: number;
+	/**
+	 * Messages found inside the read window. It is not the transcript total,
+	 * because a large file is read from its end.
+	 */
+	messagesInWindow: number;
+	/** True when the reader started at a byte offset instead of the file start. */
+	windowed: boolean;
 }
 
 const DEFAULT_MESSAGE_COUNT = 1;
 const MAX_MESSAGE_COUNT = 50;
 /** Valid records can exceed the previous 256 KiB limit, but not this bound. */
 export const MAX_TRANSCRIPT_RECORD_BYTES = 2 * 1024 * 1024;
-/** A read snapshots at most this many bytes, even while the file grows. */
+/** A read scans at most this many trailing bytes, even while the file grows. */
 export const MAX_TRANSCRIPT_SNAPSHOT_BYTES = 8 * 1024 * 1024;
 export const DEFAULT_TRANSCRIPT_TIMEOUT_MS = 5_000;
 const READ_CHUNK_BYTES = 64 * 1024;
@@ -194,15 +199,21 @@ function messageFromEntry(
 interface TailCollector {
 	readonly numMessages: number;
 	messages: TranscriptMessage[];
-	totalMessages: number;
+	messagesInWindow: number;
+	windowed: boolean;
 }
 
 function createTailCollector(options: { numMessages: number }): TailCollector {
-	return { numMessages: options.numMessages, messages: [], totalMessages: 0 };
+	return {
+		numMessages: options.numMessages,
+		messages: [],
+		messagesInWindow: 0,
+		windowed: false,
+	};
 }
 
 function collectMessage(collector: TailCollector, candidate: TranscriptMessage): void {
-	collector.totalMessages++;
+	collector.messagesInWindow++;
 	if (collector.numMessages <= 0) return;
 	collector.messages.push(candidate);
 	if (collector.messages.length > collector.numMessages) collector.messages.shift();
@@ -215,7 +226,8 @@ function resultFor(
 	return {
 		status,
 		messages: collector.messages,
-		totalMessages: collector.totalMessages,
+		messagesInWindow: collector.messagesInWindow,
+		windowed: collector.windowed,
 	};
 }
 
@@ -436,16 +448,19 @@ export async function readTranscript(
 		const fileStat = await bounded(() => file!.stat(), deadline, readOptions.signal, "Transcript stat");
 		if (!Number.isSafeInteger(fileStat.size) || fileStat.size < 0)
 			return resultFor(createTailCollector(page), "unreadable");
-		if (fileStat.size > maxSnapshotBytes)
-			return resultFor(createTailCollector(page), "unreadable");
 		const collector = createTailCollector(page);
+		// A tail read needs only the end of the file, so file size never rejects a read.
+		const windowStart = Math.max(0, fileStat.size - maxSnapshotBytes);
+		collector.windowed = windowStart > 0;
 		const scanner = new TranscriptScanner(
 			(line, onMalformed) => projectLine(line, collector, onMalformed),
 			recordLimit(readOptions),
 		);
 		const decoder = new StringDecoder("utf8");
 		const buffer = Buffer.allocUnsafe(Math.min(READ_CHUNK_BYTES, Math.max(1, fileStat.size)));
-		let position = 0;
+		let position = windowStart;
+		// The window boundary lands mid-record, so drop bytes up to the first LF.
+		let pendingPrefix = collector.windowed;
 		while (position < fileStat.size) {
 			const length = Math.min(buffer.length, fileStat.size - position);
 			const result = await bounded(
@@ -457,9 +472,18 @@ export async function readTranscript(
 			if (!Number.isSafeInteger(result.bytesRead) || result.bytesRead <= 0 || result.bytesRead > length)
 				return resultFor(collector, "unreadable");
 			position += result.bytesRead;
-			scanner.push(decoder.write(buffer.subarray(0, result.bytesRead)));
+			let chunk = decoder.write(buffer.subarray(0, result.bytesRead));
+			if (pendingPrefix) {
+				const firstBreak = chunk.indexOf("\n");
+				if (firstBreak < 0) continue;
+				chunk = chunk.slice(firstBreak + 1);
+				pendingPrefix = false;
+			}
+			scanner.push(chunk);
 		}
 		scanner.push(decoder.end());
+		// A window that never found a record boundary exposed no complete record.
+		if (pendingPrefix) return resultFor(collector, "incomplete");
 		return resultFor(collector, scanner.finish());
 	} catch (error) {
 		if (isAbortError(error)) throw error;

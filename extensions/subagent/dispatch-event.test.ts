@@ -41,7 +41,6 @@ function assistant(
 function createHandle(): SubagentDispatchHandle {
 	return {
 		...createLifecycleState(),
-		resultText: "",
 		currentAssistantText: "",
 		latestAssistantText: "",
 		assistantMessageGeneration: 0,
@@ -151,7 +150,7 @@ test("dispatch settlement is non-terminal and another run succeeds", () => {
 	completeRun(h, 2, "second");
 	assert.equal(h.handle.runSequence, 2);
 	assert.equal(h.handle.lastSettledRunId, 2);
-	assert.equal(h.handle.resultText, "second");
+	assert.equal(h.handle.latestAssistantText, "second");
 	assert.equal(h.handle.usage.turns, 2);
 	assert.equal(h.settled, 2);
 });
@@ -242,7 +241,7 @@ test("provider model canonicalization does not block native settlement", () => {
 	assert.equal(h.handle.processState, "alive");
 	assert.equal(h.handle.runState, "idle");
 	assert.equal(h.handle.settlementStatus, "settled");
-	assert.equal(h.handle.resultText, "done");
+	assert.equal(h.handle.latestAssistantText, "done");
 	assert.equal(h.settled, 1);
 	assert.deepEqual(h.diagnostics, []);
 });
@@ -274,7 +273,7 @@ test("native settlement closes a corroborated run after an unmatched agent_end",
 	);
 	assert.equal(h.handle.runState, "idle");
 	assert.equal(h.handle.runOutcome, "succeeded");
-	assert.equal(h.handle.resultText, "done");
+	assert.equal(h.handle.latestAssistantText, "done");
 	assert.equal(h.settled, 1);
 	assert.match(h.diagnostics.join("\n"), /does not match the active run/);
 	assert.match(h.diagnostics.join("\n"), /without an accepted agent_end/);

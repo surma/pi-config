@@ -160,6 +160,8 @@ A read returns the last `n` messages, oldest first. The default is one message. 
 
 A message has no size cap. The reader returns its complete text.
 
+The reader seeks to the last 8 MiB of the file and scans forward from the first record boundary after that point. File size never rejects a read. It discards the partial record at the window start, so a truncated leading record never becomes a message.
+
 The reader reports one of these statuses:
 
 - `available`: the snapshot has valid complete records.
@@ -167,7 +169,7 @@ The reader reports one of these statuses:
 - `incomplete`: the file has a non-empty trailing fragment without LF.
 - `unreadable`: one or more complete records are malformed, or the file cannot be read.
 
-The inspector reads at most the most recent 512 KiB of transcript data. It keeps recent records and reports when earlier records fall outside that bound.
+The TUI inspector reads at most the most recent 512 KiB of transcript data. It keeps recent records and reports when earlier records fall outside that bound. That bound belongs to the inspector, not to `subagent_inspect`.
 
 The inspector reads at most the first 64 KiB of the captured effective prompt. It reports prompt truncation instead of reading the complete file before display bounds apply.
 
@@ -175,7 +177,9 @@ Each inspector file operation has a deadline and an AbortSignal. Selection chang
 
 The inspector sanitizes all untrusted text before terminal rendering. These bounds do not weaken terminal sanitization.
 
-The result also reports `totalMessages`, so the caller knows how many messages the tail omitted.
+The result reports `messagesInWindow` and `windowed`. The count covers the read window, not the whole file, because a large file is read from its end.
+
+A damaged snapshot still returns every valid record before the damage. The tool prints those messages with a warning instead of hiding them.
 
 Transcript text and file presence do not prove that a run settled.
 
@@ -192,7 +196,9 @@ A subagent stops in four ways. Each one queues exactly one non-durable steering 
 - It finished its turn. The run settled with outcome `succeeded`.
 - It errored. The run settled with outcome `failed`.
 - You interrupted it. The run settled with outcome `aborted`.
-- Its process died. The process closed before any settlement, so the record uses `eventKind: "process_died"` and outcome `died`.
+- Its process died while the owner was still waiting. The record uses `eventKind: "process_died"` and outcome `died`.
+
+A child that already reported a stop does not report a second one when its process later closes. The owner is not waiting on an idle child, and a dead child reports itself through the next `subagent_steer` failure.
 
 The queue suppresses duplicate records by owner, child, incarnation, run ID, and event kind.
 
@@ -208,7 +214,9 @@ A `process_died` wake adds the exit code or signal, the close error, and a bound
 
 The custom message details include the direct owner session file, owner session ID, child ID, incarnation, run ID, event kind, outcome, and a `settlements` array containing that record.
 
-Shutdown and explicit removal suppress unsent wakes. The caller asked for those stops, so no wake is needed.
+Shutdown and explicit removal suppress unsent wakes. The caller asked for those stops, so no wake is needed. A reload keeps queued wakes, because the process and its children survive it.
+
+The wake text carries child-controlled strings. The extension sanitizes and bounds the child name, the close error, and the stderr tail before it builds the message.
 
 Reload queues accept at most 512 records. Overflow retains accepted records, emits one terminal diagnostic, and fences the runtime against later updates. Bounded critical lifecycle records remain accepted so `agent_start`, `agent_end`, and `agent_settled` remain deliverable after an update flood.
 
@@ -248,5 +256,13 @@ Run the deterministic suite from this directory:
 ```sh
 PI_TEST_PACKAGE_DIR=/path/to/pi-0.84.1 ./test.sh
 ```
+
+Type-check every source and test file:
+
+```sh
+PI_TEST_PACKAGE_DIR=/path/to/pi-0.84.1 ./typecheck.sh
+```
+
+The test runner strips types instead of checking them, so a green suite proves nothing about type correctness. Run both.
 
 The suite covers lifecycle dispatch, transcript projection and tail reads, stop notifications, strict RPC framing, correlated responses, bounded termination, launch arguments, all six tools, reload, process-close evidence, abort acceptance, child-extension health helpers, and the inspector.

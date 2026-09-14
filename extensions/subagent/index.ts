@@ -239,7 +239,7 @@ function deadlineTimeout(deadline: number | undefined, fallback: number): number
 }
 
 function emptyTranscriptResult(): TranscriptResult {
-	return { status: "unreadable", messages: [], totalMessages: 0 };
+	return { status: "unreadable", messages: [], messagesInWindow: 0, windowed: false };
 }
 
 async function verifyChildExtensionHealth(
@@ -318,6 +318,13 @@ function isThinking(value: unknown): value is ThinkingLevel {
 function truncate(value: string | undefined, max = 240) {
 	const text = (value || "").replace(/\s+/g, " ").trim();
 	return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
+const MAX_NOTIFICATION_DETAIL = 400;
+
+/** Bound and sanitize child-controlled text before it reaches a notification. */
+function notificationText(value: string, max: number): string {
+	return truncate(sanitizeTerminalText(value).replace(/\s+/g, " ").trim(), max);
 }
 
 /** A compact age, so the caller does not have to subtract timestamps. */
@@ -410,7 +417,6 @@ function childEnvironment(values: {
 	childId: string;
 	incarnation: string;
 	depth: number;
-	systemPrompt: string;
 	promptPath: string;
 	sessionDir: string;
 	healthPath: string;
@@ -423,7 +429,6 @@ function childEnvironment(values: {
 		PI_SUBAGENT_CHILD: "1",
 		PI_SUBAGENT_CHILD_ID: values.childId,
 		PI_SUBAGENT_INCARNATION: values.incarnation,
-		PI_SUBAGENT_SYSTEM_PROMPT: values.systemPrompt,
 		PI_SUBAGENT_DEPTH: String(values.depth),
 		PI_SUBAGENT_PROMPT_PATH: values.promptPath,
 		PI_SUBAGENT_SESSION_DIR: values.sessionDir,
@@ -686,6 +691,8 @@ interface SubagentHandle extends SubagentDispatchHandle {
 	rpcReadyAt?: number;
 	lastActivityAt: number;
 	completedAt?: number;
+	/** The run whose stop the owner already learned about. */
+	announcedRunId?: number;
 	extensionError?: string;
 	transcriptStatus: TranscriptStatus;
 	stderr: string;
@@ -984,10 +991,10 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			throwIfAborted(signal);
 			operationPromise = Promise.resolve().then(operation);
 			// Cancellation can return before transport or termination cleanup settles.
-			const completion = operationPromise.then(
-				() => handle.terminationPromise || handle.rpcOperationPromise,
-				() => handle.terminationPromise || handle.rpcOperationPromise,
-			);
+			const settleCleanup = async (): Promise<void> => {
+				await (handle.terminationPromise || handle.rpcOperationPromise);
+			};
+			const completion = operationPromise.then(settleCleanup, settleCleanup);
 			void completion.then(releaseCurrent, releaseCurrent);
 			return await operationPromise;
 		} catch (error) {
@@ -1039,7 +1046,13 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		}
 	};
 
-	/** Wake the owner once for any stop the owner did not ask for. */
+	/**
+	 * Wake the owner once for any stop the owner did not ask for.
+	 *
+	 * The run cursor records that the owner already learned about this run, even
+	 * when a guard suppresses the send. A later process close then stays silent
+	 * for a child the owner is no longer waiting on.
+	 */
 	function announceStop(
 		handle: SubagentHandle,
 		record: Omit<
@@ -1047,14 +1060,19 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			"ownerSessionFile" | "ownerSessionId" | "childId" | "incarnation" | "name"
 		>,
 	): void {
+		handle.announcedRunId = handle.runSequence;
 		if (sessionShuttingDown || handle.killRequestedAt !== undefined) return;
 		settlementNotifications.queue({
 			ownerSessionFile: handle.ownerSessionFile,
 			ownerSessionId: handle.ownerSessionId,
 			childId: handle.id,
 			incarnation: handle.incarnation,
-			name: handle.name,
+			// Child-controlled text reaches a Markdown renderer, so bound and sanitize it here.
+			name: handle.name ? notificationText(handle.name, 80) : undefined,
 			...record,
+			...(record.detail
+				? { detail: notificationText(record.detail, MAX_NOTIFICATION_DETAIL) }
+				: {}),
 		});
 	}
 
@@ -1115,7 +1133,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			transcript: {
 				status: transcript.status,
 				messages: transcript.messages,
-				totalMessages: transcript.totalMessages,
+				messagesInWindow: transcript.messagesInWindow,
+				windowed: transcript.windowed,
 			},
 			error: handle.error || handle.finalError || undefined,
 			stderrTail: tail(handle.stderr),
@@ -1224,18 +1243,23 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		const at = now();
 		const sections = [await summary(handle, serial)];
 		const transcript = serial.transcript;
-		if (transcript.status !== "available") {
-			sections.push(`Messages unavailable: the log is ${transcript.status}.`);
-			return sections.join("\n\n");
-		}
 		if (numMessages === 0) return sections.join("\n\n");
+		// A damaged snapshot still yields every valid record before the damage.
+		if (transcript.status !== "available")
+			sections.push(
+				`Warning: the log is ${transcript.status}. Any messages below are the valid records that survived.`,
+			);
 		if (!transcript.messages.length) {
-			sections.push("No messages yet.");
+			sections.push(
+				transcript.status === "available"
+					? "No messages yet."
+					: "No readable messages.",
+			);
 			return sections.join("\n\n");
 		}
-		const hidden = transcript.totalMessages - transcript.messages.length;
+		const hidden = transcript.messagesInWindow - transcript.messages.length;
 		sections.push(
-			`Last ${transcript.messages.length} of ${transcript.totalMessages} messages${hidden > 0 ? ` (${hidden} earlier omitted)` : ""}:`,
+			`Last ${transcript.messages.length} messages${hidden > 0 ? ` (${hidden} earlier omitted)` : ""}:`,
 		);
 		for (const message of transcript.messages)
 			sections.push(
@@ -1268,7 +1292,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			settlementStatus: "pending",
 			state: restoredState,
 			lifecycle: stopped ? restoredState : (entry.runState as SessionLifecycle),
-			resultText: "",
 			currentAssistantText: "",
 			latestAssistantText: "",
 			assistantMessageGeneration: 0,
@@ -1314,7 +1337,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		handle.currentToolStartedAt = undefined;
 		handle.lastTool = undefined;
 		handle.isStreaming = false;
-		handle.resultText = "";
 		handle.currentAssistantText = "";
 		handle.latestAssistantText = "";
 		handle.activeTools.clear();
@@ -1393,7 +1415,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		);
 		if (close.error)
 			addDiagnostic(handle, `RPC child process close error: ${close.error.message}`);
-		const settledBeforeClose = handle.settlementStatus === "settled";
+		// A settled run without an accepted outcome never announced, so track the cursor.
+		const alreadyAnnounced = handle.announcedRunId === handle.runSequence;
 		if (handle.processState !== "stopped") {
 			markStopped(handle, now(), {
 				code: close.code,
@@ -1401,8 +1424,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 				error: close.error?.message,
 			});
 		}
-		// A process that closes mid-run never settles, so nothing else wakes the owner.
-		if (!settledBeforeClose)
+		// Wake only when the owner is still waiting on this child.
+		if (!alreadyAnnounced)
 			announceStop(handle, {
 				runId: 0,
 				eventKind: "process_died",
@@ -1513,7 +1536,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			fenced: false,
 			draining: false,
 			drainFailures: 0,
-		} as RuntimeChild;
+		} as unknown as RuntimeChild;
 		const transport = new RpcChildTransport(child, {
 			onRecord: (record) => {
 				routeRuntimeRecord(runtime, record);
@@ -1929,7 +1952,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 					childId: id,
 					incarnation,
 					depth: getDepth() + 1,
-					systemPrompt: spec.systemPrompt || "",
 					promptPath: handle.promptPath,
 					sessionDir,
 					healthPath: childExtensionHealthPath(sessionDir, incarnation),
@@ -2191,11 +2213,14 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async (event, ctx) => {
-		sessionShuttingDown = true;
-		suppressAllSettlementNotifications();
 		latestCtx = ctx;
 		const deadline = now() + SHUTDOWN_TIMEOUT_MS;
 		const reason = event?.reason || "quit";
+		// A reload keeps the process and its children, so queued wakes must survive it.
+		if (reason !== "reload") {
+			sessionShuttingDown = true;
+			suppressAllSettlementNotifications();
+		}
 		if (reason === "reload") {
 			for (const handle of handles.values()) {
 				if (!handle.runtime) continue;
@@ -2249,23 +2274,24 @@ export default function subagentExtension(pi: ExtensionAPI) {
 					details: { nestedDelegationBlocked: true },
 				};
 			const spec = params as TaskSpec;
-			const choice = selectedModel(ctx, spec);
-			if (!choice.model || !choice.thinking)
+			const { model, thinking, error: choiceError } = selectedModel(ctx, spec);
+			if (!model || !thinking)
 				return {
 					content: [
 						{
 							type: "text" as const,
-							text: choice.error || "Invalid subagent configuration.",
+							text: choiceError || "Invalid subagent configuration.",
 						},
 					],
 					details: {},
 				};
 			let startedHandle: SubagentHandle | undefined;
 			try {
-				const callerCwd = ctx.cwd;
+				// An omitted cwd inherits the caller working directory.
+				const callerCwd = ctx.cwd || process.cwd();
 				const childCwd = spec.cwd ? resolve(callerCwd, spec.cwd) : callerCwd;
 				const handle = await withLaunchReservation(signal, () =>
-					launch(spec, childCwd, choice.model, choice.thinking, signal),
+					launch(spec, childCwd, model, thinking, signal),
 				);
 				startedHandle = handle;
 				return {
@@ -2481,7 +2507,9 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		handler: async (_args, ctx) => {
 			latestCtx = ctx;
 			if (ctx.mode !== "tui") {
-				console.log((await Promise.all(sorted().map(summary))).join("\n\n"));
+				console.log(
+					(await Promise.all(sorted().map((handle) => summary(handle)))).join("\n\n"),
+				);
 				return;
 			}
 			await ctx.ui.custom<void>(

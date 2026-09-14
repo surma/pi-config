@@ -24,7 +24,7 @@ import subagentExtension, {
 	routeRuntimeRecord,
 } from "./index.ts";
 import { MAX_SUBAGENT_EVENT_QUEUE_RECORDS } from "./dispatch-event.ts";
-import { RpcChildTransport } from "./rpc.js";
+import { RpcChildTransport, type RpcProcessClose } from "./rpc.js";
 
 // The test process can inherit the delegated-child marker from the parent harness.
 delete process.env.PI_SUBAGENT_DEPTH;
@@ -173,6 +173,12 @@ function turn(message) {
     activeAbortRun = runId;
     return;
   }
+  // Settle with no outcome and no stop reason, then die while nominally idle.
+  if (mode === "settle-pending-then-die") {
+    output({ type: "agent_settled", runId });
+    setTimeout(() => process.exit(11), 20);
+    return;
+  }
   const failure = mode === "failure";
   const text = (failure ? "failed-" : "result-") + run + " " + String(message || "");
   const assistant = {
@@ -196,6 +202,8 @@ function turn(message) {
   output({ type: "message_end", message: assistant });
   output({ type: "agent_end", runId, messages: [assistant], willRetry: false });
   output({ type: "agent_settled", runId, runOutcome: failure ? "failed" : "succeeded" });
+  // The child settles, reaches idle, then dies without the parent asking.
+  if (mode === "settle-then-die") setTimeout(() => process.exit(9), 20);
 }
 function command(command) {
   if (command.type === "get_state") {
@@ -297,7 +305,7 @@ function testRuntime(records: Record<string, unknown>[] = []): any {
 		forceClose(close: Record<string, unknown>) {
 			this.isClosed = true;
 			runtime.forceCloseCalls++;
-			noteRuntimeClose(runtime, close);
+			noteRuntimeClose(runtime, close as unknown as RpcProcessClose);
 		},
 	};
 	return runtime;
@@ -758,8 +766,8 @@ test("RPC child lifecycle supports settlement wakes, transcript paging, runtime-
 			n: 2,
 		});
 		assert.deepEqual(page.details.transcript.messages.map((message: any) => message.text), ["hello", "world"]);
-		assert.equal(page.details.transcript.totalMessages, 2);
-		assert.match(page.content[0]?.text || "", /Last 2 of 2 messages/);
+		assert.equal(page.details.transcript.messagesInWindow, 2);
+		assert.match(page.content[0]?.text || "", /Last 2 messages/);
 		assert.match(page.content[0]?.text || "", /\] assistant\nworld/);
 		assert.match(page.content[0]?.text || "", new RegExp(`log ${sessionPath}`));
 
@@ -1115,6 +1123,104 @@ test("process close before settlement records terminal evidence and wakes the ow
 		const status = await requireTool(tools, "subagent_inspect").execute("status", { id: childId });
 		assert.equal(status.details.settlement.status, "closed_without_settlement");
 		assert.equal(status.details.exitCode, 17);
+	} finally {
+		await handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
+		if (old.agentDirectory === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = old.agentDirectory;
+		if (old.pi === undefined) delete process.env.PI_SUBAGENT_PI_BIN;
+		else process.env.PI_SUBAGENT_PI_BIN = old.pi;
+		if (old.mode === undefined) delete process.env.FAKE_PI_MODE;
+		else process.env.FAKE_PI_MODE = old.mode;
+	}
+});
+
+test("an idle child that dies later does not wake the owner a second time", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "pi-rpc-settle-die-"));
+	const agentDirectory = join(directory, "agent");
+	const parentSession = join(directory, "parent.jsonl");
+	const logPath = join(directory, "invocations.jsonl");
+	await writeFile(parentSession, "parent\n");
+	const binary = await fakePi(directory, logPath, "settle-then-die");
+	const old = {
+		agentDirectory: process.env.PI_CODING_AGENT_DIR,
+		pi: process.env.PI_SUBAGENT_PI_BIN,
+		mode: process.env.FAKE_PI_MODE,
+	};
+	process.env.PI_CODING_AGENT_DIR = agentDirectory;
+	process.env.PI_SUBAGENT_PI_BIN = binary;
+	process.env.FAKE_PI_MODE = "settle-then-die";
+	const handlers = new Map<string, TestHandler>();
+	const sent: SentMessage[] = [];
+	const { tools } = setup(handlers, sent);
+	const ctx = context(parentSession, "settle-die-parent", directory);
+	try {
+		await handlers.get("session_start")?.({ reason: "startup" }, ctx);
+		const started = await requireTool(tools, "subagent_start").execute(
+			"start",
+			{ prompt: "work", model: "provider/model", thinking: "off", name: "worker" },
+			undefined,
+			undefined,
+			ctx,
+		);
+		const childId = String(started.details.handle.id);
+		await waitFor(async () => {
+			const status = await requireTool(tools, "subagent_inspect").execute("s", { id: childId });
+			return status.details.processState === "stopped";
+		});
+		await waitFor(() => sent.length >= 1);
+		// The settlement already told the owner. The later death adds nothing.
+		await new Promise((resolve) => setTimeout(resolve, 80));
+		assert.equal(sent.length, 1);
+		assert.equal(sent[0]?.message.details?.eventKind, "run_settled");
+		assert.equal(sent[0]?.message.details?.outcome, "succeeded");
+	} finally {
+		await handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
+		if (old.agentDirectory === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = old.agentDirectory;
+		if (old.pi === undefined) delete process.env.PI_SUBAGENT_PI_BIN;
+		else process.env.PI_SUBAGENT_PI_BIN = old.pi;
+		if (old.mode === undefined) delete process.env.FAKE_PI_MODE;
+		else process.env.FAKE_PI_MODE = old.mode;
+	}
+});
+
+test("a child that dies after an uncorroborated settlement still wakes the owner", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "pi-rpc-pending-die-"));
+	const agentDirectory = join(directory, "agent");
+	const parentSession = join(directory, "parent.jsonl");
+	const logPath = join(directory, "invocations.jsonl");
+	await writeFile(parentSession, "parent\n");
+	const binary = await fakePi(directory, logPath, "settle-pending-then-die");
+	const old = {
+		agentDirectory: process.env.PI_CODING_AGENT_DIR,
+		pi: process.env.PI_SUBAGENT_PI_BIN,
+		mode: process.env.FAKE_PI_MODE,
+	};
+	process.env.PI_CODING_AGENT_DIR = agentDirectory;
+	process.env.PI_SUBAGENT_PI_BIN = binary;
+	process.env.FAKE_PI_MODE = "settle-pending-then-die";
+	const handlers = new Map<string, TestHandler>();
+	const sent: SentMessage[] = [];
+	const { tools } = setup(handlers, sent);
+	const ctx = context(parentSession, "pending-die-parent", directory);
+	try {
+		await handlers.get("session_start")?.({ reason: "startup" }, ctx);
+		const started = await requireTool(tools, "subagent_start").execute(
+			"start",
+			{ prompt: "work", model: "provider/model", thinking: "off" },
+			undefined,
+			undefined,
+			ctx,
+		);
+		const childId = String(started.details.handle.id);
+		await waitFor(async () => {
+			const status = await requireTool(tools, "subagent_inspect").execute("s", { id: childId });
+			return status.details.processState === "stopped";
+		});
+		// An uncorroborated agent_settled queues no wake, so the death must not stay silent.
+		await waitFor(() => sent.length >= 1);
+		assert.equal(sent.length, 1);
+		assert.equal(sent[0]?.message.details?.eventKind, "process_died");
 	} finally {
 		await handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
 		if (old.agentDirectory === undefined) delete process.env.PI_CODING_AGENT_DIR;
