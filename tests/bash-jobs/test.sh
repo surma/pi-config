@@ -14,12 +14,10 @@ tmp="$(mktemp -d)"
 cleanup() { rm -rf "$tmp"; }
 trap cleanup EXIT
 
-mkdir -p "$tmp/extensions/escape-debug" "$tmp/tests" "$tmp/node_modules/@mariozechner"
+mkdir -p "$tmp/extensions" "$tmp/tests" "$tmp/node_modules/@mariozechner"
 cp "$repo_dir/extensions/bash-jobs.ts" "$tmp/extensions/"
-cp "$repo_dir/extensions/escape-debug/log.ts" "$tmp/extensions/escape-debug/"
 cp "$repo_dir/tests/bash-jobs.test.ts" "$tmp/tests/"
-ln -s log.ts "$tmp/extensions/escape-debug/log.js"
 ln -s "$package_dir" "$tmp/node_modules/@mariozechner/pi-coding-agent"
 ln -s "$package_dir/node_modules/typebox" "$tmp/node_modules/typebox"
 
-PI_ESCAPE_DEBUG_LOG="$tmp/escape-debug.log" node --experimental-transform-types --test "$tmp/tests/bash-jobs.test.ts"
+node --experimental-transform-types --test "$tmp/tests/bash-jobs.test.ts"

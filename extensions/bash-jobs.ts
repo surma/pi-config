@@ -12,7 +12,6 @@ import {
 	truncateTail,
 } from "@mariozechner/pi-coding-agent";
 import { Type } from "typebox";
-import { dlog } from "./escape-debug/log.js";
 
 const LOG_DIR = join(tmpdir(), "pi-bash-jobs");
 const MAX_TAIL_BUFFER_BYTES = DEFAULT_MAX_BYTES * 2;
@@ -561,14 +560,6 @@ async function runManagedBash(
 	onDetached: (job: BashJob) => void,
 ): Promise<BashToolResult> {
 	const job = spawnManagedJob(command, cwd);
-	dlog("BASH", "runManagedBash_spawned", {
-		jobId: job.jobId,
-		pid: job.pid,
-		command: command.slice(0, 200),
-		timeoutSeconds,
-		haveSignal: !!signal,
-		signalAlreadyAborted: signal?.aborted ?? null,
-	});
 	const stopUpdating = attachOutputUpdater(job, onUpdate);
 
 	try {
@@ -582,11 +573,6 @@ async function runManagedBash(
 				settled = true;
 				if (timeoutHandle) clearTimeout(timeoutHandle);
 				if (abortHandler && signal) signal.removeEventListener("abort", abortHandler);
-				dlog("BASH", "runManagedBash_finish", {
-					jobId: job.jobId,
-					outcome: value,
-					signalAborted: signal?.aborted ?? null,
-				});
 				resolve(value);
 			};
 
@@ -602,11 +588,6 @@ async function runManagedBash(
 			if (timeoutHandle.unref) timeoutHandle.unref();
 
 			abortHandler = () => {
-				dlog("BASH", "runManagedBash_abort_fired", {
-					jobId: job.jobId,
-					settled,
-					signalAborted: signal?.aborted ?? null,
-				});
 				if (settled) return;
 				settled = true;
 				if (timeoutHandle) clearTimeout(timeoutHandle);
@@ -616,14 +597,10 @@ async function runManagedBash(
 			};
 			if (signal) {
 				if (signal.aborted) {
-					dlog("BASH", "runManagedBash_signal_already_aborted", { jobId: job.jobId });
 					abortHandler();
 				} else {
 					signal.addEventListener("abort", abortHandler, { once: true });
-					dlog("BASH", "runManagedBash_listener_attached", { jobId: job.jobId });
 				}
-			} else {
-				dlog("BASH", "runManagedBash_no_signal", { jobId: job.jobId });
 			}
 		});
 
@@ -795,11 +772,8 @@ export default function (pi: ExtensionAPI) {
 				},
 				{ triggerTurn: true, deliverAs: "steer" },
 			);
-		} catch (error) {
-			dlog("BASH", "completion_notification_failed", {
-				error: (error as Error)?.message ?? String(error),
-				jobIds: eligibleJobs.map((job) => job.jobId),
-			});
+		} catch {
+			// Notification scheduling is best-effort.
 		}
 	};
 
@@ -873,35 +847,14 @@ export default function (pi: ExtensionAPI) {
 		],
 		parameters: bashSchema,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			const commandCwd = resolveCommandCwd(ctx.cwd, params.cwd);
-			dlog("BASH", "tool_bash_enter", {
-				toolCallId: _toolCallId,
-				command: typeof params.command === "string" ? params.command.slice(0, 200) : null,
-				haveSignal: !!signal,
-				signalAlreadyAborted: signal?.aborted ?? null,
-			});
-			try {
-				return await runManagedBash(
-					params.command,
-					commandCwd,
-					params.timeout ?? defaultBashTimeoutSeconds,
-					signal,
-					onUpdate,
-					queueCompletionNotification,
-				);
-			} catch (err) {
-				dlog("BASH", "tool_bash_threw", {
-					toolCallId: _toolCallId,
-					error: (err as Error)?.message ?? String(err),
-					signalAborted: signal?.aborted ?? null,
-				});
-				throw err;
-			} finally {
-				dlog("BASH", "tool_bash_exit", {
-					toolCallId: _toolCallId,
-					signalAborted: signal?.aborted ?? null,
-				});
-			}
+			return await runManagedBash(
+				params.command,
+				resolveCommandCwd(ctx.cwd, params.cwd),
+				params.timeout ?? defaultBashTimeoutSeconds,
+				signal,
+				onUpdate,
+				queueCompletionNotification,
+			);
 		},
 	});
 
@@ -942,20 +895,10 @@ export default function (pi: ExtensionAPI) {
 		parameters: jobIdSchema,
 		renderResult: bashResultRenderer,
 		async execute(_toolCallId, params, signal) {
-			dlog("BASH", "tool_bash_kill_enter", {
-				toolCallId: _toolCallId,
-				jobId: params.jobId,
-				signalAlreadyAborted: signal?.aborted ?? null,
-			});
 			const job = getJob(params.jobId);
 			suppressCompletionNotification(job);
 			await killJob(job, signal);
 			const { text, details } = consumeCompletedJob(job, true);
-			dlog("BASH", "tool_bash_kill_exit", {
-				toolCallId: _toolCallId,
-				jobId: params.jobId,
-				signalAborted: signal?.aborted ?? null,
-			});
 			return {
 				content: [{ type: "text", text }],
 				details,
