@@ -10,7 +10,10 @@ import { Type } from "typebox";
 
 // ../nix/store/a2mzaapx3y947d8l3rgv43nr2xs9v459-extractive-compaction/src/decisions.ts
 import { setTimeout as wait } from "node:timers/promises";
-var DECISIONS_ENDPOINT = "https://proxy.shopify.ai/vendors/openai-shopify-shopapp-chatgpt-prod/v1/decisions";
+// Set PI_DECISIONS_URL to send decisions requests to another proxy.
+var DEFAULT_DECISIONS_ENDPOINT = "https://proxy.shopify.ai/vendors/openai-shopify-shopapp-chatgpt-prod/v1/decisions";
+var DECISIONS_URL_ENV = "PI_DECISIONS_URL";
+var DECISIONS_ENDPOINT = process.env[DECISIONS_URL_ENV]?.trim() || DEFAULT_DECISIONS_ENDPOINT;
 var DECISIONS_MODEL = "gpt-6-luna";
 var MAX_QUESTIONS_PER_REQUEST = 200;
 var MAX_INPUT_TIMES_QUESTIONS = 4e6;
