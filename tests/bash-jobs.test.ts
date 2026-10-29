@@ -196,6 +196,29 @@ test("explicit kill suppresses completion notifications", async () => {
 	assert.equal(h.sends.length, 0);
 });
 
+test("footer spinner shows while background jobs run in the TUI", async () => {
+	const statuses: Array<string | undefined> = [];
+	const ui = {
+		theme: { fg: (_color: string, text: string) => text },
+		setStatus(key: string, text: string | undefined) {
+			if (key === "bash-jobs") statuses.push(text);
+		},
+	};
+	const tuiCtx = { cwd: process.cwd(), mode: "tui", ui };
+
+	await bash().execute("spinner-fast", { command: "printf fast", timeout: 1 }, undefined, undefined, tuiCtx);
+	assert.equal(statuses.length, 0);
+
+	const result = await bash().execute("spinner", { command: "sleep 1.3", timeout: 1 }, undefined, undefined, tuiCtx);
+	const jobId = jobIdFrom(result.content[0]?.text ?? "");
+	assert.match(statuses.at(-1) ?? "", /^\S 1 bash job$/);
+	await waitFor(() => statuses.length >= 2);
+	assert.notEqual(statuses[0], statuses[1]);
+
+	await waitFor(() => statuses.at(-1) === undefined);
+	await status().execute("spinner-status", { jobId }, undefined, undefined, { cwd: process.cwd() });
+});
+
 test("session shutdown suppresses completion notifications", async () => {
 	h.sends.length = 0;
 	const result = await bash().execute("shutdown", { command: "sleep 1.2; printf shutdown-output", timeout: 1 }, undefined, undefined, { cwd: process.cwd() });

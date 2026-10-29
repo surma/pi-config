@@ -3,7 +3,7 @@ import { createWriteStream, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
-import type { BashToolDetails, ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { BashToolDetails, ExtensionAPI, ExtensionContext, ExtensionUIContext } from "@mariozechner/pi-coding-agent";
 import {
 	createBashToolDefinition,
 	DEFAULT_MAX_BYTES,
@@ -22,6 +22,9 @@ const COMMAND_PREVIEW_MAX_CHARS = 160;
 const STALL_CHECK_INTERVAL_MS = 5_000;
 const STALL_THRESHOLD_MS = 45_000;
 const COMPLETION_NOTIFICATION_BATCH_MS = 50;
+const STATUS_KEY = "bash-jobs";
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SPINNER_INTERVAL_MS = 80;
 
 const PROMPT_PATTERNS = [
 	/\(y\/n\)/i,
@@ -644,6 +647,10 @@ function getRunningJobs(): BashJob[] {
 	return [...jobs.values()].filter((job) => job.status === "running");
 }
 
+function getBackgroundJobs(): BashJob[] {
+	return getRunningJobs().filter((job) => job.detached);
+}
+
 function formatJobsList(): string {
 	const managedJobs = [...jobs.values()].sort((a, b) => b.startedAt - a.startedAt);
 	if (managedJobs.length === 0) {
@@ -733,6 +740,37 @@ export default function (pi: ExtensionAPI) {
 	const pendingCompletionNotifications = new Set<BashJob>();
 	let completionNotificationTimer: NodeJS.Timeout | undefined;
 	let sessionShuttingDown = false;
+	let spinnerUi: ExtensionUIContext | undefined;
+	let spinnerTimer: NodeJS.Timeout | undefined;
+	let spinnerFrame = 0;
+
+	const stopSpinner = () => {
+		if (spinnerTimer) clearInterval(spinnerTimer);
+		spinnerTimer = undefined;
+		spinnerUi?.setStatus(STATUS_KEY, undefined);
+		spinnerUi = undefined;
+	};
+
+	const renderSpinner = () => {
+		const count = getBackgroundJobs().length;
+		if (!spinnerUi || count === 0) {
+			stopSpinner();
+			return;
+		}
+		const theme = spinnerUi.theme;
+		const frame = SPINNER_FRAMES[spinnerFrame++ % SPINNER_FRAMES.length];
+		const label = `${count} bash job${count === 1 ? "" : "s"}`;
+		spinnerUi.setStatus(STATUS_KEY, `${theme.fg("accent", frame)} ${theme.fg("dim", label)}`);
+	};
+
+	// Only animate in the TUI. RPC clients would receive one status message per frame.
+	const startSpinner = (ctx: ExtensionContext) => {
+		if (ctx.mode !== "tui" || spinnerTimer || sessionShuttingDown || getBackgroundJobs().length === 0) return;
+		spinnerUi = ctx.ui;
+		renderSpinner();
+		spinnerTimer = setInterval(renderSpinner, SPINNER_INTERVAL_MS);
+		spinnerTimer.unref?.();
+	};
 
 	const flushCompletionNotifications = () => {
 		completionNotificationTimer = undefined;
@@ -811,6 +849,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async () => {
 		sessionShuttingDown = true;
+		stopSpinner();
 		if (completionNotificationTimer) {
 			clearTimeout(completionNotificationTimer);
 			completionNotificationTimer = undefined;
@@ -847,7 +886,7 @@ export default function (pi: ExtensionAPI) {
 		],
 		parameters: bashSchema,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			return await runManagedBash(
+			const result = await runManagedBash(
 				params.command,
 				resolveCommandCwd(ctx.cwd, params.cwd),
 				params.timeout ?? defaultBashTimeoutSeconds,
@@ -855,6 +894,8 @@ export default function (pi: ExtensionAPI) {
 				onUpdate,
 				queueCompletionNotification,
 			);
+			startSpinner(ctx);
+			return result;
 		},
 	});
 
